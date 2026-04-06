@@ -9,6 +9,19 @@ use core_ir::{EdgeKind, Graph, SymbolId};
 
 /// Extract a subgraph rooted at `root`, traversing up to `depth` hops along
 /// edges whose kind is in `kinds`. If `kinds` is empty, all edge kinds match.
+///
+/// # Edge cases
+///
+/// * `depth = 0` — returns only the root node with no edges.
+/// * `depth = 1` — returns the root plus its immediate neighbors via matching
+///   edge kinds.
+/// * Empty `kinds` slice — follows all edge kinds (no filtering).
+/// * Root not in graph — returns an empty graph (no panic).
+/// * Traversal is **bidirectional**: an edge `A → B` lets BFS reach `A` from
+///   `B` and vice-versa. A leaf node at depth 1 will therefore include its
+///   predecessor.
+/// * The returned graph contains only edges where **both** endpoints are in the
+///   visited set **and** the edge kind matches the filter.
 pub fn subgraph_around(g: &Graph, root: SymbolId, depth: u32, kinds: &[EdgeKind]) -> Graph {
     let mut visited: HashSet<SymbolId> = HashSet::new();
     let mut queue: VecDeque<(SymbolId, u32)> = VecDeque::new();
