@@ -56,7 +56,7 @@ Required only for the `frontend-clang` crate. The viz app works without it via t
 - **macOS**: `brew install llvm && export LIBCLANG_PATH=$(brew --prefix llvm)/lib`
 - **Windows**: install LLVM prebuilt from llvm.org, set `LIBCLANG_PATH` to `<llvm>/bin`
 
-If libclang is not available in the current environment, the `clang` workspace feature is off by default and the frontend-clang crate is excluded from the build. Do not attempt to stub libclang calls with `todo!()` — use the JSON fallback path instead.
+libclang is expected to be available in all development environments. On Linux, install it with `sudo apt install libclang-dev` before building.
 
 ## Testing
 
