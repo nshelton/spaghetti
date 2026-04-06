@@ -1,5 +1,7 @@
 //! Tests for core-ir types and graph operations.
 
+use std::collections::{HashMap, HashSet};
+
 use core_ir::*;
 
 fn make_symbol(name: &str, kind: SymbolKind) -> Symbol {
@@ -24,6 +26,123 @@ fn test_symbol_id_determinism() {
     // Different kind → different ID
     let c = SymbolId::from_parts("Foo::bar", SymbolKind::Field);
     assert_ne!(a, c);
+}
+
+#[test]
+fn test_symbol_id_determinism_1000_iterations() {
+    let reference = SymbolId::from_parts("Foo::bar", SymbolKind::Method);
+    for _ in 0..1000 {
+        assert_eq!(
+            SymbolId::from_parts("Foo::bar", SymbolKind::Method),
+            reference
+        );
+    }
+}
+
+#[test]
+fn test_symbol_id_golden_file() {
+    let golden_json =
+        std::fs::read_to_string("tests/fixtures/symbol_id_golden.json").expect("golden file");
+    let golden: HashMap<String, u64> =
+        serde_json::from_str(&golden_json).expect("parse golden JSON");
+
+    let test_name = "TestSymbol";
+    let kinds: &[(&str, SymbolKind)] = &[
+        ("Class", SymbolKind::Class),
+        ("Struct", SymbolKind::Struct),
+        ("Function", SymbolKind::Function),
+        ("Method", SymbolKind::Method),
+        ("Field", SymbolKind::Field),
+        ("Namespace", SymbolKind::Namespace),
+        ("TemplateInstantiation", SymbolKind::TemplateInstantiation),
+        ("TranslationUnit", SymbolKind::TranslationUnit),
+    ];
+
+    for (kind_name, kind) in kinds {
+        let key = format!("{test_name}|{kind_name}");
+        let expected = golden
+            .get(&key)
+            .unwrap_or_else(|| panic!("missing golden entry for {key}"));
+        let actual = SymbolId::from_parts(test_name, *kind);
+        assert_eq!(
+            actual.0, *expected,
+            "golden mismatch for {key}: got {}, expected {expected}",
+            actual.0
+        );
+    }
+}
+
+#[test]
+fn test_symbol_id_no_collisions_tiny_cpp() {
+    let json =
+        std::fs::read_to_string("../../examples/tiny-cpp/graph.json").expect("tiny-cpp graph.json");
+    let graph = Graph::from_json(&json).expect("parse graph");
+
+    let ids: Vec<SymbolId> = graph.symbols.keys().copied().collect();
+    let unique: HashSet<SymbolId> = ids.iter().copied().collect();
+    assert_eq!(
+        ids.len(),
+        unique.len(),
+        "collision detected among {} symbols",
+        ids.len()
+    );
+}
+
+#[test]
+fn test_symbol_id_whitespace_normalization() {
+    let canonical = SymbolId::from_parts("Foo::bar", SymbolKind::Method);
+
+    // Leading/trailing whitespace is trimmed
+    assert_eq!(
+        SymbolId::from_parts("  Foo::bar  ", SymbolKind::Method),
+        canonical
+    );
+    assert_eq!(
+        SymbolId::from_parts("\tFoo::bar\n", SymbolKind::Method),
+        canonical
+    );
+
+    // Interior whitespace variations collapse to the same result
+    let spaced = SymbolId::from_parts("Foo :: bar", SymbolKind::Method);
+    assert_eq!(
+        SymbolId::from_parts("Foo ::  bar", SymbolKind::Method),
+        spaced
+    );
+    assert_eq!(
+        SymbolId::from_parts("Foo  ::  bar", SymbolKind::Method),
+        spaced
+    );
+
+    // But different names still differ
+    assert_ne!(
+        SymbolId::from_parts("Foo::baz", SymbolKind::Method),
+        canonical
+    );
+}
+
+#[test]
+fn test_symbol_id_different_kinds_differ() {
+    let name = "SomeName";
+    let all_kinds = [
+        SymbolKind::Class,
+        SymbolKind::Struct,
+        SymbolKind::Function,
+        SymbolKind::Method,
+        SymbolKind::Field,
+        SymbolKind::Namespace,
+        SymbolKind::TemplateInstantiation,
+        SymbolKind::TranslationUnit,
+    ];
+    let ids: Vec<u64> = all_kinds
+        .iter()
+        .map(|k| SymbolId::from_parts(name, *k).0)
+        .collect();
+    let unique: HashSet<u64> = ids.iter().copied().collect();
+    assert_eq!(
+        ids.len(),
+        unique.len(),
+        "different kinds must produce different IDs for the same name"
+    );
 }
 
 #[test]
