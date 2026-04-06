@@ -1,0 +1,182 @@
+{
+  "files": {
+    "paths": [
+      "include/shape.h",
+      "include/circle.h",
+      "include/square.h",
+      "src/main.cpp"
+    ],
+    "index": {
+      "include/shape.h": 0,
+      "include/square.h": 2,
+      "include/circle.h": 1,
+      "src/main.cpp": 3
+    }
+  },
+  "symbols": {
+    "431510121773824215": {
+      "id": 431510121773824215,
+      "kind": "Class",
+      "name": "Shape",
+      "qualified_name": "Shape",
+      "location": {
+        "file": 0,
+        "line": 3,
+        "col": 1
+      },
+      "module": null,
+      "attrs": [
+        "Abstract"
+      ]
+    },
+    "3370629231376887314": {
+      "id": 3370629231376887314,
+      "kind": "Class",
+      "name": "Circle",
+      "qualified_name": "Circle",
+      "location": {
+        "file": 1,
+        "line": 5,
+        "col": 1
+      },
+      "module": null,
+      "attrs": []
+    },
+    "16274401493981508717": {
+      "id": 16274401493981508717,
+      "kind": "Class",
+      "name": "Square",
+      "qualified_name": "Square",
+      "location": {
+        "file": 2,
+        "line": 5,
+        "col": 1
+      },
+      "module": null,
+      "attrs": []
+    },
+    "14534339332128068973": {
+      "id": 14534339332128068973,
+      "kind": "Method",
+      "name": "area",
+      "qualified_name": "Shape::area",
+      "location": {
+        "file": 0,
+        "line": 6,
+        "col": 5
+      },
+      "module": null,
+      "attrs": [
+        "Virtual",
+        "Abstract"
+      ]
+    },
+    "10206104397325683908": {
+      "id": 10206104397325683908,
+      "kind": "Method",
+      "name": "area",
+      "qualified_name": "Circle::area",
+      "location": {
+        "file": 1,
+        "line": 8,
+        "col": 5
+      },
+      "module": null,
+      "attrs": [
+        "Virtual"
+      ]
+    },
+    "8386239880288634602": {
+      "id": 8386239880288634602,
+      "kind": "Method",
+      "name": "area",
+      "qualified_name": "Square::area",
+      "location": {
+        "file": 2,
+        "line": 8,
+        "col": 5
+      },
+      "module": null,
+      "attrs": [
+        "Virtual"
+      ]
+    },
+    "14309553661220262184": {
+      "id": 14309553661220262184,
+      "kind": "Function",
+      "name": "main",
+      "qualified_name": "main",
+      "location": {
+        "file": 3,
+        "line": 7,
+        "col": 1
+      },
+      "module": null,
+      "attrs": []
+    }
+  },
+  "edges": [
+    {
+      "from": 3370629231376887314,
+      "to": 431510121773824215,
+      "kind": "Inherits",
+      "location": null
+    },
+    {
+      "from": 16274401493981508717,
+      "to": 431510121773824215,
+      "kind": "Inherits",
+      "location": null
+    },
+    {
+      "from": 431510121773824215,
+      "to": 14534339332128068973,
+      "kind": "Contains",
+      "location": null
+    },
+    {
+      "from": 3370629231376887314,
+      "to": 10206104397325683908,
+      "kind": "Contains",
+      "location": null
+    },
+    {
+      "from": 16274401493981508717,
+      "to": 8386239880288634602,
+      "kind": "Contains",
+      "location": null
+    },
+    {
+      "from": 10206104397325683908,
+      "to": 14534339332128068973,
+      "kind": "Overrides",
+      "location": null
+    },
+    {
+      "from": 8386239880288634602,
+      "to": 14534339332128068973,
+      "kind": "Overrides",
+      "location": null
+    },
+    {
+      "from": 14309553661220262184,
+      "to": 10206104397325683908,
+      "kind": "Calls",
+      "location": {
+        "file": 3,
+        "line": 13,
+        "col": 9
+      }
+    },
+    {
+      "from": 14309553661220262184,
+      "to": 8386239880288634602,
+      "kind": "Calls",
+      "location": {
+        "file": 3,
+        "line": 13,
+        "col": 9
+      }
+    }
+  ]
+}

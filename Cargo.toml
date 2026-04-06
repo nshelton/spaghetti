@@ -1,0 +1,44 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/core-ir",
+    "crates/layout",
+    "crates/query",
+    "crates/viz",
+    # frontend-clang is only included when the "clang" feature is active
+]
+
+[workspace.dependencies]
+# Serialization
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+# Collections
+indexmap = { version = "2", features = ["serde"] }
+smallvec = { version = "1", features = ["serde"] }
+
+# Error handling
+thiserror = "1"
+anyhow = "1"
+
+# Logging
+tracing = "0.1"
+tracing-subscriber = "0.3"
+
+# Math
+glam = "0.32"
+
+# Parallelism
+rayon = "1"
+
+# GUI
+eframe = "0.34"
+egui = "0.34"
+
+# Hashing
+seahash = "4"
+
+# Internal crates
+core-ir = { path = "crates/core-ir" }
+layout = { path = "crates/layout" }
+query = { path = "crates/query" }

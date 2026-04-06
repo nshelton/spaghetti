@@ -1,0 +1,15 @@
+[package]
+name = "frontend-clang"
+version = "0.1.0"
+edition = "2021"
+
+[features]
+clang-tests = []
+
+[dependencies]
+core-ir = { workspace = true }
+rayon = { workspace = true }
+thiserror = { workspace = true }
+tracing = { workspace = true }
+serde_json = { workspace = true }
+clang = "2"

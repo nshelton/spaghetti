@@ -1,0 +1,9 @@
+[package]
+name = "query"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+core-ir = { workspace = true }
+thiserror = { workspace = true }
+tracing = { workspace = true }

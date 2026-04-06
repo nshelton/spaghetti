@@ -1,0 +1,22 @@
+[
+  {
+    "directory": "examples/tiny-cpp",
+    "command": "g++ -std=c++17 -Iinclude -c src/shape.cpp -o shape.o",
+    "file": "src/shape.cpp"
+  },
+  {
+    "directory": "examples/tiny-cpp",
+    "command": "g++ -std=c++17 -Iinclude -c src/circle.cpp -o circle.o",
+    "file": "src/circle.cpp"
+  },
+  {
+    "directory": "examples/tiny-cpp",
+    "command": "g++ -std=c++17 -Iinclude -c src/square.cpp -o square.o",
+    "file": "src/square.cpp"
+  },
+  {
+    "directory": "examples/tiny-cpp",
+    "command": "g++ -std=c++17 -Iinclude -c src/main.cpp -o main.o",
+    "file": "src/main.cpp"
+  }
+]
