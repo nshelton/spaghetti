@@ -36,13 +36,58 @@ pub struct SymbolId(pub u64);
 
 impl SymbolId {
     /// Create a deterministic [`SymbolId`] from a qualified name and kind.
+    ///
+    /// # Stability guarantees
+    ///
+    /// The returned `u64` is **stable across runs, platforms, and Rust
+    /// compiler versions** for a given `(qualified_name, kind)` pair.
+    ///
+    /// * **Hash function:** seahash v4 (`seahash::hash`). This is a
+    ///   portable, non-keyed hash whose output depends only on the input
+    ///   bytes — it uses no randomness and no platform-specific intrinsics.
+    /// * **Input normalization:** leading/trailing whitespace is trimmed and
+    ///   interior runs of whitespace are collapsed to a single ASCII space
+    ///   (`0x20`). This means `"Foo :: bar"` and `"Foo ::  bar"` produce
+    ///   the same ID.
+    /// * **Encoding:** the normalized name bytes are concatenated with a
+    ///   `0xFF` separator and the `SymbolKind` discriminant as a
+    ///   little-endian `u32`, so different kinds always hash differently
+    ///   even for the same name.
+    ///
+    /// Changing any of the above (hash algorithm, normalization rules, or
+    /// encoding) is a **breaking change** that invalidates persisted IDs and
+    /// golden-file tests.
     pub fn from_parts(qualified_name: &str, kind: SymbolKind) -> Self {
         use seahash::hash;
-        let mut buf = qualified_name.as_bytes().to_vec();
+        let normalized = normalize_name(qualified_name);
+        let mut buf = normalized.as_bytes().to_vec();
         buf.push(0xFF);
         buf.extend_from_slice(&(kind as u32).to_le_bytes());
         Self(hash(&buf))
     }
+}
+
+/// Trim leading/trailing whitespace and collapse interior runs of whitespace
+/// to a single ASCII space.
+fn normalize_name(name: &str) -> String {
+    let mut result = String::with_capacity(name.len());
+    let mut prev_was_space = true; // true to trim leading whitespace
+    for ch in name.chars() {
+        if ch.is_whitespace() {
+            if !prev_was_space {
+                result.push(' ');
+                prev_was_space = true;
+            }
+        } else {
+            result.push(ch);
+            prev_was_space = false;
+        }
+    }
+    // Trim trailing space if present
+    if result.ends_with(' ') {
+        result.pop();
+    }
+    result
 }
 
 // ---------------------------------------------------------------------------
