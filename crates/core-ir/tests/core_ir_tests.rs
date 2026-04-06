@@ -3,6 +3,7 @@
 use std::collections::{HashMap, HashSet};
 
 use core_ir::*;
+use smallvec::smallvec;
 
 fn make_symbol(name: &str, kind: SymbolKind) -> Symbol {
     let id = SymbolId::from_parts(name, kind);
@@ -247,4 +248,146 @@ fn test_serde_roundtrip() {
 
     assert_eq!(g2.symbol_count(), 1);
     assert_eq!(g2.files.resolve(FileId(0)), Some("src/main.cpp"));
+}
+
+// ---------------------------------------------------------------------------
+// CAP-002: Graph serde roundtrip golden-file tests
+// ---------------------------------------------------------------------------
+
+/// Test 1: Construct graph in code → serialize → deserialize → assert equality.
+#[test]
+fn test_serde_roundtrip_equality() {
+    let mut g = Graph::new();
+    let fid = g.files.intern("src/lib.rs");
+
+    let cls = Symbol {
+        id: SymbolId::from_parts("Foo", SymbolKind::Class),
+        kind: SymbolKind::Class,
+        name: "Foo".to_owned(),
+        qualified_name: "Foo".to_owned(),
+        location: Some(Location {
+            file: fid,
+            line: 1,
+            col: 1,
+        }),
+        module: Some("mymod".to_owned()),
+        attrs: smallvec![Attr::Abstract, Attr::Virtual],
+    };
+    let method = Symbol {
+        id: SymbolId::from_parts("Foo::bar", SymbolKind::Method),
+        kind: SymbolKind::Method,
+        name: "bar".to_owned(),
+        qualified_name: "Foo::bar".to_owned(),
+        location: Some(Location {
+            file: fid,
+            line: 5,
+            col: 5,
+        }),
+        module: None,
+        attrs: smallvec![Attr::Const],
+    };
+
+    let cls_id = g.add_symbol(cls);
+    let method_id = g.add_symbol(method);
+    g.add_edge(Edge {
+        from: cls_id,
+        to: method_id,
+        kind: EdgeKind::Contains,
+        location: None,
+    });
+
+    let json = g.to_json().expect("serialize");
+    let deserialized = Graph::from_json(&json).expect("deserialize");
+    assert_eq!(g, deserialized);
+}
+
+/// Test 2: Load golden file → deserialize → re-serialize → deserialize → assert stability.
+#[test]
+fn test_golden_file_roundtrip_stability() {
+    let golden_json =
+        std::fs::read_to_string("tests/fixtures/serde_golden.json").expect("read golden file");
+    let g1 = Graph::from_json(&golden_json).expect("first deserialize");
+    let reserialized = g1.to_json().expect("re-serialize");
+    let g2 = Graph::from_json(&reserialized).expect("second deserialize");
+    assert_eq!(g1, g2);
+}
+
+/// Test 3: Verify the golden file covers all SymbolKind and EdgeKind variants.
+#[test]
+fn test_golden_file_variant_coverage() {
+    let golden_json =
+        std::fs::read_to_string("tests/fixtures/serde_golden.json").expect("read golden file");
+    let g = Graph::from_json(&golden_json).expect("deserialize golden");
+
+    // Collect all SymbolKind variants present
+    let symbol_kinds: std::collections::HashSet<_> = g
+        .symbols
+        .values()
+        .map(|s| std::mem::discriminant(&s.kind))
+        .collect();
+    let all_symbol_kinds = [
+        SymbolKind::Class,
+        SymbolKind::Struct,
+        SymbolKind::Function,
+        SymbolKind::Method,
+        SymbolKind::Field,
+        SymbolKind::Namespace,
+        SymbolKind::TemplateInstantiation,
+        SymbolKind::TranslationUnit,
+    ];
+    for kind in &all_symbol_kinds {
+        assert!(
+            symbol_kinds.contains(&std::mem::discriminant(kind)),
+            "golden file missing SymbolKind::{kind:?}"
+        );
+    }
+
+    // Collect all EdgeKind variants present
+    let edge_kinds: std::collections::HashSet<_> = g
+        .edges
+        .iter()
+        .map(|e| std::mem::discriminant(&e.kind))
+        .collect();
+    let all_edge_kinds = [
+        EdgeKind::Calls,
+        EdgeKind::Inherits,
+        EdgeKind::Contains,
+        EdgeKind::ReadsField,
+        EdgeKind::WritesField,
+        EdgeKind::Includes,
+        EdgeKind::Instantiates,
+        EdgeKind::HasType,
+        EdgeKind::Overrides,
+    ];
+    for kind in &all_edge_kinds {
+        assert!(
+            edge_kinds.contains(&std::mem::discriminant(kind)),
+            "golden file missing EdgeKind::{kind:?}"
+        );
+    }
+}
+
+/// Test 4: Empty graph roundtrips correctly.
+#[test]
+fn test_empty_graph_roundtrip() {
+    let g = Graph::new();
+    let json = g.to_json().expect("serialize empty");
+    let g2 = Graph::from_json(&json).expect("deserialize empty");
+    assert_eq!(g, g2);
+    assert_eq!(g2.symbol_count(), 0);
+    assert_eq!(g2.edge_count(), 0);
+}
+
+/// Test 5: `examples/tiny-cpp/graph.json` roundtrips without data loss.
+#[test]
+fn test_tiny_cpp_graph_roundtrip() {
+    let original_json = std::fs::read_to_string("../../examples/tiny-cpp/graph.json")
+        .expect("read tiny-cpp graph.json");
+    let g1 = Graph::from_json(&original_json).expect("first deserialize");
+    let reserialized = g1.to_json().expect("re-serialize");
+    let g2 = Graph::from_json(&reserialized).expect("second deserialize");
+    assert_eq!(g1, g2);
+    // Sanity check: the tiny-cpp graph has known counts
+    assert_eq!(g1.symbol_count(), 7);
+    assert_eq!(g1.edge_count(), 9);
 }
