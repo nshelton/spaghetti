@@ -2,14 +2,15 @@
 //!
 //! Pure function from [`core_ir::Graph`] → [`Positions`]. No rendering dependencies.
 
-use std::collections::HashMap;
-
 use core_ir::{EdgeKind, Graph, SymbolId};
 use glam::Vec2;
+use indexmap::IndexMap;
 
 /// Mapping from symbol IDs to 2D positions.
+///
+/// Uses [`IndexMap`] to guarantee deterministic iteration order.
 #[derive(Debug, Clone)]
-pub struct Positions(pub HashMap<SymbolId, Vec2>);
+pub struct Positions(pub IndexMap<SymbolId, Vec2>);
 
 /// A layout algorithm that computes positions for graph nodes.
 pub trait Layout {
@@ -41,7 +42,7 @@ impl Layout for ForceDirected {
         let ids: Vec<SymbolId> = graph.symbols.keys().copied().collect();
         let n = ids.len();
         if n == 0 {
-            return Positions(HashMap::new());
+            return Positions(IndexMap::new());
         }
 
         // Deterministic initial positions using a simple hash-based scatter
@@ -57,7 +58,7 @@ impl Layout for ForceDirected {
             .collect();
 
         // Build edge index (as pairs of position indices)
-        let id_to_idx: HashMap<SymbolId, usize> =
+        let id_to_idx: IndexMap<SymbolId, usize> =
             ids.iter().enumerate().map(|(i, &id)| (id, i)).collect();
 
         let edge_pairs: Vec<(usize, usize)> = graph
@@ -116,7 +117,7 @@ impl Layout for ForceDirected {
             }
         }
 
-        let map: HashMap<SymbolId, Vec2> = ids.into_iter().zip(pos).collect();
+        let map: IndexMap<SymbolId, Vec2> = ids.into_iter().zip(pos).collect();
         Positions(map)
     }
 }
