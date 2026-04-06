@@ -54,7 +54,7 @@ impl SymbolId {
 pub struct FileId(pub u32);
 
 /// String-interning table for file paths.
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct FileTable {
     paths: Vec<String>,
     index: HashMap<String, FileId>,
@@ -154,7 +154,7 @@ pub enum Attr {
 // ---------------------------------------------------------------------------
 
 /// A node in the code graph.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Symbol {
     /// Unique identifier.
     pub id: SymbolId,
@@ -205,7 +205,7 @@ pub enum EdgeKind {
 // ---------------------------------------------------------------------------
 
 /// A directed edge in the code graph.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Edge {
     /// Source symbol.
     pub from: SymbolId,
@@ -222,7 +222,7 @@ pub struct Edge {
 // ---------------------------------------------------------------------------
 
 /// The central code graph: symbols (nodes) and edges (relationships).
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct Graph {
     /// Interned file paths.
     pub files: FileTable,

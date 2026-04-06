@@ -1,0 +1,201 @@
+{
+  "files": {
+    "paths": [
+      "include/myclass.h",
+      "src/main.cpp",
+      "include/vector.h"
+    ],
+    "index": {
+      "include/vector.h": 2,
+      "include/myclass.h": 0,
+      "src/main.cpp": 1
+    }
+  },
+  "symbols": {
+    "14701924629282052021": {
+      "id": 14701924629282052021,
+      "kind": "Namespace",
+      "name": "MyNamespace",
+      "qualified_name": "MyNamespace",
+      "location": null,
+      "module": null,
+      "attrs": []
+    },
+    "1813664031554356078": {
+      "id": 1813664031554356078,
+      "kind": "Class",
+      "name": "MyClass",
+      "qualified_name": "MyNamespace::MyClass",
+      "location": {
+        "file": 0,
+        "line": 10,
+        "col": 1
+      },
+      "module": "mymodule",
+      "attrs": [
+        "Abstract"
+      ]
+    },
+    "14666880402345592172": {
+      "id": 14666880402345592172,
+      "kind": "Struct",
+      "name": "MyStruct",
+      "qualified_name": "MyNamespace::MyStruct",
+      "location": {
+        "file": 0,
+        "line": 30,
+        "col": 1
+      },
+      "module": null,
+      "attrs": []
+    },
+    "2458808275723023275": {
+      "id": 2458808275723023275,
+      "kind": "Method",
+      "name": "method",
+      "qualified_name": "MyNamespace::MyClass::method",
+      "location": {
+        "file": 0,
+        "line": 15,
+        "col": 5
+      },
+      "module": "mymodule",
+      "attrs": [
+        "Virtual",
+        "Const"
+      ]
+    },
+    "9402313313054178995": {
+      "id": 9402313313054178995,
+      "kind": "Field",
+      "name": "field",
+      "qualified_name": "MyNamespace::MyStruct::field",
+      "location": {
+        "file": 0,
+        "line": 32,
+        "col": 5
+      },
+      "module": null,
+      "attrs": [
+        {
+          "Custom": "mutable"
+        }
+      ]
+    },
+    "12920951373858422664": {
+      "id": 12920951373858422664,
+      "kind": "Function",
+      "name": "free_function",
+      "qualified_name": "free_function",
+      "location": {
+        "file": 1,
+        "line": 5,
+        "col": 1
+      },
+      "module": null,
+      "attrs": [
+        "Static"
+      ]
+    },
+    "8114207905912866890": {
+      "id": 8114207905912866890,
+      "kind": "TemplateInstantiation",
+      "name": "Vector<int>",
+      "qualified_name": "Vector<int>",
+      "location": {
+        "file": 2,
+        "line": 1,
+        "col": 1
+      },
+      "module": null,
+      "attrs": []
+    },
+    "18155238833077166774": {
+      "id": 18155238833077166774,
+      "kind": "TranslationUnit",
+      "name": "main.cpp",
+      "qualified_name": "main.cpp",
+      "location": null,
+      "module": null,
+      "attrs": []
+    }
+  },
+  "edges": [
+    {
+      "from": 14701924629282052021,
+      "to": 1813664031554356078,
+      "kind": "Contains",
+      "location": null
+    },
+    {
+      "from": 14701924629282052021,
+      "to": 14666880402345592172,
+      "kind": "Contains",
+      "location": null
+    },
+    {
+      "from": 14666880402345592172,
+      "to": 1813664031554356078,
+      "kind": "Inherits",
+      "location": {
+        "file": 0,
+        "line": 30,
+        "col": 1
+      }
+    },
+    {
+      "from": 12920951373858422664,
+      "to": 2458808275723023275,
+      "kind": "Calls",
+      "location": {
+        "file": 1,
+        "line": 10,
+        "col": 5
+      }
+    },
+    {
+      "from": 12920951373858422664,
+      "to": 9402313313054178995,
+      "kind": "ReadsField",
+      "location": {
+        "file": 1,
+        "line": 11,
+        "col": 5
+      }
+    },
+    {
+      "from": 12920951373858422664,
+      "to": 9402313313054178995,
+      "kind": "WritesField",
+      "location": {
+        "file": 1,
+        "line": 12,
+        "col": 5
+      }
+    },
+    {
+      "from": 18155238833077166774,
+      "to": 14701924629282052021,
+      "kind": "Includes",
+      "location": null
+    },
+    {
+      "from": 8114207905912866890,
+      "to": 1813664031554356078,
+      "kind": "Instantiates",
+      "location": null
+    },
+    {
+      "from": 9402313313054178995,
+      "to": 1813664031554356078,
+      "kind": "HasType",
+      "location": null
+    },
+    {
+      "from": 2458808275723023275,
+      "to": 2458808275723023275,
+      "kind": "Overrides",
+      "location": null
+    }
+  ]
+}
