@@ -1,6 +1,6 @@
 //! Tests for core-ir types and graph operations.
 
-use super::*;
+use core_ir::*;
 
 fn make_symbol(name: &str, kind: SymbolKind) -> Symbol {
     let id = SymbolId::from_parts(name, kind);

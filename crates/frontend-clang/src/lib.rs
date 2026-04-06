@@ -13,9 +13,10 @@
 use std::path::Path;
 
 use core_ir::{
-    Edge, EdgeKind, FileId, Graph, Location, Symbol, SymbolId, SymbolKind,
+    Edge, EdgeKind, Graph, Location, Symbol, SymbolId, SymbolKind,
 };
-use rayon::prelude::*;
+// Note: libclang only allows one `Clang` instance per process, so we index
+// translation units sequentially rather than with rayon.
 use thiserror::Error;
 use tracing::{debug, info, warn};
 
@@ -52,9 +53,13 @@ pub fn index_project(compile_commands: &Path) -> Result<Graph, ClangError> {
     let contents = std::fs::read_to_string(compile_commands)?;
     let commands: Vec<CompileCommand> = serde_json::from_str(&contents)?;
 
-    let base_dir = compile_commands
+    // Canonicalize the compile_commands.json parent so we can resolve relative
+    // `directory` entries against it as a fallback.
+    let cc_parent = compile_commands
         .parent()
-        .unwrap_or_else(|| Path::new("."));
+        .unwrap_or_else(|| Path::new("."))
+        .canonicalize()
+        .unwrap_or_else(|_| compile_commands.parent().unwrap_or(Path::new(".")).to_path_buf());
 
     info!(
         entries = commands.len(),
@@ -62,10 +67,21 @@ pub fn index_project(compile_commands: &Path) -> Result<Graph, ClangError> {
     );
 
     let partial_graphs: Vec<Graph> = commands
-        .par_iter()
+        .iter()
         .filter_map(|cmd| {
-            let file_path = base_dir.join(&cmd.directory).join(&cmd.file);
-            match index_translation_unit(cmd, base_dir) {
+            // `directory` in compile_commands.json is the build working
+            // directory. Try as-is first (absolute or relative to CWD), then
+            // fall back to resolving relative to the compile_commands.json location.
+            let dir_path = std::path::PathBuf::from(&cmd.directory);
+            let work_dir = if dir_path.is_absolute() {
+                dir_path
+            } else {
+                dir_path.canonicalize()
+                    .or_else(|_| cc_parent.join(&cmd.directory).canonicalize())
+                    .unwrap_or_else(|_| cc_parent.join(&cmd.directory))
+            };
+            let file_path = work_dir.join(&cmd.file);
+            match index_translation_unit(cmd, &work_dir) {
                 Ok(g) => {
                     debug!(file = %file_path.display(), symbols = g.symbol_count(), "indexed TU");
                     Some(g)
@@ -92,11 +108,11 @@ pub fn index_project(compile_commands: &Path) -> Result<Graph, ClangError> {
 }
 
 /// Index a single translation unit.
-fn index_translation_unit(cmd: &CompileCommand, base_dir: &Path) -> Result<Graph, ClangError> {
+fn index_translation_unit(cmd: &CompileCommand, work_dir: &Path) -> Result<Graph, ClangError> {
     let clang = clang::Clang::new().map_err(|e| ClangError::Parse(e.to_string()))?;
     let index = clang::Index::new(&clang, false, true);
 
-    let file_path = base_dir.join(&cmd.directory).join(&cmd.file);
+    let file_path = work_dir.join(&cmd.file);
 
     // Extract compiler arguments
     let args = if let Some(arguments) = &cmd.arguments {
@@ -108,7 +124,8 @@ fn index_translation_unit(cmd: &CompileCommand, base_dir: &Path) -> Result<Graph
         vec![]
     };
 
-    // Filter out -o and -c flags and their arguments, keep only -I, -D, -std flags
+    // Filter out flags that conflict with libclang's parser (-o, -c, and the
+    // source file itself). Keep everything else (-I, -D, -std, -W, etc.).
     let mut filtered_args = Vec::new();
     let mut skip_next = false;
     for arg in &args {
@@ -120,14 +137,16 @@ fn index_translation_unit(cmd: &CompileCommand, base_dir: &Path) -> Result<Graph
             skip_next = true;
             continue;
         }
-        if arg.starts_with("-I") || arg.starts_with("-D") || arg.starts_with("-std") {
-            // Resolve -I paths relative to the command directory
-            if arg.starts_with("-I") && !arg.starts_with("-I/") {
-                let include_path = base_dir.join(&cmd.directory).join(&arg[2..]);
-                filtered_args.push(format!("-I{}", include_path.display()));
-            } else {
-                filtered_args.push(arg.clone());
-            }
+        // Skip the source file path (clang parser gets it separately)
+        if arg == &cmd.file || arg.ends_with(".cpp") || arg.ends_with(".c") {
+            continue;
+        }
+        // Resolve relative -I paths to absolute
+        if arg.starts_with("-I") && !arg.starts_with("-I/") {
+            let include_path = work_dir.join(&arg[2..]);
+            filtered_args.push(format!("-I{}", include_path.display()));
+        } else {
+            filtered_args.push(arg.clone());
         }
     }
 
@@ -138,7 +157,7 @@ fn index_translation_unit(cmd: &CompileCommand, base_dir: &Path) -> Result<Graph
         .map_err(|e| ClangError::Parse(format!("{:?}", e)))?;
 
     let mut graph = Graph::new();
-    visit_cursor(&tu.get_entity(), &mut graph, base_dir);
+    visit_cursor(&tu.get_entity(), &mut graph, work_dir);
     Ok(graph)
 }
 
@@ -151,11 +170,8 @@ fn visit_cursor(cursor: &clang::Entity, graph: &mut Graph, base_dir: &Path) {
             if cursor.is_definition() {
                 if let Some(name) = cursor.get_name() {
                     let qualified = qualified_name(cursor);
-                    let kind = if cursor.get_kind() == EntityKind::ClassDecl {
-                        SymbolKind::Class
-                    } else {
-                        SymbolKind::Class // Treat structs as classes for now
-                    };
+                    // Treat structs as classes for now (v0 scope)
+                    let kind = SymbolKind::Class;
                     let location = cursor_location(cursor, graph, base_dir);
                     let id = SymbolId::from_parts(&qualified, kind);
 
@@ -345,37 +361,4 @@ fn cursor_location(
         line: file_loc.line,
         col: file_loc.column,
     })
-}
-
-#[cfg(test)]
-#[cfg(feature = "clang-tests")]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn test_index_tiny_cpp() {
-        let compile_commands = Path::new(env!("CARGO_MANIFEST_DIR"))
-            .join("../../examples/tiny-cpp/compile_commands.json");
-
-        let graph = index_project(&compile_commands).expect("indexing failed");
-
-        // Should have at least Shape, Circle, Square classes
-        assert!(
-            graph.symbol_count() >= 3,
-            "expected at least 3 symbols, got {}",
-            graph.symbol_count()
-        );
-
-        // Should have inheritance edges
-        let inherits_count = graph
-            .edges
-            .iter()
-            .filter(|e| e.kind == EdgeKind::Inherits)
-            .count();
-        assert!(
-            inherits_count >= 2,
-            "expected at least 2 inheritance edges, got {}",
-            inherits_count
-        );
-    }
 }

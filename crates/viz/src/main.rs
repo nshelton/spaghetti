@@ -30,14 +30,8 @@ fn main() -> Result<()> {
             g
         }
         Err(_) => {
-            // TODO: If this is a compile_commands.json, use frontend-clang to index.
-            // For now, only the pre-serialized graph.json path is supported.
-            bail!(
-                "Could not parse {} as a serialized Graph. \
-                 compile_commands.json indexing requires the `clang` feature. \
-                 Use a pre-serialized graph.json instead.",
-                path.display()
-            );
+            // Not a pre-serialized graph — try as compile_commands.json via libclang.
+            load_via_clang(&path)?
         }
     };
 
@@ -58,4 +52,27 @@ fn main() -> Result<()> {
     .map_err(|e| anyhow::anyhow!("eframe error: {e}"))?;
 
     Ok(())
+}
+
+/// Attempt to index a compile_commands.json using the clang frontend.
+#[cfg(feature = "clang")]
+fn load_via_clang(path: &std::path::Path) -> Result<core_ir::Graph> {
+    let graph = frontend_clang::index_project(path)
+        .map_err(|e| anyhow::anyhow!("clang indexing failed: {e}"))?;
+    info!(
+        symbols = graph.symbol_count(),
+        edges = graph.edge_count(),
+        "indexed project via libclang"
+    );
+    Ok(graph)
+}
+
+#[cfg(not(feature = "clang"))]
+fn load_via_clang(path: &std::path::Path) -> Result<core_ir::Graph> {
+    anyhow::bail!(
+        "Could not parse {} as a serialized Graph. \
+         compile_commands.json indexing requires the `clang` feature. \
+         Rebuild with: cargo run -p viz --features clang",
+        path.display()
+    );
 }

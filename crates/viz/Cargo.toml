@@ -7,8 +7,12 @@ edition = "2021"
 name = "spaghetti"
 path = "src/main.rs"
 
+[features]
+clang = ["dep:frontend-clang"]
+
 [dependencies]
 core-ir = { workspace = true }
+frontend-clang = { workspace = true, optional = true }
 layout = { workspace = true }
 query = { workspace = true }
 eframe = { workspace = true }
