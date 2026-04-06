@@ -4,7 +4,7 @@ A cross-platform desktop visualizer for code structure and dataflow. Points at a
 
 This is a personal project hosted on GitHub. It is not published to crates.io. Internal crate names exist for workspace organization only.
 
-See `PLAN.md` for the full v0 scaffold spec.
+See [docs/Architecture.md](docs/Architecture.md) for detailed architecture documentation.
 
 ## Architecture
 
@@ -115,14 +115,14 @@ The core-ir enums may contain more variants than the frontend currently emits â€
 
 ## Current Status
 
-v0 scaffold. The definition of done is in `PLAN.md` under "Definition of Done". If you are starting a session and unsure what state the repo is in, run:
+The v0 scaffold is complete and functional. To verify the project is healthy:
 
 ```bash
 cargo check --workspace && cargo test --workspace && cargo run -p viz -- examples/tiny-cpp/graph.json
 ```
 
-If all three succeed and a window appears, the scaffold is complete and any further work should be explicitly requested, not volunteered.
+All three should succeed and a window should appear showing the example graph.
 
 ## Handoff Rule
 
-**Stop and ask before adding functionality not specified in `PLAN.md`.** Helpful expansion is actively harmful at this stage. The goal is a tight, working foundation.
+**Stop and ask before adding functionality not listed above or in the Non-Goals section.** Helpful expansion is actively harmful. The goal is a tight, working foundation.

@@ -4,6 +4,8 @@ A cross-platform desktop visualizer for code structure and dataflow. Point it at
 
 Built in Rust with [eframe](https://github.com/emilk/egui/tree/master/crates/eframe) (egui + wgpu + winit).
 
+![CI](https://github.com/nshelton/spaghetti/actions/workflows/ci.yml/badge.svg)
+
 ## Quick Start
 
 ```bash
@@ -18,7 +20,17 @@ cargo run -p viz -- examples/tiny-cpp/graph.json
 cargo run -p viz -- examples/tiny-cpp/compile_commands.json
 ```
 
-Expected result: a window showing 3 classes (Shape, Circle, Square) with inheritance and call edges.
+Expected result: a window showing 3 classes (Shape, Circle, Square) with inheritance and call edges from `main`.
+
+## Features
+
+- Interactive pan and zoom
+- Force-directed graph layout
+- Symbol search and filtering
+- Edge kind filtering (Calls, Inherits, Contains, Overrides)
+- Click-to-select with detail panel showing symbol info and neighbors
+- JSON fallback path (no libclang required)
+- Stable symbol ID hashing with input normalization
 
 ## libclang Setup
 
@@ -43,12 +55,12 @@ cargo fmt --check
 | Crate | Purpose |
 |-------|---------|
 | `core-ir` | Language-agnostic graph types and serde |
-| `frontend-clang` | libclang indexer → core-ir Graph |
+| `frontend-clang` | libclang indexer -> core-ir Graph |
 | `layout` | Force-directed graph layout |
 | `query` | Subgraph extraction, search, callers-of |
 | `viz` | eframe desktop app (binary: `spaghetti`) |
 
-See `PLAN.md` for the full v0 scaffold specification.
+See [docs/Architecture.md](docs/Architecture.md) for detailed architecture documentation.
 
 ## License
 

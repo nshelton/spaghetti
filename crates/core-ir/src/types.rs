@@ -99,7 +99,7 @@ fn normalize_name(name: &str) -> String {
 pub struct FileId(pub u32);
 
 /// String-interning table for file paths.
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct FileTable {
     paths: Vec<String>,
     index: HashMap<String, FileId>,
@@ -199,7 +199,7 @@ pub enum Attr {
 // ---------------------------------------------------------------------------
 
 /// A node in the code graph.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Symbol {
     /// Unique identifier.
     pub id: SymbolId,
@@ -278,7 +278,7 @@ impl Edge {
 // ---------------------------------------------------------------------------
 
 /// The central code graph: symbols (nodes) and edges (relationships).
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct Graph {
     /// Interned file paths.
     pub files: FileTable,
@@ -306,8 +306,31 @@ impl Graph {
         self.edges.push(edge);
     }
 
-    /// Iterate over neighbor symbol IDs reachable from `id` via edges whose
+    /// Iterate over neighbor symbol IDs connected to `id` via edges whose
     /// kind is in `kinds`. If `kinds` is empty, all edge kinds match.
+    ///
+    /// # Direction semantics
+    ///
+    /// Traversal is **bidirectional**: a neighbor is any node connected to
+    /// `id` by an edge where `id` appears as either the source (`from`) or
+    /// the target (`to`). This means `neighbors(A, &[])` returns B if there
+    /// is an edge `A → B` *or* `B → A`.
+    ///
+    /// # Unknown nodes
+    ///
+    /// If `id` does not exist in the graph, the iterator yields no items
+    /// (it does **not** return an error).
+    ///
+    /// # Duplicates
+    ///
+    /// If multiple edges connect the same pair of nodes (possibly with
+    /// different kinds), the neighbor's ID appears once per matching edge.
+    /// Callers that need a unique set should collect into a `HashSet`.
+    ///
+    /// # Self-loops
+    ///
+    /// A self-loop (an edge where `from == to == id`) yields the node
+    /// exactly once per matching edge, not twice.
     pub fn neighbors<'a>(
         &'a self,
         id: SymbolId,

@@ -3,6 +3,7 @@
 use std::collections::{HashMap, HashSet};
 
 use core_ir::*;
+use smallvec::smallvec;
 
 fn make_symbol(name: &str, kind: SymbolKind) -> Symbol {
     let id = SymbolId::from_parts(name, kind);
@@ -191,6 +192,154 @@ fn test_graph_add_and_neighbors() {
     // Neighbors without filter (all)
     let all: Vec<_> = g.neighbors(circle_id, &[]).collect();
     assert_eq!(all.len(), 2);
+}
+
+// ---------------------------------------------------------------------------
+// neighbors() — 5-node fixture graph
+//
+// Fixture topology:
+//
+//   A --Calls--> B --Inherits--> C
+//   |                            ^
+//   +--Contains--> D             |
+//                                |
+//   E --Calls--> E  (self-loop)  |
+//   E --Inherits--> C            |
+//
+// Node A: connected to B (Calls) and D (Contains)
+// Node B: connected to A (Calls, inbound) and C (Inherits)
+// Node C: connected to B (Inherits, inbound) and E (Inherits, inbound)
+// Node D: connected to A (Contains, inbound) — leaf for outgoing
+// Node E: self-loop (Calls) and inherits C
+// ---------------------------------------------------------------------------
+
+/// Build the standard 5-node fixture graph used by neighbors tests.
+fn neighbors_fixture() -> (Graph, SymbolId, SymbolId, SymbolId, SymbolId, SymbolId) {
+    let mut g = Graph::new();
+    let a = g.add_symbol(make_symbol("A", SymbolKind::Class));
+    let b = g.add_symbol(make_symbol("B", SymbolKind::Class));
+    let c = g.add_symbol(make_symbol("C", SymbolKind::Class));
+    let d = g.add_symbol(make_symbol("D", SymbolKind::Method));
+    let e = g.add_symbol(make_symbol("E", SymbolKind::Class));
+
+    g.add_edge(Edge {
+        from: a,
+        to: b,
+        kind: EdgeKind::Calls,
+        location: None,
+    });
+    g.add_edge(Edge {
+        from: b,
+        to: c,
+        kind: EdgeKind::Inherits,
+        location: None,
+    });
+    g.add_edge(Edge {
+        from: a,
+        to: d,
+        kind: EdgeKind::Contains,
+        location: None,
+    });
+    g.add_edge(Edge {
+        from: e,
+        to: e,
+        kind: EdgeKind::Calls,
+        location: None,
+    });
+    g.add_edge(Edge {
+        from: e,
+        to: c,
+        kind: EdgeKind::Inherits,
+        location: None,
+    });
+
+    (g, a, b, c, d, e)
+}
+
+#[test]
+fn test_neighbors_all_no_filter() {
+    let (g, a, b, _c, _d, _e) = neighbors_fixture();
+
+    // A is connected to B (Calls) and D (Contains) — bidirectional traversal.
+    let mut all_a: Vec<SymbolId> = g.neighbors(a, &[]).collect();
+    all_a.sort_by_key(|id| id.0);
+    let mut expected = vec![b, _d];
+    expected.sort_by_key(|id| id.0);
+    assert_eq!(all_a, expected, "A should see B and D with no filter");
+
+    // B is connected to A (Calls, inbound) and C (Inherits, outbound).
+    let mut all_b: Vec<SymbolId> = g.neighbors(b, &[]).collect();
+    all_b.sort_by_key(|id| id.0);
+    let mut expected_b = vec![a, _c];
+    expected_b.sort_by_key(|id| id.0);
+    assert_eq!(all_b, expected_b, "B should see A and C with no filter");
+}
+
+#[test]
+fn test_neighbors_filter_single_kind() {
+    let (g, a, b, _c, _d, _e) = neighbors_fixture();
+
+    // A --Calls--> B, so filtering by Calls from A yields B.
+    let calls: Vec<SymbolId> = g.neighbors(a, &[EdgeKind::Calls]).collect();
+    assert_eq!(calls, vec![b]);
+
+    // A --Contains--> D, so filtering by Contains from A yields D.
+    let contains: Vec<SymbolId> = g.neighbors(a, &[EdgeKind::Contains]).collect();
+    assert_eq!(contains, vec![_d]);
+}
+
+#[test]
+fn test_neighbors_filter_multiple_kinds() {
+    let (g, _a, _b, c, _d, e) = neighbors_fixture();
+
+    // E has Calls(self) and Inherits(C). Filter by both kinds.
+    let mut multi: Vec<SymbolId> = g
+        .neighbors(e, &[EdgeKind::Calls, EdgeKind::Inherits])
+        .collect();
+    multi.sort_by_key(|id| id.0);
+    // Self-loop yields E twice (from and to), plus C from Inherits.
+    // e.from == e and e.to == e both match, so self-loop produces 2 entries for E.
+    assert!(multi.contains(&e), "E should appear (self-loop via Calls)");
+    assert!(multi.contains(&c), "C should appear (Inherits from E)");
+}
+
+#[test]
+fn test_neighbors_leaf_node() {
+    let (g, _a, _b, _c, d, _e) = neighbors_fixture();
+
+    // D only has an inbound Contains edge from A — bidirectional means we see A.
+    let leaf: Vec<SymbolId> = g.neighbors(d, &[]).collect();
+    assert_eq!(leaf, vec![_a], "D should see A via inbound Contains edge");
+
+    // But if we filter by Calls, D has none.
+    let leaf_calls: Vec<SymbolId> = g.neighbors(d, &[EdgeKind::Calls]).collect();
+    assert!(leaf_calls.is_empty(), "D has no Calls edges");
+}
+
+#[test]
+fn test_neighbors_unknown_node() {
+    let (g, _a, _b, _c, _d, _e) = neighbors_fixture();
+
+    let unknown = SymbolId(999_999);
+    let result: Vec<SymbolId> = g.neighbors(unknown, &[]).collect();
+    assert!(
+        result.is_empty(),
+        "unknown node should yield empty iterator"
+    );
+}
+
+#[test]
+fn test_neighbors_self_loop() {
+    let (g, _a, _b, _c, _d, e) = neighbors_fixture();
+
+    // E --Calls--> E (self-loop). The implementation uses if/else-if, so
+    // a self-loop edge yields the node exactly once (the `from` branch fires).
+    let self_refs: Vec<SymbolId> = g.neighbors(e, &[EdgeKind::Calls]).collect();
+    assert_eq!(
+        self_refs,
+        vec![e],
+        "self-loop should yield the node once per self-referencing edge"
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -486,4 +635,146 @@ fn test_serde_roundtrip() {
 
     assert_eq!(g2.symbol_count(), 1);
     assert_eq!(g2.files.resolve(FileId(0)), Some("src/main.cpp"));
+}
+
+// ---------------------------------------------------------------------------
+// CAP-002: Graph serde roundtrip golden-file tests
+// ---------------------------------------------------------------------------
+
+/// Test 1: Construct graph in code → serialize → deserialize → assert equality.
+#[test]
+fn test_serde_roundtrip_equality() {
+    let mut g = Graph::new();
+    let fid = g.files.intern("src/lib.rs");
+
+    let cls = Symbol {
+        id: SymbolId::from_parts("Foo", SymbolKind::Class),
+        kind: SymbolKind::Class,
+        name: "Foo".to_owned(),
+        qualified_name: "Foo".to_owned(),
+        location: Some(Location {
+            file: fid,
+            line: 1,
+            col: 1,
+        }),
+        module: Some("mymod".to_owned()),
+        attrs: smallvec![Attr::Abstract, Attr::Virtual],
+    };
+    let method = Symbol {
+        id: SymbolId::from_parts("Foo::bar", SymbolKind::Method),
+        kind: SymbolKind::Method,
+        name: "bar".to_owned(),
+        qualified_name: "Foo::bar".to_owned(),
+        location: Some(Location {
+            file: fid,
+            line: 5,
+            col: 5,
+        }),
+        module: None,
+        attrs: smallvec![Attr::Const],
+    };
+
+    let cls_id = g.add_symbol(cls);
+    let method_id = g.add_symbol(method);
+    g.add_edge(Edge {
+        from: cls_id,
+        to: method_id,
+        kind: EdgeKind::Contains,
+        location: None,
+    });
+
+    let json = g.to_json().expect("serialize");
+    let deserialized = Graph::from_json(&json).expect("deserialize");
+    assert_eq!(g, deserialized);
+}
+
+/// Test 2: Load golden file → deserialize → re-serialize → deserialize → assert stability.
+#[test]
+fn test_golden_file_roundtrip_stability() {
+    let golden_json =
+        std::fs::read_to_string("tests/fixtures/serde_golden.json").expect("read golden file");
+    let g1 = Graph::from_json(&golden_json).expect("first deserialize");
+    let reserialized = g1.to_json().expect("re-serialize");
+    let g2 = Graph::from_json(&reserialized).expect("second deserialize");
+    assert_eq!(g1, g2);
+}
+
+/// Test 3: Verify the golden file covers all SymbolKind and EdgeKind variants.
+#[test]
+fn test_golden_file_variant_coverage() {
+    let golden_json =
+        std::fs::read_to_string("tests/fixtures/serde_golden.json").expect("read golden file");
+    let g = Graph::from_json(&golden_json).expect("deserialize golden");
+
+    // Collect all SymbolKind variants present
+    let symbol_kinds: std::collections::HashSet<_> = g
+        .symbols
+        .values()
+        .map(|s| std::mem::discriminant(&s.kind))
+        .collect();
+    let all_symbol_kinds = [
+        SymbolKind::Class,
+        SymbolKind::Struct,
+        SymbolKind::Function,
+        SymbolKind::Method,
+        SymbolKind::Field,
+        SymbolKind::Namespace,
+        SymbolKind::TemplateInstantiation,
+        SymbolKind::TranslationUnit,
+    ];
+    for kind in &all_symbol_kinds {
+        assert!(
+            symbol_kinds.contains(&std::mem::discriminant(kind)),
+            "golden file missing SymbolKind::{kind:?}"
+        );
+    }
+
+    // Collect all EdgeKind variants present
+    let edge_kinds: std::collections::HashSet<_> = g
+        .edges
+        .iter()
+        .map(|e| std::mem::discriminant(&e.kind))
+        .collect();
+    let all_edge_kinds = [
+        EdgeKind::Calls,
+        EdgeKind::Inherits,
+        EdgeKind::Contains,
+        EdgeKind::ReadsField,
+        EdgeKind::WritesField,
+        EdgeKind::Includes,
+        EdgeKind::Instantiates,
+        EdgeKind::HasType,
+        EdgeKind::Overrides,
+    ];
+    for kind in &all_edge_kinds {
+        assert!(
+            edge_kinds.contains(&std::mem::discriminant(kind)),
+            "golden file missing EdgeKind::{kind:?}"
+        );
+    }
+}
+
+/// Test 4: Empty graph roundtrips correctly.
+#[test]
+fn test_empty_graph_roundtrip() {
+    let g = Graph::new();
+    let json = g.to_json().expect("serialize empty");
+    let g2 = Graph::from_json(&json).expect("deserialize empty");
+    assert_eq!(g, g2);
+    assert_eq!(g2.symbol_count(), 0);
+    assert_eq!(g2.edge_count(), 0);
+}
+
+/// Test 5: `examples/tiny-cpp/graph.json` roundtrips without data loss.
+#[test]
+fn test_tiny_cpp_graph_roundtrip() {
+    let original_json = std::fs::read_to_string("../../examples/tiny-cpp/graph.json")
+        .expect("read tiny-cpp graph.json");
+    let g1 = Graph::from_json(&original_json).expect("first deserialize");
+    let reserialized = g1.to_json().expect("re-serialize");
+    let g2 = Graph::from_json(&reserialized).expect("second deserialize");
+    assert_eq!(g1, g2);
+    // Sanity check: the tiny-cpp graph has known counts
+    assert_eq!(g1.symbol_count(), 7);
+    assert_eq!(g1.edge_count(), 9);
 }
