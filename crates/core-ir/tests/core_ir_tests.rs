@@ -193,6 +193,154 @@ fn test_graph_add_and_neighbors() {
     assert_eq!(all.len(), 2);
 }
 
+// ---------------------------------------------------------------------------
+// neighbors() — 5-node fixture graph
+//
+// Fixture topology:
+//
+//   A --Calls--> B --Inherits--> C
+//   |                            ^
+//   +--Contains--> D             |
+//                                |
+//   E --Calls--> E  (self-loop)  |
+//   E --Inherits--> C            |
+//
+// Node A: connected to B (Calls) and D (Contains)
+// Node B: connected to A (Calls, inbound) and C (Inherits)
+// Node C: connected to B (Inherits, inbound) and E (Inherits, inbound)
+// Node D: connected to A (Contains, inbound) — leaf for outgoing
+// Node E: self-loop (Calls) and inherits C
+// ---------------------------------------------------------------------------
+
+/// Build the standard 5-node fixture graph used by neighbors tests.
+fn neighbors_fixture() -> (Graph, SymbolId, SymbolId, SymbolId, SymbolId, SymbolId) {
+    let mut g = Graph::new();
+    let a = g.add_symbol(make_symbol("A", SymbolKind::Class));
+    let b = g.add_symbol(make_symbol("B", SymbolKind::Class));
+    let c = g.add_symbol(make_symbol("C", SymbolKind::Class));
+    let d = g.add_symbol(make_symbol("D", SymbolKind::Method));
+    let e = g.add_symbol(make_symbol("E", SymbolKind::Class));
+
+    g.add_edge(Edge {
+        from: a,
+        to: b,
+        kind: EdgeKind::Calls,
+        location: None,
+    });
+    g.add_edge(Edge {
+        from: b,
+        to: c,
+        kind: EdgeKind::Inherits,
+        location: None,
+    });
+    g.add_edge(Edge {
+        from: a,
+        to: d,
+        kind: EdgeKind::Contains,
+        location: None,
+    });
+    g.add_edge(Edge {
+        from: e,
+        to: e,
+        kind: EdgeKind::Calls,
+        location: None,
+    });
+    g.add_edge(Edge {
+        from: e,
+        to: c,
+        kind: EdgeKind::Inherits,
+        location: None,
+    });
+
+    (g, a, b, c, d, e)
+}
+
+#[test]
+fn test_neighbors_all_no_filter() {
+    let (g, a, b, _c, _d, _e) = neighbors_fixture();
+
+    // A is connected to B (Calls) and D (Contains) — bidirectional traversal.
+    let mut all_a: Vec<SymbolId> = g.neighbors(a, &[]).collect();
+    all_a.sort_by_key(|id| id.0);
+    let mut expected = vec![b, _d];
+    expected.sort_by_key(|id| id.0);
+    assert_eq!(all_a, expected, "A should see B and D with no filter");
+
+    // B is connected to A (Calls, inbound) and C (Inherits, outbound).
+    let mut all_b: Vec<SymbolId> = g.neighbors(b, &[]).collect();
+    all_b.sort_by_key(|id| id.0);
+    let mut expected_b = vec![a, _c];
+    expected_b.sort_by_key(|id| id.0);
+    assert_eq!(all_b, expected_b, "B should see A and C with no filter");
+}
+
+#[test]
+fn test_neighbors_filter_single_kind() {
+    let (g, a, b, _c, _d, _e) = neighbors_fixture();
+
+    // A --Calls--> B, so filtering by Calls from A yields B.
+    let calls: Vec<SymbolId> = g.neighbors(a, &[EdgeKind::Calls]).collect();
+    assert_eq!(calls, vec![b]);
+
+    // A --Contains--> D, so filtering by Contains from A yields D.
+    let contains: Vec<SymbolId> = g.neighbors(a, &[EdgeKind::Contains]).collect();
+    assert_eq!(contains, vec![_d]);
+}
+
+#[test]
+fn test_neighbors_filter_multiple_kinds() {
+    let (g, _a, _b, c, _d, e) = neighbors_fixture();
+
+    // E has Calls(self) and Inherits(C). Filter by both kinds.
+    let mut multi: Vec<SymbolId> = g
+        .neighbors(e, &[EdgeKind::Calls, EdgeKind::Inherits])
+        .collect();
+    multi.sort_by_key(|id| id.0);
+    // Self-loop yields E twice (from and to), plus C from Inherits.
+    // e.from == e and e.to == e both match, so self-loop produces 2 entries for E.
+    assert!(multi.contains(&e), "E should appear (self-loop via Calls)");
+    assert!(multi.contains(&c), "C should appear (Inherits from E)");
+}
+
+#[test]
+fn test_neighbors_leaf_node() {
+    let (g, _a, _b, _c, d, _e) = neighbors_fixture();
+
+    // D only has an inbound Contains edge from A — bidirectional means we see A.
+    let leaf: Vec<SymbolId> = g.neighbors(d, &[]).collect();
+    assert_eq!(leaf, vec![_a], "D should see A via inbound Contains edge");
+
+    // But if we filter by Calls, D has none.
+    let leaf_calls: Vec<SymbolId> = g.neighbors(d, &[EdgeKind::Calls]).collect();
+    assert!(leaf_calls.is_empty(), "D has no Calls edges");
+}
+
+#[test]
+fn test_neighbors_unknown_node() {
+    let (g, _a, _b, _c, _d, _e) = neighbors_fixture();
+
+    let unknown = SymbolId(999_999);
+    let result: Vec<SymbolId> = g.neighbors(unknown, &[]).collect();
+    assert!(
+        result.is_empty(),
+        "unknown node should yield empty iterator"
+    );
+}
+
+#[test]
+fn test_neighbors_self_loop() {
+    let (g, _a, _b, _c, _d, e) = neighbors_fixture();
+
+    // E --Calls--> E (self-loop). The implementation uses if/else-if, so
+    // a self-loop edge yields the node exactly once (the `from` branch fires).
+    let self_refs: Vec<SymbolId> = g.neighbors(e, &[EdgeKind::Calls]).collect();
+    assert_eq!(
+        self_refs,
+        vec![e],
+        "self-loop should yield the node once per self-referencing edge"
+    );
+}
+
 #[test]
 fn test_merge_determinism() {
     let mut g1 = Graph::new();
