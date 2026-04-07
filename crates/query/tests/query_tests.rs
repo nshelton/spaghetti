@@ -278,3 +278,134 @@ fn test_callers_of_none() {
     let callers = callers_of(&g, shape_id);
     assert!(callers.is_empty());
 }
+
+// ---------------------------------------------------------------------------
+// CAP-008: callers_of directional correctness tests
+// ---------------------------------------------------------------------------
+
+/// Helper to build a graph for CAP-008 tests.
+///
+/// ```text
+///   caller1 --Calls--> target --Calls--> callee1
+///   caller2 --Calls--> target
+///   unrelated --Inherits--> target
+///   target --Calls--> target  (self-call)
+/// ```
+fn cap008_graph() -> (Graph, SymbolId, SymbolId, SymbolId, SymbolId, SymbolId) {
+    let mut g = Graph::new();
+    let caller1 = make_symbol("caller1", SymbolKind::Function);
+    let caller2 = make_symbol("caller2", SymbolKind::Function);
+    let target = make_symbol("target", SymbolKind::Method);
+    let callee1 = make_symbol("callee1", SymbolKind::Function);
+    let unrelated = make_symbol("unrelated", SymbolKind::Class);
+
+    let (c1, c2, t, ce1, u) = (caller1.id, caller2.id, target.id, callee1.id, unrelated.id);
+
+    g.add_symbol(caller1);
+    g.add_symbol(caller2);
+    g.add_symbol(target);
+    g.add_symbol(callee1);
+    g.add_symbol(unrelated);
+
+    // Incoming Calls edges to target
+    g.add_edge(Edge {
+        from: c1,
+        to: t,
+        kind: EdgeKind::Calls,
+        location: None,
+    });
+    g.add_edge(Edge {
+        from: c2,
+        to: t,
+        kind: EdgeKind::Calls,
+        location: None,
+    });
+    // Outgoing Calls edge from target (callee, should NOT appear)
+    g.add_edge(Edge {
+        from: t,
+        to: ce1,
+        kind: EdgeKind::Calls,
+        location: None,
+    });
+    // Non-call edge pointing to target (should NOT appear)
+    g.add_edge(Edge {
+        from: u,
+        to: t,
+        kind: EdgeKind::Inherits,
+        location: None,
+    });
+    // Self-call
+    g.add_edge(Edge {
+        from: t,
+        to: t,
+        kind: EdgeKind::Calls,
+        location: None,
+    });
+
+    (g, c1, c2, t, ce1, u)
+}
+
+/// CAP-008 test 1: multiple symbols calling one target are all returned.
+#[test]
+fn test_cap008_basic_callers() {
+    let (g, c1, c2, t, ..) = cap008_graph();
+    let callers = callers_of(&g, t);
+    assert!(callers.contains(&c1), "caller1 should be a caller");
+    assert!(callers.contains(&c2), "caller2 should be a caller");
+}
+
+/// CAP-008 test 2: callees (outgoing edges) are excluded.
+#[test]
+fn test_cap008_exclude_callees() {
+    let (g, _, _, t, ce1, _) = cap008_graph();
+    let callers = callers_of(&g, t);
+    assert!(
+        !callers.contains(&ce1),
+        "callee1 must not appear — it is called BY target, not a caller OF target"
+    );
+}
+
+/// CAP-008 test 3: returns empty when nothing calls the target.
+#[test]
+fn test_cap008_empty_callers() {
+    let (g, _, _, _, ce1, _) = cap008_graph();
+    // callee1 has no incoming Calls edges in this graph
+    let callers = callers_of(&g, ce1);
+    // Only target calls callee1, so callers should be [target]
+    // Actually test a node with truly zero callers — caller1 has none.
+    let (g2, c1, ..) = cap008_graph();
+    let callers2 = callers_of(&g2, c1);
+    assert!(callers2.is_empty(), "caller1 has no incoming Calls edges");
+    let _ = (g, callers);
+}
+
+/// CAP-008 test 4: non-call edges (Inherits, Contains, etc.) are ignored.
+#[test]
+fn test_cap008_edge_type_filtering() {
+    let (g, _, _, t, _, u) = cap008_graph();
+    let callers = callers_of(&g, t);
+    assert!(
+        !callers.contains(&u),
+        "unrelated has an Inherits edge to target, not Calls — must be excluded"
+    );
+}
+
+/// CAP-008 test 5: unknown ID returns empty vec without panicking.
+#[test]
+fn test_cap008_unknown_id() {
+    let (g, ..) = cap008_graph();
+    let missing = SymbolId::from_parts("does_not_exist", SymbolKind::Function);
+    let callers = callers_of(&g, missing);
+    assert!(callers.is_empty(), "unknown ID must return empty results");
+}
+
+/// CAP-008 test 6: self-call — target calls itself, so it should appear as its own caller.
+#[test]
+fn test_cap008_self_call() {
+    let (g, _, _, t, ..) = cap008_graph();
+    let callers = callers_of(&g, t);
+    assert!(
+        callers.contains(&t),
+        "target calls itself — it should appear in its own callers list"
+    );
+}
