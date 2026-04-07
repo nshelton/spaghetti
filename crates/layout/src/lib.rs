@@ -5,6 +5,7 @@
 use core_ir::{EdgeKind, Graph, SymbolId};
 use glam::Vec2;
 use indexmap::IndexMap;
+use std::collections::VecDeque;
 
 /// Mapping from symbol IDs to 2D positions.
 ///
@@ -117,7 +118,109 @@ impl Layout for ForceDirected {
             }
         }
 
-        let map: IndexMap<SymbolId, Vec2> = ids.into_iter().zip(pos).collect();
+        let mut map: IndexMap<SymbolId, Vec2> = ids.into_iter().zip(pos).collect();
+        pack_components(&mut map, graph);
         Positions(map)
     }
+}
+
+/// Padding between component bounding boxes (in layout units).
+const COMPONENT_PADDING: f32 = 50.0;
+
+/// Detect connected components via BFS and shift them so their padded bounding
+/// boxes do not overlap. Uses a simple horizontal strip-packing approach.
+fn pack_components(positions: &mut IndexMap<SymbolId, Vec2>, graph: &Graph) {
+    let components = find_components(positions, graph);
+    if components.len() <= 1 {
+        return;
+    }
+
+    // Compute bounding box for each component
+    struct BBox {
+        min: Vec2,
+        max: Vec2,
+    }
+
+    let mut boxes: Vec<BBox> = components
+        .iter()
+        .map(|comp| {
+            let mut min = Vec2::splat(f32::INFINITY);
+            let mut max = Vec2::splat(f32::NEG_INFINITY);
+            for &id in comp {
+                let p = positions[&id];
+                min = min.min(p);
+                max = max.max(p);
+            }
+            BBox { min, max }
+        })
+        .collect();
+
+    // Pack components left-to-right with padding
+    let mut cursor_x: f32 = 0.0;
+    for (i, comp) in components.iter().enumerate() {
+        let bbox = &mut boxes[i];
+        let width = bbox.max.x - bbox.min.x;
+        let offset_x = cursor_x - bbox.min.x;
+        let offset_y = -bbox.min.y; // Align top edges at y=0
+
+        for &id in comp {
+            let p = positions.get_mut(&id).expect("symbol in component");
+            p.x += offset_x;
+            p.y += offset_y;
+        }
+
+        bbox.min.x += offset_x;
+        bbox.max.x += offset_x;
+        bbox.min.y += offset_y;
+        bbox.max.y += offset_y;
+
+        cursor_x = bbox.max.x + width.clamp(1.0, COMPONENT_PADDING) + COMPONENT_PADDING;
+    }
+}
+
+/// Find connected components using BFS over the graph's edges.
+///
+/// Returns a list of components, each being a list of [`SymbolId`]s. Components
+/// are sorted by the first symbol ID in each group for deterministic ordering.
+fn find_components(positions: &IndexMap<SymbolId, Vec2>, graph: &Graph) -> Vec<Vec<SymbolId>> {
+    // Build adjacency list from graph edges (undirected for component detection)
+    let mut adj: IndexMap<SymbolId, Vec<SymbolId>> = IndexMap::new();
+    for id in positions.keys() {
+        adj.entry(*id).or_default();
+    }
+    for edge in &graph.edges {
+        if positions.contains_key(&edge.from) && positions.contains_key(&edge.to) {
+            adj.entry(edge.from).or_default().push(edge.to);
+            adj.entry(edge.to).or_default().push(edge.from);
+        }
+    }
+
+    let mut visited: IndexMap<SymbolId, bool> = positions.keys().map(|&id| (id, false)).collect();
+    let mut components = Vec::new();
+
+    for &id in positions.keys() {
+        if visited[&id] {
+            continue;
+        }
+        let mut component = Vec::new();
+        let mut queue = VecDeque::new();
+        queue.push_back(id);
+        *visited.get_mut(&id).expect("visited entry") = true;
+
+        while let Some(current) = queue.pop_front() {
+            component.push(current);
+            if let Some(neighbors) = adj.get(&current) {
+                for &neighbor in neighbors {
+                    if !visited[&neighbor] {
+                        *visited.get_mut(&neighbor).expect("visited entry") = true;
+                        queue.push_back(neighbor);
+                    }
+                }
+            }
+        }
+
+        components.push(component);
+    }
+
+    components
 }

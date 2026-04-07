@@ -1,0 +1,17 @@
+{
+  "symbols": {
+    "A1": { "kind": "Class", "name": "A1" },
+    "B1": { "kind": "Class", "name": "B1" },
+    "C1": { "kind": "Class", "name": "C1" },
+    "A2": { "kind": "Class", "name": "A2" },
+    "B2": { "kind": "Class", "name": "B2" },
+    "C2": { "kind": "Class", "name": "C2" }
+  },
+  "edges": [
+    { "from": "A1", "to": "B1", "kind": "Calls" },
+    { "from": "B1", "to": "C1", "kind": "Calls" },
+    { "from": "A2", "to": "B2", "kind": "Calls" },
+    { "from": "B2", "to": "C2", "kind": "Calls" }
+  ],
+  "description": "Two disconnected 3-node triangles for CAP-006 testing"
+}
