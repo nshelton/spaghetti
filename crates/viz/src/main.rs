@@ -3,6 +3,7 @@
 //! Usage: `spaghetti <path-to-compile_commands.json>`
 
 mod app;
+mod camera;
 
 use anyhow::{bail, Result};
 use std::path::PathBuf;
