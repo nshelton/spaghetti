@@ -74,7 +74,20 @@ pub fn find_by_name(g: &Graph, pattern: &str) -> Vec<SymbolId> {
         .collect()
 }
 
-/// Find all symbols that have a `Calls` edge pointing to `id`.
+/// Find all symbols that have a `Calls` edge pointing **to** `id`.
+///
+/// # Direction semantics
+///
+/// Only **incoming** `Calls` edges are considered: an edge `A → B` with kind
+/// `Calls` means A is a caller of B. This function returns the `from` side of
+/// such edges. Outgoing edges (callees of `id`) are excluded.
+///
+/// Non-call edge kinds (`Inherits`, `Contains`, etc.) are ignored entirely.
+///
+/// If `id` does not exist in the graph or nothing calls it, an empty `Vec` is
+/// returned — the function never panics on an unknown ID.
+///
+/// If `id` calls itself (self-loop), it appears in the result.
 pub fn callers_of(g: &Graph, id: SymbolId) -> Vec<SymbolId> {
     g.edges
         .iter()
