@@ -10,7 +10,7 @@
 use core_ir::{EdgeKind, Graph, SymbolId};
 use glam::Vec2;
 use indexmap::IndexMap;
-use std::collections::VecDeque;
+use std::collections::{HashMap, VecDeque};
 
 /// Mapping from symbol IDs to 2D positions.
 ///
@@ -37,6 +37,10 @@ pub struct ForceParams {
     pub ideal_length: f32,
     /// Minimum distance clamped to avoid division by near-zero.
     pub min_dist: f32,
+    /// Cutoff distance for grid-based repulsion. Pairs farther apart than this
+    /// skip the expensive per-pair calculation. Set to `f32::INFINITY` to
+    /// disable the optimisation and fall back to all-pairs.
+    pub repulsion_cutoff: f32,
 }
 
 impl Default for ForceParams {
@@ -47,6 +51,7 @@ impl Default for ForceParams {
             damping: 0.9,
             ideal_length: 150.0,
             min_dist: 1.0,
+            repulsion_cutoff: 500.0,
         }
     }
 }
@@ -130,21 +135,77 @@ impl LayoutState {
 
     /// Run `n` simulation iterations.
     pub fn step(&mut self, n: u32) {
+        self.step_inner(n, false);
+    }
+
+    /// Run up to `n` iterations, optionally stopping early when energy is low.
+    fn step_inner(&mut self, n: u32, early_stop: bool) {
+        /// Energy threshold below which batch layout stops early.
+        const EARLY_STOP_ENERGY: f32 = 0.5;
+
         let len = self.positions.len();
         let p = &self.params;
 
         for _ in 0..n {
+            if early_stop && self.energy() < EARLY_STOP_ENERGY {
+                break;
+            }
             let mut forces = vec![Vec2::ZERO; len];
 
-            // Repulsive forces (all pairs)
-            // TODO: Barnes-Hut octree for O(n log n) instead of O(n^2)
+            // Repulsive forces — grid-based cutoff for ~O(n) instead of O(n²).
+            // Nodes are bucketed into cells of size `cutoff`. Only pairs in the
+            // same or adjacent cells (3×3 neighbourhood) are evaluated.
+            let cutoff = p.repulsion_cutoff;
+            let cutoff_sq = cutoff * cutoff;
+            let inv_cutoff = 1.0 / cutoff;
+
+            // Build spatial grid
+            let mut grid: HashMap<(i32, i32), Vec<usize>> = HashMap::new();
             for i in 0..len {
-                for j in (i + 1)..len {
-                    let delta = self.positions[i] - self.positions[j];
-                    let dist = delta.length().max(p.min_dist);
-                    let force = delta.normalize_or_zero() * (p.repulsion / (dist * dist));
-                    forces[i] += force;
-                    forces[j] -= force;
+                let cx = (self.positions[i].x * inv_cutoff).floor() as i32;
+                let cy = (self.positions[i].y * inv_cutoff).floor() as i32;
+                grid.entry((cx, cy)).or_default().push(i);
+            }
+
+            // Iterate over each cell and its neighbours
+            let offsets: [(i32, i32); 5] = [(0, 0), (1, 0), (0, 1), (1, 1), (-1, 1)];
+            for (&(cx, cy), cell) in &grid {
+                // Pairs within the same cell
+                for a in 0..cell.len() {
+                    for b in (a + 1)..cell.len() {
+                        let i = cell[a];
+                        let j = cell[b];
+                        let delta = self.positions[i] - self.positions[j];
+                        let dist_sq = delta.length_squared();
+                        if dist_sq > cutoff_sq {
+                            continue;
+                        }
+                        let dist = dist_sq.sqrt().max(p.min_dist);
+                        let force = delta.normalize_or_zero() * (p.repulsion / (dist * dist));
+                        forces[i] += force;
+                        forces[j] -= force;
+                    }
+                }
+
+                // Pairs with neighbouring cells (avoid double-counting via
+                // half-neighbourhood offsets, skipping (0,0) which is handled above)
+                for &(dx, dy) in &offsets[1..] {
+                    if let Some(neighbor_cell) = grid.get(&(cx + dx, cy + dy)) {
+                        for &i in cell {
+                            for &j in neighbor_cell {
+                                let delta = self.positions[i] - self.positions[j];
+                                let dist_sq = delta.length_squared();
+                                if dist_sq > cutoff_sq {
+                                    continue;
+                                }
+                                let dist = dist_sq.sqrt().max(p.min_dist);
+                                let force =
+                                    delta.normalize_or_zero() * (p.repulsion / (dist * dist));
+                                forces[i] += force;
+                                forces[j] -= force;
+                            }
+                        }
+                    }
                 }
             }
 
@@ -238,7 +299,7 @@ impl LayoutState {
     }
 }
 
-/// Force-directed layout using a simplified Barnes-Hut approach.
+/// Force-directed layout with grid-based repulsion approximation.
 ///
 /// Deterministic given a fixed seed and iteration count.
 pub struct ForceDirected {
@@ -264,7 +325,7 @@ impl Layout for ForceDirected {
         }
 
         let mut state = LayoutState::new(graph, self.seed, ForceParams::default());
-        state.step(self.iterations);
+        state.step_inner(self.iterations, true);
 
         let mut map = state.positions().0;
         pack_components(&mut map, graph);
