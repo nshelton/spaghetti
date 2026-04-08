@@ -48,9 +48,7 @@ fn main() -> Result<()> {
         );
 
         // Create incremental layout state (the viz drives it frame-by-frame)
-        let mut layout_state = layout::LayoutState::new(&graph, 42, layout::ForceParams::default());
-        // Run an initial batch so the window opens with a reasonable layout.
-        layout_state.step(200);
+        let layout_state = layout::LayoutState::new(&graph, 42, layout::ForceParams::default());
 
         app::SpaghettiApp::new(graph, layout_state, log_buffer)
     } else {

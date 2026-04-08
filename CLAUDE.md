@@ -39,35 +39,30 @@ examples/
 ## Running
 
 ```bash
-# Fallback path (no libclang required) — uses pre-serialized graph
-cargo run -p viz -- examples/tiny-cpp/graph.json
-
-# Real indexing path (requires libclang)
-cargo run -p viz -- examples/tiny-cpp/compile_commands.json
+# Requires libclang
+LIBCLANG_PATH=$(brew --prefix llvm)/lib cargo run -p viz -- examples/tiny-cpp/compile_commands.json
 ```
 
-Expected result: a window showing 3 classes (Shape, Circle, Square) with inheritance edges and call edges from `main`.
+Expected result: a window showing classes (Shape, Circle, Square), methods, and `main` with inheritance, call, contains, and overrides edges. The force-directed layout animates into place over ~1-2 seconds.
 
 ## libclang Setup
 
-Required only for the `frontend-clang` crate. The viz app works without it via the JSON fallback.
+Required to build. The viz binary always uses `frontend-clang` for indexing.
 
 - **Linux**: `sudo apt install libclang-dev`
 - **macOS**: `brew install llvm && export LIBCLANG_PATH=$(brew --prefix llvm)/lib`
 - **Windows**: install LLVM prebuilt from llvm.org, set `LIBCLANG_PATH` to `<llvm>/bin`
 
-libclang is expected to be available in all development environments. On Linux, install it with `sudo apt install libclang-dev` before building.
-
 ## Testing
 
 ```bash
 cargo test --workspace                      # default, skips clang integration tests
-cargo test --workspace --features clang     # includes libclang-dependent tests
+cargo test -p frontend-clang --features clang-tests  # includes libclang-dependent tests
 cargo clippy --workspace -- -D warnings
 cargo fmt --check
 ```
 
-Every crate has at least one test. `frontend-clang` integration tests are gated on the `clang` feature.
+Every crate has at least one test. `frontend-clang` integration tests are gated on the `clang-tests` feature. The `viz` crate's `camera` module has unit tests for coordinate transforms and hit-testing.
 
 ## Coding Conventions
 
@@ -108,20 +103,21 @@ This list exists because scope creep kills this kind of project. If you find you
 - Incremental re-indexing
 - Uninstantiated template modeling
 - SFINAE / concept overload visualization
-- Edge kinds beyond `Calls` and `Inherits` in the clang frontend
-- Symbol kinds beyond `Class` and `Method` in the clang frontend
+- Symbol kinds beyond `Class`, `Method`, and `Function` in the clang frontend
 
 The core-ir enums may contain more variants than the frontend currently emits — that is intentional, to avoid churning the IR later.
 
 ## Current Status
 
-The v0 scaffold is complete and functional. To verify the project is healthy:
+The clang frontend is functional, emitting `Class`, `Method`, and `Function` symbols with `Calls`, `Inherits`, `Contains`, and `Overrides` edges. The layout uses an incremental force-directed simulation (`LayoutState`) driven frame-by-frame with node dragging/pinning support. The camera module (`viz/src/camera.rs`) handles pan, zoom, and hit-testing.
+
+To verify the project is healthy:
 
 ```bash
-cargo check --workspace && cargo test --workspace && cargo run -p viz -- examples/tiny-cpp/graph.json
+LIBCLANG_PATH=$(brew --prefix llvm)/lib cargo check --workspace && cargo test --workspace && cargo run -p viz -- examples/tiny-cpp/compile_commands.json
 ```
 
-All three should succeed and a window should appear showing the example graph.
+All three should succeed and a window should appear showing the indexed graph with animated layout.
 
 ## Handoff Rule
 
