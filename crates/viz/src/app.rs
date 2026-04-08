@@ -65,6 +65,8 @@ pub struct SpaghettiApp {
     search: String,
     /// The node currently being dragged, if any.
     dragging: Option<SymbolId>,
+    /// Whether the initial auto-fit has been performed.
+    auto_fitted: bool,
 }
 
 impl SpaghettiApp {
@@ -81,6 +83,7 @@ impl SpaghettiApp {
             edge_filter: EdgeKindFilter::default(),
             search: String::new(),
             dragging: None,
+            auto_fitted: false,
         }
     }
 
@@ -238,8 +241,22 @@ impl SpaghettiApp {
             self.layout_state.step(STEPS_PER_FRAME);
             self.positions = self.layout_state.positions();
 
+            // Auto-fit camera once the layout settles for the first time.
+            let energy = self.layout_state.energy();
+            if !self.auto_fitted && energy < ENERGY_THRESHOLD {
+                self.camera
+                    .fit_to_bounds(&self.positions, canvas_rect.size());
+                self.auto_fitted = true;
+            }
+
+            // Press F to re-frame the view.
+            if ui.input(|i| i.key_pressed(egui::Key::F)) && !ui.memory(|m| m.focused().is_some()) {
+                self.camera
+                    .fit_to_bounds(&self.positions, canvas_rect.size());
+            }
+
             // Request repaint while the layout is still settling.
-            if self.layout_state.energy() > ENERGY_THRESHOLD || self.dragging.is_some() {
+            if energy > ENERGY_THRESHOLD || self.dragging.is_some() {
                 ui.ctx().request_repaint();
             }
 

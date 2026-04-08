@@ -58,6 +58,37 @@ impl Camera2D {
     pub fn apply_zoom(&mut self, factor: f32) {
         self.zoom = (self.zoom * factor).clamp(ZOOM_MIN, ZOOM_MAX);
     }
+
+    /// Set offset and zoom so all node positions fit within the viewport.
+    ///
+    /// `viewport_size` is the pixel dimensions of the drawing area. Adds 10%
+    /// padding on each side. Does nothing when `positions` is empty.
+    pub fn fit_to_bounds(&mut self, positions: &Positions, viewport_size: egui::Vec2) {
+        if positions.0.is_empty() {
+            return;
+        }
+
+        let mut min = GVec2::splat(f32::INFINITY);
+        let mut max = GVec2::splat(f32::NEG_INFINITY);
+        for pos in positions.0.values() {
+            min = min.min(*pos - GVec2::new(NODE_WIDTH / 2.0, NODE_HEIGHT / 2.0));
+            max = max.max(*pos + GVec2::new(NODE_WIDTH / 2.0, NODE_HEIGHT / 2.0));
+        }
+
+        let center = (min + max) * 0.5;
+        let extent = max - min;
+
+        // 10% padding on each side → usable area is 80% of viewport
+        let usable = viewport_size * 0.8;
+        let zoom = if extent.x > 0.0 && extent.y > 0.0 {
+            (usable.x / extent.x).min(usable.y / extent.y)
+        } else {
+            1.0
+        };
+
+        self.zoom = zoom.clamp(ZOOM_MIN, ZOOM_MAX);
+        self.offset = egui::Vec2::new(-center.x, -center.y);
+    }
 }
 
 /// Identify which node (if any) is under `pointer_screen`.
@@ -211,5 +242,44 @@ mod tests {
         let cam = Camera2D::default();
         let positions = Positions(IndexMap::new());
         assert_eq!(hit_test(&cam, &positions, None, center()), None);
+    }
+
+    /// 8. fit_to_bounds centers the graph and sets zoom so all nodes are visible.
+    #[test]
+    fn fit_to_bounds_centers_and_zooms() {
+        let mut cam = Camera2D::default();
+        let mut map = IndexMap::new();
+        map.insert(SymbolId(1), GVec2::new(-100.0, -50.0));
+        map.insert(SymbolId(2), GVec2::new(100.0, 50.0));
+        let positions = Positions(map);
+
+        let viewport = egui::Vec2::new(800.0, 600.0);
+        cam.fit_to_bounds(&positions, viewport);
+
+        // Center of AABB is (0,0), so offset should be ~(0,0).
+        assert!(cam.offset.x.abs() < 1e-4, "offset.x = {}", cam.offset.x);
+        assert!(cam.offset.y.abs() < 1e-4, "offset.y = {}", cam.offset.y);
+
+        // Both extremes should map to within the viewport.
+        let canvas_center = egui::Pos2::new(400.0, 300.0);
+        let s1 = cam.world_to_screen(GVec2::new(-100.0, -50.0), canvas_center);
+        let s2 = cam.world_to_screen(GVec2::new(100.0, 50.0), canvas_center);
+        assert!(s1.x >= 0.0 && s1.x <= 800.0, "s1.x out of viewport");
+        assert!(s2.x >= 0.0 && s2.x <= 800.0, "s2.x out of viewport");
+        assert!(s1.y >= 0.0 && s1.y <= 600.0, "s1.y out of viewport");
+        assert!(s2.y >= 0.0 && s2.y <= 600.0, "s2.y out of viewport");
+    }
+
+    /// 9. fit_to_bounds does nothing on empty positions.
+    #[test]
+    fn fit_to_bounds_empty_is_noop() {
+        let mut cam = Camera2D {
+            offset: egui::Vec2::new(5.0, 10.0),
+            zoom: 2.0,
+        };
+        let positions = Positions(IndexMap::new());
+        cam.fit_to_bounds(&positions, egui::Vec2::new(800.0, 600.0));
+        assert!((cam.zoom - 2.0).abs() < 1e-4);
+        assert!((cam.offset.x - 5.0).abs() < 1e-4);
     }
 }
