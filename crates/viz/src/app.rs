@@ -9,6 +9,7 @@ use layout::{LayoutState, Positions};
 use tracing::Level;
 
 use crate::camera::{self, Camera2D};
+use crate::fps::FpsCounter;
 use crate::log_capture::LogBuffer;
 use crate::progress::{ProgressMessage, ProgressState};
 
@@ -90,6 +91,9 @@ pub struct SpaghettiApp {
 
     // -- File dialog --
     pub(crate) pending_file_dialog: Option<Receiver<Option<PathBuf>>>,
+
+    // -- FPS counter --
+    pub(crate) fps: FpsCounter,
 }
 
 impl SpaghettiApp {
@@ -115,6 +119,7 @@ impl SpaghettiApp {
             progress_rx: None,
             cancel_tx: None,
             pending_file_dialog: None,
+            fps: FpsCounter::new(60),
         }
     }
 

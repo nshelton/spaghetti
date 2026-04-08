@@ -6,6 +6,7 @@
 
 mod app;
 mod camera;
+mod fps;
 mod log_capture;
 mod panels;
 mod progress;

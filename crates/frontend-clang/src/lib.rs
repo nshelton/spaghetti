@@ -66,6 +66,12 @@ pub fn index_project(compile_commands: &Path) -> Result<Graph, ClangError> {
         "indexing project from compile_commands.json"
     );
 
+    // Create a single Clang instance for the entire indexing run.
+    // libclang only allows one `Clang` per process, and init/teardown is
+    // expensive — hoisting it here avoids repeating that cost per TU.
+    let clang = clang::Clang::new().map_err(|e| ClangError::Parse(e.to_string()))?;
+    let index = clang::Index::new(&clang, false, true);
+
     let partial_graphs: Vec<Graph> = commands
         .iter()
         .filter_map(|cmd| {
@@ -80,7 +86,7 @@ pub fn index_project(compile_commands: &Path) -> Result<Graph, ClangError> {
                 cc_parent.join(dir_path)
             };
             let file_path = work_dir.join(&cmd.file);
-            match index_translation_unit(cmd, &work_dir, &project_root) {
+            match index_translation_unit(cmd, &work_dir, &project_root, &index) {
                 Ok(g) => {
                     debug!(file = %file_path.display(), symbols = g.symbol_count(), "indexed TU");
                     Some(g)
@@ -114,10 +120,8 @@ fn index_translation_unit(
     cmd: &CompileCommand,
     work_dir: &Path,
     project_root: &Path,
+    index: &clang::Index,
 ) -> Result<Graph, ClangError> {
-    let clang = clang::Clang::new().map_err(|e| ClangError::Parse(e.to_string()))?;
-    let index = clang::Index::new(&clang, false, true);
-
     let file_path = work_dir.join(&cmd.file);
 
     // Extract compiler arguments

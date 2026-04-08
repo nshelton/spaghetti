@@ -5,6 +5,7 @@ use egui::{Color32, Rect, Stroke, StrokeKind, Vec2};
 
 use crate::app::{SpaghettiApp, ENERGY_THRESHOLD, STEPS_PER_FRAME};
 use crate::camera::{NODE_HEIGHT, NODE_WIDTH};
+use crate::fps::paint_fps_overlay;
 
 impl SpaghettiApp {
     /// Draw the central canvas: nodes and edges with interactive dragging.
@@ -144,6 +145,10 @@ impl SpaghettiApp {
                     );
                 }
             }
+
+            // FPS overlay
+            self.fps.tick();
+            paint_fps_overlay(ui, response.rect, self.fps.fps());
         });
     }
 }
