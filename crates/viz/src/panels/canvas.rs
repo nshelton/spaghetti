@@ -1,43 +1,78 @@
-//! Central canvas panel: node and edge rendering, pan/zoom, selection.
+//! Central canvas panel: node and edge rendering, pan/zoom, dragging, selection.
 
-use core_ir::{EdgeKind, SymbolId, SymbolKind};
-use egui::{Color32, Pos2, Rect, Stroke, StrokeKind, Vec2};
+use core_ir::{EdgeKind, SymbolKind};
+use egui::{Color32, Rect, Stroke, StrokeKind, Vec2};
 
-use crate::app::{SpaghettiApp, NODE_HEIGHT, NODE_WIDTH};
+use crate::app::{SpaghettiApp, ENERGY_THRESHOLD, STEPS_PER_FRAME};
+use crate::camera::{NODE_HEIGHT, NODE_WIDTH};
 
 impl SpaghettiApp {
-    /// Draw the central canvas: nodes and edges.
+    /// Draw the central canvas: nodes and edges with interactive dragging.
     pub(crate) fn central_panel(&mut self, ui: &mut egui::Ui) {
         egui::CentralPanel::default().show_inside(ui, |ui| {
             let (response, painter) =
                 ui.allocate_painter(ui.available_size(), egui::Sense::click_and_drag());
 
-            let canvas_rect = response.rect;
-            let canvas_center = canvas_rect.center();
+            let canvas_center = response.rect.center();
 
             // Handle zoom
             let scroll_delta = ui.input(|i| i.smooth_scroll_delta.y);
             if scroll_delta != 0.0 {
                 let zoom_factor = 1.0 + scroll_delta * 0.002;
-                self.camera.zoom = (self.camera.zoom * zoom_factor).clamp(0.1, 10.0);
+                self.camera.apply_zoom(zoom_factor);
             }
 
-            // Handle pan (drag)
-            if response.dragged_by(egui::PointerButton::Primary)
-                && self
-                    .hit_test(response.interact_pointer_pos(), canvas_center)
-                    .is_none()
-            {
-                let delta = response.drag_delta();
-                self.camera.offset.x += delta.x / self.camera.zoom;
-                self.camera.offset.y += delta.y / self.camera.zoom;
+            // --- Drag / pan / click interaction ---
+
+            // Drag started: determine whether we are dragging a node or panning.
+            if response.drag_started_by(egui::PointerButton::Primary) {
+                if let Some(hit) = self.hit_test(response.interact_pointer_pos(), canvas_center) {
+                    // Begin dragging a node.
+                    self.dragging = Some(hit);
+                    self.selection = Some(hit);
+                    if let Some(&world) = self.positions.0.get(&hit) {
+                        self.layout_state.pin(hit, world);
+                    }
+                }
             }
 
-            // Handle click (select)
+            // Ongoing drag.
+            if response.dragged_by(egui::PointerButton::Primary) {
+                if let Some(dragged_id) = self.dragging {
+                    // Move the pinned node to follow the cursor.
+                    if let Some(pointer) = response.interact_pointer_pos() {
+                        let world = self.camera.screen_to_world(pointer, canvas_center);
+                        self.layout_state.set_position(dragged_id, world);
+                    }
+                } else {
+                    // No node drag — pan the camera.
+                    let delta = response.drag_delta();
+                    self.camera.offset.x += delta.x / self.camera.zoom;
+                    self.camera.offset.y += delta.y / self.camera.zoom;
+                }
+            }
+
+            // Drag released: unpin the node.
+            if response.drag_stopped_by(egui::PointerButton::Primary) {
+                if let Some(dragged_id) = self.dragging.take() {
+                    self.layout_state.unpin(dragged_id);
+                }
+            }
+
+            // Handle click (select) — only when not dragging.
             if response.clicked() {
                 if let Some(pointer) = response.interact_pointer_pos() {
                     self.selection = self.hit_test(Some(pointer), canvas_center);
                 }
+            }
+
+            // --- Run incremental simulation ---
+            self.layout_state.step(STEPS_PER_FRAME);
+            self.positions = self.layout_state.positions();
+
+            // Request repaint while the layout is still settling.
+            if self.layout_state.energy() > ENERGY_THRESHOLD || self.dragging.is_some() {
+                ui.ctx().request_repaint();
             }
 
             // Draw edges
@@ -94,23 +129,6 @@ impl SpaghettiApp {
                 }
             }
         });
-    }
-
-    /// Hit-test: find which symbol (if any) is under the pointer.
-    // TODO: quadtree for efficient hit testing
-    pub(crate) fn hit_test(&self, pointer: Option<Pos2>, canvas_center: Pos2) -> Option<SymbolId> {
-        let pointer = pointer?;
-        let world = self.camera.screen_to_world(pointer, canvas_center);
-
-        let half_w = NODE_WIDTH / 2.0;
-        let half_h = NODE_HEIGHT / 2.0;
-
-        for (id, pos) in &self.positions.0 {
-            if (world.x - pos.x).abs() < half_w && (world.y - pos.y).abs() < half_h {
-                return Some(*id);
-            }
-        }
-        None
     }
 }
 

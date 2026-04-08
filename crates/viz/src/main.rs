@@ -5,6 +5,7 @@
 //! - `spaghetti` — start with an empty canvas (use File > Open)
 
 mod app;
+mod camera;
 mod log_capture;
 mod panels;
 mod progress;
@@ -46,10 +47,12 @@ fn main() -> Result<()> {
             "indexed project"
         );
 
-        let layout_algo = layout::ForceDirected::default();
-        let positions = layout::Layout::compute(&layout_algo, &graph);
+        // Create incremental layout state (the viz drives it frame-by-frame)
+        let mut layout_state = layout::LayoutState::new(&graph, 42, layout::ForceParams::default());
+        // Run an initial batch so the window opens with a reasonable layout.
+        layout_state.step(200);
 
-        app::SpaghettiApp::new(graph, positions, log_buffer)
+        app::SpaghettiApp::new(graph, layout_state, log_buffer)
     } else {
         info!("no file argument — starting with empty canvas");
         app::SpaghettiApp::empty(log_buffer)

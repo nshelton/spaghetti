@@ -2,7 +2,7 @@
 
 use core_ir::{Edge, EdgeKind, Graph, Symbol, SymbolId, SymbolKind};
 use glam::Vec2;
-use layout::{ForceDirected, Layout};
+use layout::{ForceDirected, ForceParams, Layout, LayoutState};
 
 fn make_symbol(name: &str, kind: SymbolKind) -> Symbol {
     Symbol {
@@ -407,6 +407,177 @@ fn test_disconnected_isolated_node() {
             min.y - padding,
             max.x + padding,
             max.y + padding,
+        );
+    }
+}
+
+// ---------------------------------------------------------------------------
+// CAP-011: LayoutState incremental simulation tests
+// ---------------------------------------------------------------------------
+
+/// Pinned nodes must maintain their exact position across 50 iterations.
+#[test]
+fn test_pinned_node_maintains_position() {
+    let g = three_node_graph();
+    let mut state = LayoutState::new(&g, 42, ForceParams::default());
+
+    let pin_id = g.symbols.keys().next().copied().unwrap();
+    let pin_pos = Vec2::new(100.0, 200.0);
+    state.pin(pin_id, pin_pos);
+
+    state.step(50);
+
+    let positions = state.positions();
+    let actual = positions.0.get(&pin_id).unwrap();
+    assert_eq!(
+        actual.x.to_bits(),
+        pin_pos.x.to_bits(),
+        "pinned node x drifted"
+    );
+    assert_eq!(
+        actual.y.to_bits(),
+        pin_pos.y.to_bits(),
+        "pinned node y drifted"
+    );
+}
+
+/// Unpinned nodes resume movement after the pin is released.
+#[test]
+fn test_unpinned_node_resumes_movement() {
+    let g = three_node_graph();
+    let mut state = LayoutState::new(&g, 42, ForceParams::default());
+
+    let id = g.symbols.keys().next().copied().unwrap();
+    let pin_pos = Vec2::new(100.0, 200.0);
+    state.pin(id, pin_pos);
+    state.step(10);
+
+    // Release and run more steps.
+    state.unpin(id);
+    state.step(50);
+
+    let positions = state.positions();
+    let actual = positions.0.get(&id).unwrap();
+    // The node should have moved away from the pin position.
+    let moved = (actual.x - pin_pos.x).abs() > 0.01 || (actual.y - pin_pos.y).abs() > 0.01;
+    assert!(
+        moved,
+        "node did not move after unpin: still at ({}, {})",
+        actual.x, actual.y
+    );
+}
+
+/// Pinned nodes exert forces that influence their neighbours' positions.
+#[test]
+fn test_pinned_node_influences_neighbors() {
+    let g = three_node_graph();
+
+    // Baseline: no pin.
+    let mut baseline = LayoutState::new(&g, 42, ForceParams::default());
+    baseline.step(50);
+    let baseline_pos = baseline.positions();
+
+    // Pinned run: pin first node far away.
+    let mut pinned = LayoutState::new(&g, 42, ForceParams::default());
+    let pin_id = g.symbols.keys().next().copied().unwrap();
+    pinned.pin(pin_id, Vec2::new(5000.0, 5000.0));
+    pinned.step(50);
+    let pinned_pos = pinned.positions();
+
+    // At least one non-pinned neighbour must have a different position.
+    let any_differ = g.symbols.keys().filter(|&&id| id != pin_id).any(|id| {
+        let a = baseline_pos.0.get(id).unwrap();
+        let b = pinned_pos.0.get(id).unwrap();
+        (a.x - b.x).abs() > 0.01 || (a.y - b.y).abs() > 0.01
+    });
+
+    assert!(
+        any_differ,
+        "pinning a node far away had no effect on neighbours"
+    );
+}
+
+/// Incremental stepping must match a single batch run of equivalent length.
+#[test]
+fn test_incremental_matches_batch() {
+    let g = three_node_graph();
+    let params = ForceParams::default();
+
+    // Batch: 100 steps in one call.
+    let mut batch = LayoutState::new(&g, 42, params);
+    batch.step(100);
+
+    // Incremental: 100 individual step(1) calls.
+    let mut incremental = LayoutState::new(&g, 42, params);
+    for _ in 0..100 {
+        incremental.step(1);
+    }
+
+    let batch_pos = batch.positions();
+    let inc_pos = incremental.positions();
+
+    for id in g.symbols.keys() {
+        let a = batch_pos.0.get(id).unwrap();
+        let b = inc_pos.0.get(id).unwrap();
+        assert_eq!(
+            a.x.to_bits(),
+            b.x.to_bits(),
+            "x mismatch for {id:?}: batch={}, inc={}",
+            a.x,
+            b.x
+        );
+        assert_eq!(
+            a.y.to_bits(),
+            b.y.to_bits(),
+            "y mismatch for {id:?}: batch={}, inc={}",
+            a.y,
+            b.y
+        );
+    }
+}
+
+/// Empty graph must not panic in LayoutState.
+#[test]
+fn test_layout_state_empty_graph() {
+    let g = Graph::new();
+    let mut state = LayoutState::new(&g, 42, ForceParams::default());
+    state.step(50);
+    let positions = state.positions();
+    assert!(positions.0.is_empty());
+    assert_eq!(state.energy(), 0.0);
+}
+
+/// Multiple simultaneous pins must all hold their positions.
+#[test]
+fn test_multiple_pins_stable() {
+    let g = three_node_graph();
+    let mut state = LayoutState::new(&g, 42, ForceParams::default());
+
+    let ids: Vec<SymbolId> = g.symbols.keys().copied().collect();
+    let pin_positions: Vec<Vec2> = ids
+        .iter()
+        .enumerate()
+        .map(|(i, _)| Vec2::new(i as f32 * 200.0, i as f32 * 100.0))
+        .collect();
+
+    for (id, pos) in ids.iter().zip(&pin_positions) {
+        state.pin(*id, *pos);
+    }
+
+    state.step(50);
+
+    let positions = state.positions();
+    for (id, expected) in ids.iter().zip(&pin_positions) {
+        let actual = positions.0.get(id).unwrap();
+        assert_eq!(
+            actual.x.to_bits(),
+            expected.x.to_bits(),
+            "multi-pin x drifted for {id:?}"
+        );
+        assert_eq!(
+            actual.y.to_bits(),
+            expected.y.to_bits(),
+            "multi-pin y drifted for {id:?}"
         );
     }
 }

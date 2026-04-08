@@ -1,7 +1,7 @@
 //! Progress overlay state and channel message types for background indexing.
 
 use core_ir::Graph;
-use layout::Positions;
+use layout::LayoutState;
 
 /// Messages sent from the background indexing thread to the UI.
 pub enum ProgressMessage {
@@ -16,8 +16,8 @@ pub enum ProgressMessage {
     Done {
         /// The indexed graph.
         graph: Box<Graph>,
-        /// Pre-computed layout positions.
-        positions: Box<Positions>,
+        /// Incremental layout state with pre-computed initial positions.
+        layout_state: Box<LayoutState>,
     },
     /// Indexing failed with an error.
     Failed(String),
@@ -109,9 +109,11 @@ mod tests {
         assert_eq!(state.messages.len(), 1);
 
         // Done terminates
+        let graph = Graph::new();
+        let layout_state = LayoutState::new(&graph, 42, layout::ForceParams::default());
         let done = ProgressMessage::Done {
-            graph: Box::new(Graph::new()),
-            positions: Box::new(Positions(Default::default())),
+            graph: Box::new(graph),
+            layout_state: Box::new(layout_state),
         };
         assert!(!state.apply(&done));
     }

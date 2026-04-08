@@ -5,18 +5,12 @@ use std::sync::mpsc::{Receiver, Sender};
 use std::sync::{Arc, Mutex};
 
 use core_ir::{EdgeKind, Graph, SymbolId};
-use egui::{Pos2, Vec2};
-use glam::Vec2 as GVec2;
-use layout::Positions;
+use layout::{LayoutState, Positions};
 use tracing::Level;
 
+use crate::camera::{self, Camera2D};
 use crate::log_capture::LogBuffer;
 use crate::progress::{ProgressMessage, ProgressState};
-
-/// Node width in world units.
-pub(crate) const NODE_WIDTH: f32 = 120.0;
-/// Node height in world units.
-pub(crate) const NODE_HEIGHT: f32 = 30.0;
 
 /// Edge kind filter state.
 pub(crate) struct EdgeKindFilter {
@@ -56,48 +50,28 @@ impl EdgeKindFilter {
     }
 }
 
-/// 2D camera for pan and zoom.
-pub(crate) struct Camera2D {
-    pub offset: Vec2,
-    pub zoom: f32,
-}
+/// Energy threshold below which the simulation is considered settled and
+/// repaints are no longer requested.
+pub(crate) const ENERGY_THRESHOLD: f32 = 0.5;
 
-impl Default for Camera2D {
-    fn default() -> Self {
-        Self {
-            offset: Vec2::ZERO,
-            zoom: 1.0,
-        }
-    }
-}
-
-impl Camera2D {
-    /// Transform a world position to screen position.
-    pub(crate) fn world_to_screen(&self, world: GVec2, canvas_center: Pos2) -> Pos2 {
-        let x = canvas_center.x + (world.x + self.offset.x) * self.zoom;
-        let y = canvas_center.y + (world.y + self.offset.y) * self.zoom;
-        Pos2::new(x, y)
-    }
-
-    /// Transform a screen position to world position.
-    pub(crate) fn screen_to_world(&self, screen: Pos2, canvas_center: Pos2) -> GVec2 {
-        let x = (screen.x - canvas_center.x) / self.zoom - self.offset.x;
-        let y = (screen.y - canvas_center.y) / self.zoom - self.offset.y;
-        GVec2::new(x, y)
-    }
-}
+/// Number of force-simulation steps to run each frame while the layout is
+/// still settling.
+pub(crate) const STEPS_PER_FRAME: u32 = 3;
 
 /// Main application state.
 pub struct SpaghettiApp {
     // -- Graph data --
     pub(crate) graph: Graph,
     pub(crate) positions: Positions,
+    pub(crate) layout_state: LayoutState,
 
     // -- Interaction state --
     pub(crate) camera: Camera2D,
     pub(crate) selection: Option<SymbolId>,
     pub(crate) edge_filter: EdgeKindFilter,
     pub(crate) search: String,
+    /// The node currently being dragged, if any.
+    pub(crate) dragging: Option<SymbolId>,
 
     // -- Menu / UI state --
     pub(crate) show_console: bool,
@@ -117,15 +91,19 @@ pub struct SpaghettiApp {
 }
 
 impl SpaghettiApp {
-    /// Create a new app with a pre-loaded graph and positions.
-    pub fn new(graph: Graph, positions: Positions, log_buffer: Arc<Mutex<LogBuffer>>) -> Self {
+    /// Create a new app with a live [`LayoutState`] that drives positions
+    /// incrementally each frame.
+    pub fn new(graph: Graph, layout_state: LayoutState, log_buffer: Arc<Mutex<LogBuffer>>) -> Self {
+        let positions = layout_state.positions();
         Self {
             graph,
             positions,
+            layout_state,
             camera: Camera2D::default(),
             selection: None,
             edge_filter: EdgeKindFilter::default(),
             search: String::new(),
+            dragging: None,
             show_console: false,
             indexing: false,
             log_buffer,
@@ -139,7 +117,9 @@ impl SpaghettiApp {
 
     /// Create a new app with an empty graph (for menu-driven file opening).
     pub fn empty(log_buffer: Arc<Mutex<LogBuffer>>) -> Self {
-        Self::new(Graph::new(), Positions(Default::default()), log_buffer)
+        let graph = Graph::new();
+        let layout_state = LayoutState::new(&graph, 42, layout::ForceParams::default());
+        Self::new(graph, layout_state, log_buffer)
     }
 
     /// Draw the menu bar.
@@ -216,12 +196,13 @@ impl SpaghettiApp {
 
                     let _ = progress_tx.send(ProgressMessage::Status("Computing layout…".into()));
 
-                    let layout_algo = layout::ForceDirected::default();
-                    let positions = layout::Layout::compute(&layout_algo, &graph);
+                    let mut layout_state =
+                        layout::LayoutState::new(&graph, 42, layout::ForceParams::default());
+                    layout_state.step(200);
 
                     let _ = progress_tx.send(ProgressMessage::Done {
                         graph: Box::new(graph),
-                        positions: Box::new(positions),
+                        layout_state: Box::new(layout_state),
                     });
                 }
                 Err(e) => {
@@ -258,11 +239,16 @@ impl SpaghettiApp {
             }
 
             match msg {
-                ProgressMessage::Done { graph, positions } => {
+                ProgressMessage::Done {
+                    graph,
+                    layout_state,
+                } => {
                     self.graph = *graph;
-                    self.positions = *positions;
+                    self.layout_state = *layout_state;
+                    self.positions = self.layout_state.positions();
                     self.selection = None;
                     self.camera = Camera2D::default();
+                    self.dragging = None;
                     self.finish_indexing();
                 }
                 ProgressMessage::Failed(ref err) => {
@@ -284,6 +270,15 @@ impl SpaghettiApp {
         self.progress_state = None;
         self.progress_rx = None;
         self.cancel_tx = None;
+    }
+
+    /// Hit-test: find which symbol (if any) is under the pointer.
+    pub(crate) fn hit_test(
+        &self,
+        pointer: Option<egui::Pos2>,
+        canvas_center: egui::Pos2,
+    ) -> Option<SymbolId> {
+        camera::hit_test(&self.camera, &self.positions, pointer, canvas_center)
     }
 
     /// Draw the progress overlay (modal).
