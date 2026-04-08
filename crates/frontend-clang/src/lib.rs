@@ -18,6 +18,8 @@ use core_ir::{Edge, EdgeKind, Graph, Location, Symbol, SymbolId, SymbolKind};
 use thiserror::Error;
 use tracing::{debug, info, warn};
 
+mod cache;
+
 /// Errors from the clang frontend.
 #[derive(Debug, Error)]
 pub enum ClangError {
@@ -66,12 +68,17 @@ pub fn index_project(compile_commands: &Path) -> Result<Graph, ClangError> {
         "indexing project from compile_commands.json"
     );
 
+    // Set up per-TU cache.
+    let cache_dir = cache::cache_dir(compile_commands);
+    let cc_mtime = cache::file_mtime_secs(compile_commands);
+
     // Create a single Clang instance for the entire indexing run.
     // libclang only allows one `Clang` per process, and init/teardown is
     // expensive — hoisting it here avoids repeating that cost per TU.
     let clang = clang::Clang::new().map_err(|e| ClangError::Parse(e.to_string()))?;
     let index = clang::Index::new(&clang, false, true);
 
+    let mut cache_hits = 0u32;
     let partial_graphs: Vec<Graph> = commands
         .iter()
         .filter_map(|cmd| {
@@ -86,9 +93,23 @@ pub fn index_project(compile_commands: &Path) -> Result<Graph, ClangError> {
                 cc_parent.join(dir_path)
             };
             let file_path = work_dir.join(&cmd.file);
-            match index_translation_unit(cmd, &work_dir, &project_root, &index) {
+
+            // Extract args early so we can compute the cache key.
+            let args = extract_args(cmd);
+
+            let key = cache::cache_key(&file_path, &args, cc_mtime);
+
+            // Try the cache first.
+            if let Some(cached) = cache::load(&cache_dir, key) {
+                debug!(file = %file_path.display(), symbols = cached.symbol_count(), "cached TU");
+                cache_hits += 1;
+                return Some(cached);
+            }
+
+            match index_translation_unit(cmd, &work_dir, &project_root, &index, &args) {
                 Ok(g) => {
                     debug!(file = %file_path.display(), symbols = g.symbol_count(), "indexed TU");
+                    cache::store(&cache_dir, key, &g);
                     Some(g)
                 }
                 Err(e) => {
@@ -98,6 +119,8 @@ pub fn index_project(compile_commands: &Path) -> Result<Graph, ClangError> {
             }
         })
         .collect();
+
+    info!(cache_hits, total = commands.len(), "TU cache summary");
 
     let mut graph = Graph::new();
     for g in partial_graphs {
@@ -115,30 +138,33 @@ pub fn index_project(compile_commands: &Path) -> Result<Graph, ClangError> {
     Ok(graph)
 }
 
-/// Index a single translation unit.
-fn index_translation_unit(
-    cmd: &CompileCommand,
-    work_dir: &Path,
-    project_root: &Path,
-    index: &clang::Index,
-) -> Result<Graph, ClangError> {
-    let file_path = work_dir.join(&cmd.file);
-
-    // Extract compiler arguments
-    let args = if let Some(arguments) = &cmd.arguments {
+/// Extract raw compiler arguments from a compile command.
+fn extract_args(cmd: &CompileCommand) -> Vec<String> {
+    if let Some(arguments) = &cmd.arguments {
         arguments[1..].to_vec() // skip the compiler path
     } else if let Some(command) = &cmd.command {
         let parts: Vec<&str> = command.split_whitespace().collect();
         parts[1..].iter().map(|s| s.to_string()).collect()
     } else {
         vec![]
-    };
+    }
+}
+
+/// Index a single translation unit.
+fn index_translation_unit(
+    cmd: &CompileCommand,
+    work_dir: &Path,
+    project_root: &Path,
+    index: &clang::Index,
+    args: &[String],
+) -> Result<Graph, ClangError> {
+    let file_path = work_dir.join(&cmd.file);
 
     // Filter out flags that conflict with libclang's parser (-o, -c, and the
     // source file itself). Keep everything else (-I, -D, -std, -W, etc.).
     let mut filtered_args = Vec::new();
     let mut skip_next = false;
-    for arg in &args {
+    for arg in args {
         if skip_next {
             skip_next = false;
             continue;

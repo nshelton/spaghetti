@@ -11,6 +11,8 @@ use core_ir::{EdgeKind, Graph, SymbolId};
 use glam::Vec2;
 use indexmap::IndexMap;
 use std::collections::{HashMap, VecDeque};
+use std::time::{Duration, Instant};
+use tracing::info;
 
 /// Mapping from symbol IDs to 2D positions.
 ///
@@ -136,6 +138,23 @@ impl LayoutState {
     /// Run `n` simulation iterations.
     pub fn step(&mut self, n: u32) {
         self.step_inner(n, false);
+    }
+
+    /// Run simulation iterations for at most `budget` wall-clock time.
+    ///
+    /// Returns the number of iterations completed. Always runs at least one
+    /// iteration so the layout makes progress even on very large graphs.
+    pub fn step_budgeted(&mut self, budget: Duration) -> u32 {
+        let deadline = Instant::now() + budget;
+        let mut count = 0u32;
+        loop {
+            self.step_inner(1, false);
+            count += 1;
+            if Instant::now() >= deadline {
+                break;
+            }
+        }
+        count
     }
 
     /// Run up to `n` iterations, optionally stopping early when energy is low.

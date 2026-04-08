@@ -10,6 +10,7 @@ clang-tests = []
 core-ir = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
+seahash = { workspace = true }
 thiserror = { workspace = true }
 tracing = { workspace = true }
 clang = "2"

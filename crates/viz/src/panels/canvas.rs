@@ -3,7 +3,7 @@
 use core_ir::{EdgeKind, SymbolKind};
 use egui::{Color32, Rect, Stroke, StrokeKind, Vec2};
 
-use crate::app::{SpaghettiApp, ENERGY_THRESHOLD, STEPS_PER_FRAME};
+use crate::app::{SpaghettiApp, ENERGY_THRESHOLD};
 use crate::camera::{NODE_HEIGHT, NODE_WIDTH};
 use crate::fps::paint_fps_overlay;
 
@@ -68,9 +68,11 @@ impl SpaghettiApp {
             }
 
             // --- Run incremental simulation ---
+            // Use a time budget so large graphs don't block the frame.
             let active_kinds = self.edge_filter.active_kinds();
             self.layout_state.set_visible_edge_kinds(&active_kinds);
-            self.layout_state.step(STEPS_PER_FRAME);
+            self.layout_state
+                .step_budgeted(std::time::Duration::from_millis(8));
             self.positions = self.layout_state.positions();
 
             // Auto-fit camera once the layout settles for the first time.

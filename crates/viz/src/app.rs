@@ -55,10 +55,6 @@ impl EdgeKindFilter {
 /// repaints are no longer requested.
 pub(crate) const ENERGY_THRESHOLD: f32 = 0.5;
 
-/// Number of force-simulation steps to run each frame while the layout is
-/// still settling.
-pub(crate) const STEPS_PER_FRAME: u32 = 3;
-
 /// Main application state.
 pub struct SpaghettiApp {
     // -- Graph data --
