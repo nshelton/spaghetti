@@ -61,7 +61,8 @@ pub struct LayoutState {
     ids: Vec<SymbolId>,
     positions: Vec<Vec2>,
     velocities: Vec<Vec2>,
-    edge_pairs: Vec<(usize, usize)>,
+    edge_pairs: Vec<(usize, usize, EdgeKind)>,
+    visible_edge_kinds: Vec<EdgeKind>,
     id_to_idx: IndexMap<SymbolId, usize>,
     pins: IndexMap<SymbolId, Vec2>,
     params: ForceParams,
@@ -90,7 +91,7 @@ impl LayoutState {
         let id_to_idx: IndexMap<SymbolId, usize> =
             ids.iter().enumerate().map(|(i, &id)| (id, i)).collect();
 
-        let edge_pairs: Vec<(usize, usize)> = graph
+        let edge_pairs: Vec<(usize, usize, EdgeKind)> = graph
             .edges
             .iter()
             .filter(|e| {
@@ -102,9 +103,16 @@ impl LayoutState {
             .filter_map(|e| {
                 let from = id_to_idx.get(&e.from)?;
                 let to = id_to_idx.get(&e.to)?;
-                Some((*from, *to))
+                Some((*from, *to, e.kind))
             })
             .collect();
+
+        let visible_edge_kinds = vec![
+            EdgeKind::Calls,
+            EdgeKind::Inherits,
+            EdgeKind::Contains,
+            EdgeKind::Overrides,
+        ];
 
         let velocities = vec![Vec2::ZERO; n];
 
@@ -113,6 +121,7 @@ impl LayoutState {
             positions,
             velocities,
             edge_pairs,
+            visible_edge_kinds,
             id_to_idx,
             pins: IndexMap::new(),
             params,
@@ -139,8 +148,11 @@ impl LayoutState {
                 }
             }
 
-            // Attractive forces along edges
-            for &(from, to) in &self.edge_pairs {
+            // Attractive forces along visible edges only
+            for &(from, to, kind) in &self.edge_pairs {
+                if !self.visible_edge_kinds.contains(&kind) {
+                    continue;
+                }
                 let delta = self.positions[to] - self.positions[from];
                 let dist = delta.length().max(p.min_dist);
                 let force = delta.normalize_or_zero() * p.attraction * (dist - p.ideal_length);
@@ -166,6 +178,15 @@ impl LayoutState {
                 }
             }
         }
+    }
+
+    /// Update which edge kinds contribute attractive forces.
+    ///
+    /// Only edges whose kind is in `kinds` will exert spring forces during
+    /// [`step`](Self::step). This should match whatever the UI is currently
+    /// rendering so hidden edges don't pull nodes around.
+    pub fn set_visible_edge_kinds(&mut self, kinds: &[EdgeKind]) {
+        self.visible_edge_kinds = kinds.to_vec();
     }
 
     /// Pin a node to a fixed position.

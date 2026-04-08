@@ -233,6 +233,8 @@ impl SpaghettiApp {
             }
 
             // --- Run incremental simulation ---
+            let active_kinds = self.edge_filter.active_kinds();
+            self.layout_state.set_visible_edge_kinds(&active_kinds);
             self.layout_state.step(STEPS_PER_FRAME);
             self.positions = self.layout_state.positions();
 
@@ -242,7 +244,6 @@ impl SpaghettiApp {
             }
 
             // Draw edges
-            let active_kinds = self.edge_filter.active_kinds();
             for edge in &self.graph.edges {
                 if !active_kinds.contains(&edge.kind) {
                     continue;
@@ -269,10 +270,11 @@ impl SpaghettiApp {
                     let rect = Rect::from_center_size(screen_pos, node_size);
 
                     // Background
+                    let base = node_color(sym.kind);
                     let bg = if self.selection == Some(*id) {
-                        Color32::from_rgb(80, 140, 220)
+                        brighten(base, 2.0)
                     } else {
-                        node_color(sym.kind)
+                        base
                     };
                     painter.rect_filled(rect, 4.0, bg);
                     painter.rect_stroke(
@@ -314,16 +316,25 @@ impl eframe::App for SpaghettiApp {
 
 fn node_color(kind: SymbolKind) -> Color32 {
     match kind {
-        SymbolKind::Class => Color32::from_rgb(70, 130, 180),
-        SymbolKind::Struct => Color32::from_rgb(60, 160, 120),
-        SymbolKind::Function => Color32::from_rgb(180, 100, 60),
-        SymbolKind::Method => Color32::from_rgb(140, 100, 180),
-        SymbolKind::Field => Color32::from_rgb(160, 160, 80),
-        SymbolKind::Namespace => Color32::from_rgb(100, 100, 100),
-        SymbolKind::TemplateInstantiation => Color32::from_rgb(180, 80, 140),
-        SymbolKind::TranslationUnit => Color32::from_rgb(80, 80, 80),
-        _ => Color32::from_rgb(120, 120, 120),
+        SymbolKind::Class => Color32::from_rgb(30, 55, 80),
+        SymbolKind::Struct => Color32::from_rgb(25, 70, 50),
+        SymbolKind::Function => Color32::from_rgb(80, 45, 25),
+        SymbolKind::Method => Color32::from_rgb(60, 45, 80),
+        SymbolKind::Field => Color32::from_rgb(70, 70, 35),
+        SymbolKind::Namespace => Color32::from_rgb(45, 45, 45),
+        SymbolKind::TemplateInstantiation => Color32::from_rgb(80, 35, 60),
+        SymbolKind::TranslationUnit => Color32::from_rgb(35, 35, 35),
+        _ => Color32::from_rgb(50, 50, 50),
     }
+}
+
+/// Brighten a color by a multiplier, clamping to 255.
+fn brighten(color: Color32, factor: f32) -> Color32 {
+    Color32::from_rgb(
+        (color.r() as f32 * factor).min(255.0) as u8,
+        (color.g() as f32 * factor).min(255.0) as u8,
+        (color.b() as f32 * factor).min(255.0) as u8,
+    )
 }
 
 fn edge_color(kind: EdgeKind) -> Color32 {

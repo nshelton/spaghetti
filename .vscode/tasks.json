@@ -37,7 +37,7 @@
       "label": "cargo run (viz)",
       "type": "cargo",
       "command": "run",
-      "args": ["-p", "viz", "--", "examples/tiny-cpp/compile_commands.json"],
+      "args": ["-p", "viz", "--", "/Users/nshelton/flatbuffers/compile_commands.json"],
       "problemMatcher": ["$rustc"]
     }
   ]

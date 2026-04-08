@@ -2,20 +2,20 @@
 
 ## Overview
 
-spaghetti is a cross-platform desktop visualizer for code structure and dataflow. It parses C++ projects via `compile_commands.json` (or pre-serialized `graph.json`) and renders an interactive, zoomable graph of symbols and their relationships.
+spaghetti is a cross-platform desktop visualizer for code structure and dataflow. It parses C++ projects via `compile_commands.json` and renders an interactive, zoomable graph of symbols and their relationships.
 
 Built in Rust with [eframe](https://github.com/emilk/egui/tree/master/crates/eframe) (egui + wgpu + winit).
 
 ## Data Flow
 
 ```
-compile_commands.json / graph.json
+compile_commands.json
         |
         v
   frontend-clang ──> core-ir <── query
                         |
                         v
-                     layout
+                     layout (LayoutState — incremental)
                         |
                         v
                        viz  (eframe app, binary = spaghetti)
@@ -38,16 +38,27 @@ The stable contract of the system. All other crates depend on it; it depends on 
 
 Indexes C++ projects using libclang and emits a `core-ir::Graph`.
 
-- Accepts either a `compile_commands.json` (live indexing) or a `graph.json` (pre-serialized fallback)
-- Currently emits `Class` and `Method` symbol kinds, `Calls` and `Inherits` edge kinds
-- Gated behind the `clang` workspace feature; excluded from build when libclang is unavailable
+- Reads `compile_commands.json` and drives libclang to extract AST information
+- Emits `Class`, `Method`, and `Function` symbol kinds
+- Emits `Calls`, `Inherits`, `Contains`, and `Overrides` edge kinds
+- Automatically discovers system C++ include paths (via `LIBCLANG_PATH` or `clang++`)
+- Filters to project-local symbols only (skips standard library internals)
+- Deduplicates edges across translation units
+- Integration tests gated behind the `clang-tests` feature
 
 ### layout
 
-Force-directed graph layout engine.
+Force-directed graph layout engine with two modes:
 
-- `ForceDirected` algorithm with configurable parameters
-- Produces `Positions` — a map from `SymbolId` to 2D coordinates (via `glam::Vec2`)
+- **`ForceDirected`** — batch layout: `compute()` runs all iterations and returns final `Positions`
+- **`LayoutState`** — incremental simulation driven frame-by-frame:
+  - `new(graph, seed, params)` — hash-scatter initial positions, build edge index
+  - `step(n)` — run `n` iterations of repulsion + attraction + velocity damping
+  - `positions()` — snapshot current state
+  - `energy()` — convergence metric (total kinetic energy)
+  - `pin(id, pos)` / `unpin(id)` / `set_position(id, pos)` — support for interactive node dragging
+- `ForceParams` — tuneable constants (repulsion, attraction, damping, ideal_length)
+- Connected component packing for disconnected graphs
 
 ### query
 
@@ -62,12 +73,13 @@ Graph query and subgraph extraction.
 
 The eframe desktop application (binary name: `spaghetti`).
 
-- 2D camera with pan and zoom
-- Node rendering colored by symbol kind
-- Edge rendering colored by edge kind
+- **`main.rs`** — CLI entry, indexes via `frontend-clang`, creates `LayoutState`, launches eframe
+- **`app.rs`** — `SpaghettiApp`: drives layout each frame, renders graph, handles interaction
+- **`camera.rs`** — `Camera2D` (pan/zoom/coordinate transforms) and `hit_test()`, with unit tests
+- Node dragging with pin/unpin during drag
 - Left panel: search bar, edge kind filters, scrollable symbol list
 - Right panel: selected symbol details (name, qualified name, kind, location, attributes, neighbors)
-- Click-to-select nodes with hit testing
+- Layout auto-settles: simulation runs each frame until kinetic energy drops below threshold
 
 ## Design Principles
 
