@@ -29,9 +29,10 @@ fn main() -> Result<()> {
         "indexed project via libclang"
     );
 
-    // Compute layout
-    let layout_algo = layout::ForceDirected::default();
-    let positions = layout::Layout::compute(&layout_algo, &graph);
+    // Create incremental layout state (the viz drives it frame-by-frame)
+    let mut layout_state = layout::LayoutState::new(&graph, 42, layout::ForceParams::default());
+    // Run an initial batch so the window opens with a reasonable layout.
+    layout_state.step(200);
 
     let native_options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default().with_inner_size([1280.0, 800.0]),
@@ -41,7 +42,12 @@ fn main() -> Result<()> {
     eframe::run_native(
         "spaghetti",
         native_options,
-        Box::new(move |_cc| Ok(Box::new(app::SpaghettiApp::new(graph, positions)))),
+        Box::new(move |_cc| {
+            Ok(Box::new(app::SpaghettiApp::with_layout_state(
+                graph,
+                layout_state,
+            )))
+        }),
     )
     .map_err(|e| anyhow::anyhow!("eframe error: {e}"))?;
 
