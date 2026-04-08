@@ -1,37 +1,59 @@
 //! spaghetti — interactive code structure visualizer.
 //!
-//! Usage: `spaghetti <path-to-compile_commands.json>`
+//! Usage:
+//! - `spaghetti <path>` — open a `compile_commands.json` or `graph.json`
+//! - `spaghetti` — start with an empty canvas (use File > Open)
 
 mod app;
+mod log_capture;
+mod panels;
+mod progress;
 
-use anyhow::{bail, Result};
 use std::path::PathBuf;
+use std::sync::{Arc, Mutex};
+
+use anyhow::Result;
 use tracing::info;
+use tracing_subscriber::layer::SubscriberExt;
+use tracing_subscriber::util::SubscriberInitExt;
+
+use log_capture::{LogBuffer, LogCaptureLayer};
 
 fn main() -> Result<()> {
-    tracing_subscriber::fmt::init();
+    // Set up shared log buffer and tracing subscriber with capture layer.
+    let log_buffer = Arc::new(Mutex::new(LogBuffer::new()));
+    let capture_layer = LogCaptureLayer::new(Arc::clone(&log_buffer));
 
-    let path = match std::env::args().nth(1) {
-        Some(p) => PathBuf::from(p),
-        None => bail!("Usage: spaghetti <path-to-compile_commands.json>"),
+    tracing_subscriber::registry()
+        .with(tracing_subscriber::fmt::layer())
+        .with(capture_layer)
+        .init();
+
+    // Optional CLI argument: path to compile_commands.json or graph.json.
+    let path = std::env::args().nth(1).map(PathBuf::from);
+
+    let app = if let Some(ref path) = path {
+        if !path.exists() {
+            anyhow::bail!("File not found: {}", path.display());
+        }
+
+        let graph = frontend_clang::index_project(path)
+            .map_err(|e| anyhow::anyhow!("clang indexing failed: {e}"))?;
+
+        info!(
+            symbols = graph.symbol_count(),
+            edges = graph.edge_count(),
+            "indexed project"
+        );
+
+        let layout_algo = layout::ForceDirected::default();
+        let positions = layout::Layout::compute(&layout_algo, &graph);
+
+        app::SpaghettiApp::new(graph, positions, log_buffer)
+    } else {
+        info!("no file argument — starting with empty canvas");
+        app::SpaghettiApp::empty(log_buffer)
     };
-
-    if !path.exists() {
-        bail!("File not found: {}", path.display());
-    }
-
-    let graph = frontend_clang::index_project(&path)
-        .map_err(|e| anyhow::anyhow!("clang indexing failed: {e}"))?;
-
-    info!(
-        symbols = graph.symbol_count(),
-        edges = graph.edge_count(),
-        "indexed project via libclang"
-    );
-
-    // Compute layout
-    let layout_algo = layout::ForceDirected::default();
-    let positions = layout::Layout::compute(&layout_algo, &graph);
 
     let native_options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default().with_inner_size([1280.0, 800.0]),
@@ -41,7 +63,7 @@ fn main() -> Result<()> {
     eframe::run_native(
         "spaghetti",
         native_options,
-        Box::new(move |_cc| Ok(Box::new(app::SpaghettiApp::new(graph, positions)))),
+        Box::new(move |_cc| Ok(Box::new(app))),
     )
     .map_err(|e| anyhow::anyhow!("eframe error: {e}"))?;
 
