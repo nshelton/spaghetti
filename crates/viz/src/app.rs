@@ -51,8 +51,9 @@ impl EdgeKindFilter {
 const ENERGY_THRESHOLD: f32 = 0.5;
 
 /// Number of force-simulation steps to run each frame while the layout is
-/// still settling.
-const STEPS_PER_FRAME: u32 = 3;
+/// still settling. Kept low (1) to avoid dropped frames on large graphs;
+/// the grid-based repulsion and adaptive early-stop handle convergence speed.
+const STEPS_PER_FRAME: u32 = 1;
 
 /// Main application state.
 pub struct SpaghettiApp {
