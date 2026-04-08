@@ -10,7 +10,7 @@
 //! - macOS: `brew install llvm && export LIBCLANG_PATH=$(brew --prefix llvm)/lib`
 //! - Windows: install LLVM prebuilt, set `LIBCLANG_PATH`
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use core_ir::{Edge, EdgeKind, Graph, Location, Symbol, SymbolId, SymbolKind};
 // Note: libclang only allows one `Clang` instance per process, so we index
@@ -58,8 +58,11 @@ pub fn index_project(compile_commands: &Path) -> Result<Graph, ClangError> {
     // project root. We resolve relative to compile_commands.json's parent.
     let cc_parent = compile_commands.parent().unwrap_or_else(|| Path::new("."));
 
+    let project_root = compute_project_root(&commands, cc_parent);
+
     info!(
         entries = commands.len(),
+        project_root = %project_root.display(),
         "indexing project from compile_commands.json"
     );
 
@@ -77,7 +80,7 @@ pub fn index_project(compile_commands: &Path) -> Result<Graph, ClangError> {
                 cc_parent.join(dir_path)
             };
             let file_path = work_dir.join(&cmd.file);
-            match index_translation_unit(cmd, &work_dir) {
+            match index_translation_unit(cmd, &work_dir, &project_root) {
                 Ok(g) => {
                     debug!(file = %file_path.display(), symbols = g.symbol_count(), "indexed TU");
                     Some(g)
@@ -107,7 +110,11 @@ pub fn index_project(compile_commands: &Path) -> Result<Graph, ClangError> {
 }
 
 /// Index a single translation unit.
-fn index_translation_unit(cmd: &CompileCommand, work_dir: &Path) -> Result<Graph, ClangError> {
+fn index_translation_unit(
+    cmd: &CompileCommand,
+    work_dir: &Path,
+    project_root: &Path,
+) -> Result<Graph, ClangError> {
     let clang = clang::Clang::new().map_err(|e| ClangError::Parse(e.to_string()))?;
     let index = clang::Index::new(&clang, false, true);
 
@@ -161,7 +168,7 @@ fn index_translation_unit(cmd: &CompileCommand, work_dir: &Path) -> Result<Graph
         .map_err(|e| ClangError::Parse(format!("{:?}", e)))?;
 
     let mut graph = Graph::new();
-    visit_cursor(&tu.get_entity(), &mut graph, work_dir);
+    visit_cursor(&tu.get_entity(), &mut graph, project_root);
     Ok(graph)
 }
 
@@ -441,6 +448,51 @@ fn cursor_location(cursor: &clang::Entity, graph: &mut Graph, base_dir: &Path) -
         line: file_loc.line,
         col: file_loc.column,
     })
+}
+
+/// Compute the project root as the longest common ancestor directory of all
+/// source files listed in `compile_commands.json`.
+fn compute_project_root(commands: &[CompileCommand], cc_parent: &Path) -> PathBuf {
+    let abs_paths: Vec<PathBuf> = commands
+        .iter()
+        .map(|cmd| {
+            let dir = Path::new(&cmd.directory);
+            let work_dir = if dir.is_absolute() {
+                dir.to_path_buf()
+            } else {
+                cc_parent.join(dir)
+            };
+            let file_path = work_dir.join(&cmd.file);
+            file_path.canonicalize().unwrap_or(file_path)
+        })
+        .collect();
+
+    if abs_paths.is_empty() {
+        return cc_parent.to_path_buf();
+    }
+
+    let mut prefix = abs_paths[0].clone();
+    for path in &abs_paths[1..] {
+        prefix = common_ancestor(&prefix, path);
+    }
+    // Ensure prefix is a directory, not a file
+    if prefix.is_file() {
+        prefix = prefix.parent().unwrap_or(cc_parent).to_path_buf();
+    }
+    prefix
+}
+
+/// Find the longest common ancestor path of two paths.
+fn common_ancestor(a: &Path, b: &Path) -> PathBuf {
+    let mut result = PathBuf::new();
+    for (ca, cb) in a.components().zip(b.components()) {
+        if ca == cb {
+            result.push(ca);
+        } else {
+            break;
+        }
+    }
+    result
 }
 
 /// Discover system C++ include paths by querying the compiler.

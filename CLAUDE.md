@@ -6,6 +6,18 @@ This is a personal project hosted on GitHub. It is not published to crates.io. I
 
 See [docs/Architecture.md](docs/Architecture.md) for detailed architecture documentation.
 
+## Environment Bootstrap (IMPORTANT — run first)
+
+**Before any `cargo build`, `cargo test`, or `cargo check`**, ensure libclang is installed. The `frontend-clang` crate links against it at compile time — the entire workspace fails to build without it.
+
+```bash
+bash scripts/setup-libclang.sh
+```
+
+On macOS you also need: `export LIBCLANG_PATH=$(brew --prefix llvm)/lib`
+
+This is idempotent and fast if libclang is already present. **Cloud / CI agents must run this before any cargo command.**
+
 ## Architecture
 
 ```
