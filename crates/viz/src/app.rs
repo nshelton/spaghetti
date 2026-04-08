@@ -4,8 +4,9 @@ use std::collections::HashSet;
 
 use core_ir::{EdgeKind, Graph, SymbolId, SymbolKind};
 use egui::{Color32, Pos2, Rect, Stroke, StrokeKind, Vec2};
-use glam::Vec2 as GVec2;
 use layout::{LayoutState, Positions};
+
+use crate::camera::{self, Camera2D, NODE_HEIGHT, NODE_WIDTH};
 
 /// Edge kind filter state.
 struct EdgeKindFilter {
@@ -45,37 +46,6 @@ impl EdgeKindFilter {
     }
 }
 
-/// 2D camera for pan and zoom.
-struct Camera2D {
-    offset: Vec2,
-    zoom: f32,
-}
-
-impl Default for Camera2D {
-    fn default() -> Self {
-        Self {
-            offset: Vec2::ZERO,
-            zoom: 1.0,
-        }
-    }
-}
-
-impl Camera2D {
-    /// Transform a world position to screen position.
-    fn world_to_screen(&self, world: GVec2, canvas_center: Pos2) -> Pos2 {
-        let x = canvas_center.x + (world.x + self.offset.x) * self.zoom;
-        let y = canvas_center.y + (world.y + self.offset.y) * self.zoom;
-        Pos2::new(x, y)
-    }
-
-    /// Transform a screen position to world position.
-    fn screen_to_world(&self, screen: Pos2, canvas_center: Pos2) -> GVec2 {
-        let x = (screen.x - canvas_center.x) / self.zoom - self.offset.x;
-        let y = (screen.y - canvas_center.y) / self.zoom - self.offset.y;
-        GVec2::new(x, y)
-    }
-}
-
 /// Energy threshold below which the simulation is considered settled and
 /// repaints are no longer requested.
 const ENERGY_THRESHOLD: f32 = 0.5;
@@ -96,9 +66,6 @@ pub struct SpaghettiApp {
     /// The node currently being dragged, if any.
     dragging: Option<SymbolId>,
 }
-
-const NODE_WIDTH: f32 = 120.0;
-const NODE_HEIGHT: f32 = 30.0;
 
 impl SpaghettiApp {
     /// Create a new app with a live [`LayoutState`] that drives positions
@@ -218,7 +185,7 @@ impl SpaghettiApp {
             let scroll_delta = ui.input(|i| i.smooth_scroll_delta.y);
             if scroll_delta != 0.0 {
                 let zoom_factor = 1.0 + scroll_delta * 0.002;
-                self.camera.zoom = (self.camera.zoom * zoom_factor).clamp(0.1, 10.0);
+                self.camera.apply_zoom(zoom_factor);
             }
 
             // --- Drag / pan / click interaction ---
@@ -333,18 +300,7 @@ impl SpaghettiApp {
     /// Hit-test: find which symbol (if any) is under the pointer.
     // TODO: quadtree for efficient hit testing
     fn hit_test(&self, pointer: Option<Pos2>, canvas_center: Pos2) -> Option<SymbolId> {
-        let pointer = pointer?;
-        let world = self.camera.screen_to_world(pointer, canvas_center);
-
-        let half_w = NODE_WIDTH / 2.0;
-        let half_h = NODE_HEIGHT / 2.0;
-
-        for (id, pos) in &self.positions.0 {
-            if (world.x - pos.x).abs() < half_w && (world.y - pos.y).abs() < half_h {
-                return Some(*id);
-            }
-        }
-        None
+        camera::hit_test(&self.camera, &self.positions, pointer, canvas_center)
     }
 }
 
