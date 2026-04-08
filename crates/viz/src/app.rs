@@ -4,7 +4,7 @@ use std::collections::HashSet;
 
 use core_ir::{EdgeKind, Graph, SymbolId, SymbolKind};
 use egui::{Color32, Pos2, Rect, Stroke, StrokeKind, Vec2};
-use layout::Positions;
+use layout::{LayoutState, Positions};
 
 use crate::camera::{self, Camera2D, NODE_HEIGHT, NODE_WIDTH};
 
@@ -46,26 +46,41 @@ impl EdgeKindFilter {
     }
 }
 
+/// Energy threshold below which the simulation is considered settled and
+/// repaints are no longer requested.
+const ENERGY_THRESHOLD: f32 = 0.5;
+
+/// Number of force-simulation steps to run each frame while the layout is
+/// still settling.
+const STEPS_PER_FRAME: u32 = 3;
+
 /// Main application state.
 pub struct SpaghettiApp {
     graph: Graph,
     positions: Positions,
+    layout_state: LayoutState,
     camera: Camera2D,
     selection: Option<SymbolId>,
     edge_filter: EdgeKindFilter,
     search: String,
+    /// The node currently being dragged, if any.
+    dragging: Option<SymbolId>,
 }
 
 impl SpaghettiApp {
-    /// Create a new app with the given graph and pre-computed positions.
-    pub fn new(graph: Graph, positions: Positions) -> Self {
+    /// Create a new app with a live [`LayoutState`] that drives positions
+    /// incrementally each frame.
+    pub fn new(graph: Graph, layout_state: LayoutState) -> Self {
+        let positions = layout_state.positions();
         Self {
             graph,
             positions,
+            layout_state,
             camera: Camera2D::default(),
             selection: None,
             edge_filter: EdgeKindFilter::default(),
             search: String::new(),
+            dragging: None,
         }
     }
 
@@ -173,22 +188,57 @@ impl SpaghettiApp {
                 self.camera.apply_zoom(zoom_factor);
             }
 
-            // Handle pan (drag)
-            if response.dragged_by(egui::PointerButton::Primary)
-                && self
-                    .hit_test(response.interact_pointer_pos(), canvas_center)
-                    .is_none()
-            {
-                let delta = response.drag_delta();
-                self.camera.offset.x += delta.x / self.camera.zoom;
-                self.camera.offset.y += delta.y / self.camera.zoom;
+            // --- Drag / pan / click interaction ---
+
+            // Drag started: determine whether we are dragging a node or panning.
+            if response.drag_started_by(egui::PointerButton::Primary) {
+                if let Some(hit) = self.hit_test(response.interact_pointer_pos(), canvas_center) {
+                    // Begin dragging a node.
+                    self.dragging = Some(hit);
+                    self.selection = Some(hit);
+                    if let Some(&world) = self.positions.0.get(&hit) {
+                        self.layout_state.pin(hit, world);
+                    }
+                }
             }
 
-            // Handle click (select)
+            // Ongoing drag.
+            if response.dragged_by(egui::PointerButton::Primary) {
+                if let Some(dragged_id) = self.dragging {
+                    // Move the pinned node to follow the cursor.
+                    if let Some(pointer) = response.interact_pointer_pos() {
+                        let world = self.camera.screen_to_world(pointer, canvas_center);
+                        self.layout_state.set_position(dragged_id, world);
+                    }
+                } else {
+                    // No node drag — pan the camera.
+                    let delta = response.drag_delta();
+                    self.camera.offset.x += delta.x / self.camera.zoom;
+                    self.camera.offset.y += delta.y / self.camera.zoom;
+                }
+            }
+
+            // Drag released: unpin the node.
+            if response.drag_stopped_by(egui::PointerButton::Primary) {
+                if let Some(dragged_id) = self.dragging.take() {
+                    self.layout_state.unpin(dragged_id);
+                }
+            }
+
+            // Handle click (select) — only when not dragging.
             if response.clicked() {
                 if let Some(pointer) = response.interact_pointer_pos() {
                     self.selection = self.hit_test(Some(pointer), canvas_center);
                 }
+            }
+
+            // --- Run incremental simulation ---
+            self.layout_state.step(STEPS_PER_FRAME);
+            self.positions = self.layout_state.positions();
+
+            // Request repaint while the layout is still settling.
+            if self.layout_state.energy() > ENERGY_THRESHOLD || self.dragging.is_some() {
+                ui.ctx().request_repaint();
             }
 
             // Draw edges

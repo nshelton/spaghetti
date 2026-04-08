@@ -1,6 +1,11 @@
 //! Graph layout algorithms.
 //!
 //! Pure function from [`core_ir::Graph`] → [`Positions`]. No rendering dependencies.
+//!
+//! The main types are:
+//! - [`ForceDirected`]: batch layout (compute once, get positions).
+//! - [`LayoutState`]: incremental simulation driven frame-by-frame, with
+//!   support for pinning nodes (interactive dragging).
 
 use core_ir::{EdgeKind, Graph, SymbolId};
 use glam::Vec2;
@@ -17,6 +22,199 @@ pub struct Positions(pub IndexMap<SymbolId, Vec2>);
 pub trait Layout {
     /// Compute positions for all symbols in the graph.
     fn compute(&self, graph: &Graph) -> Positions;
+}
+
+/// Tuneable constants for the force-directed simulation.
+#[derive(Debug, Clone, Copy)]
+pub struct ForceParams {
+    /// Coulomb-like repulsion strength (all pairs).
+    pub repulsion: f32,
+    /// Spring attraction coefficient (edges only).
+    pub attraction: f32,
+    /// Velocity damping factor applied each step.
+    pub damping: f32,
+    /// Rest length of edge springs.
+    pub ideal_length: f32,
+    /// Minimum distance clamped to avoid division by near-zero.
+    pub min_dist: f32,
+}
+
+impl Default for ForceParams {
+    fn default() -> Self {
+        Self {
+            repulsion: 5000.0,
+            attraction: 0.01,
+            damping: 0.9,
+            ideal_length: 150.0,
+            min_dist: 1.0,
+        }
+    }
+}
+
+/// Incremental force-directed simulation state.
+///
+/// Created from a [`Graph`] and driven frame-by-frame via [`step`](Self::step).
+/// Nodes can be pinned to fixed positions (e.g. while the user is dragging
+/// them); pinned nodes still exert forces on their neighbours but skip their
+/// own velocity/position updates.
+pub struct LayoutState {
+    ids: Vec<SymbolId>,
+    positions: Vec<Vec2>,
+    velocities: Vec<Vec2>,
+    edge_pairs: Vec<(usize, usize)>,
+    id_to_idx: IndexMap<SymbolId, usize>,
+    pins: IndexMap<SymbolId, Vec2>,
+    params: ForceParams,
+}
+
+impl LayoutState {
+    /// Initialise a new simulation from a graph.
+    ///
+    /// `seed` controls the deterministic initial scatter. `params` sets the
+    /// force constants.
+    pub fn new(graph: &Graph, seed: u64, params: ForceParams) -> Self {
+        let ids: Vec<SymbolId> = graph.symbols.keys().copied().collect();
+        let n = ids.len();
+
+        let positions: Vec<Vec2> = ids
+            .iter()
+            .enumerate()
+            .map(|(i, id)| {
+                let hash = seed.wrapping_mul(id.0).wrapping_add(i as u64);
+                let x = ((hash & 0xFFFF) as f32 / 65535.0 - 0.5) * 400.0;
+                let y = (((hash >> 16) & 0xFFFF) as f32 / 65535.0 - 0.5) * 400.0;
+                Vec2::new(x, y)
+            })
+            .collect();
+
+        let id_to_idx: IndexMap<SymbolId, usize> =
+            ids.iter().enumerate().map(|(i, &id)| (id, i)).collect();
+
+        let edge_pairs: Vec<(usize, usize)> = graph
+            .edges
+            .iter()
+            .filter(|e| {
+                matches!(
+                    e.kind,
+                    EdgeKind::Calls | EdgeKind::Inherits | EdgeKind::Contains | EdgeKind::Overrides
+                )
+            })
+            .filter_map(|e| {
+                let from = id_to_idx.get(&e.from)?;
+                let to = id_to_idx.get(&e.to)?;
+                Some((*from, *to))
+            })
+            .collect();
+
+        let velocities = vec![Vec2::ZERO; n];
+
+        Self {
+            ids,
+            positions,
+            velocities,
+            edge_pairs,
+            id_to_idx,
+            pins: IndexMap::new(),
+            params,
+        }
+    }
+
+    /// Run `n` simulation iterations.
+    pub fn step(&mut self, n: u32) {
+        let len = self.positions.len();
+        let p = &self.params;
+
+        for _ in 0..n {
+            let mut forces = vec![Vec2::ZERO; len];
+
+            // Repulsive forces (all pairs)
+            // TODO: Barnes-Hut octree for O(n log n) instead of O(n^2)
+            for i in 0..len {
+                for j in (i + 1)..len {
+                    let delta = self.positions[i] - self.positions[j];
+                    let dist = delta.length().max(p.min_dist);
+                    let force = delta.normalize_or_zero() * (p.repulsion / (dist * dist));
+                    forces[i] += force;
+                    forces[j] -= force;
+                }
+            }
+
+            // Attractive forces along edges
+            for &(from, to) in &self.edge_pairs {
+                let delta = self.positions[to] - self.positions[from];
+                let dist = delta.length().max(p.min_dist);
+                let force = delta.normalize_or_zero() * p.attraction * (dist - p.ideal_length);
+                forces[from] += force;
+                forces[to] -= force;
+            }
+
+            // Update velocities and positions (skip pinned nodes)
+            let iter = self
+                .ids
+                .iter()
+                .zip(self.positions.iter_mut())
+                .zip(self.velocities.iter_mut())
+                .zip(forces.iter());
+            for (((id, pos), vel), force) in iter {
+                if let Some(&pin_pos) = self.pins.get(id) {
+                    // Pinned: snap to pin position, zero velocity.
+                    *pos = pin_pos;
+                    *vel = Vec2::ZERO;
+                } else {
+                    *vel = (*vel + *force) * p.damping;
+                    *pos += *vel;
+                }
+            }
+        }
+    }
+
+    /// Pin a node to a fixed position.
+    ///
+    /// The node will stay at `pos` during subsequent [`step`](Self::step)
+    /// calls but continues to exert forces on its neighbours.
+    pub fn pin(&mut self, id: SymbolId, pos: Vec2) {
+        self.pins.insert(id, pos);
+        if let Some(&idx) = self.id_to_idx.get(&id) {
+            self.positions[idx] = pos;
+            self.velocities[idx] = Vec2::ZERO;
+        }
+    }
+
+    /// Release a previously pinned node so it resumes normal simulation.
+    pub fn unpin(&mut self, id: SymbolId) {
+        self.pins.shift_remove(&id);
+    }
+
+    /// Directly set a node's position (useful for updating a pin target
+    /// during a drag).
+    pub fn set_position(&mut self, id: SymbolId, pos: Vec2) {
+        if let Some(&idx) = self.id_to_idx.get(&id) {
+            self.positions[idx] = pos;
+        }
+        // If the node is pinned, update the pin target too.
+        if self.pins.contains_key(&id) {
+            self.pins.insert(id, pos);
+        }
+    }
+
+    /// Return a snapshot of the current positions.
+    pub fn positions(&self) -> Positions {
+        Positions(
+            self.ids
+                .iter()
+                .copied()
+                .zip(self.positions.iter().copied())
+                .collect(),
+        )
+    }
+
+    /// Total kinetic energy of the system (sum of squared velocity magnitudes).
+    ///
+    /// Useful as a convergence test — when energy drops below a threshold the
+    /// layout has settled and repaints can stop.
+    pub fn energy(&self) -> f32 {
+        self.velocities.iter().map(|v| v.length_squared()).sum()
+    }
 }
 
 /// Force-directed layout using a simplified Barnes-Hut approach.
@@ -40,85 +238,14 @@ impl Default for ForceDirected {
 
 impl Layout for ForceDirected {
     fn compute(&self, graph: &Graph) -> Positions {
-        let ids: Vec<SymbolId> = graph.symbols.keys().copied().collect();
-        let n = ids.len();
-        if n == 0 {
+        if graph.symbols.is_empty() {
             return Positions(IndexMap::new());
         }
 
-        // Deterministic initial positions using a simple hash-based scatter
-        let mut pos: Vec<Vec2> = ids
-            .iter()
-            .enumerate()
-            .map(|(i, id)| {
-                let hash = self.seed.wrapping_mul(id.0).wrapping_add(i as u64);
-                let x = ((hash & 0xFFFF) as f32 / 65535.0 - 0.5) * 400.0;
-                let y = (((hash >> 16) & 0xFFFF) as f32 / 65535.0 - 0.5) * 400.0;
-                Vec2::new(x, y)
-            })
-            .collect();
+        let mut state = LayoutState::new(graph, self.seed, ForceParams::default());
+        state.step(self.iterations);
 
-        // Build edge index (as pairs of position indices)
-        let id_to_idx: IndexMap<SymbolId, usize> =
-            ids.iter().enumerate().map(|(i, &id)| (id, i)).collect();
-
-        let edge_pairs: Vec<(usize, usize)> = graph
-            .edges
-            .iter()
-            .filter(|e| {
-                matches!(
-                    e.kind,
-                    EdgeKind::Calls | EdgeKind::Inherits | EdgeKind::Contains | EdgeKind::Overrides
-                )
-            })
-            .filter_map(|e| {
-                let from = id_to_idx.get(&e.from)?;
-                let to = id_to_idx.get(&e.to)?;
-                Some((*from, *to))
-            })
-            .collect();
-
-        // Force-directed simulation
-        let repulsion = 5000.0_f32;
-        let attraction = 0.01_f32;
-        let damping = 0.9_f32;
-        let ideal_length = 150.0_f32;
-        let min_dist = 1.0_f32;
-
-        let mut velocities = vec![Vec2::ZERO; n];
-
-        for _ in 0..self.iterations {
-            let mut forces = vec![Vec2::ZERO; n];
-
-            // Repulsive forces (all pairs — simplified, no Barnes-Hut quadtree for v0)
-            // TODO: Barnes-Hut octree for O(n log n) instead of O(n^2)
-            for i in 0..n {
-                for j in (i + 1)..n {
-                    let delta = pos[i] - pos[j];
-                    let dist = delta.length().max(min_dist);
-                    let force = delta.normalize_or_zero() * (repulsion / (dist * dist));
-                    forces[i] += force;
-                    forces[j] -= force;
-                }
-            }
-
-            // Attractive forces along edges
-            for &(from, to) in &edge_pairs {
-                let delta = pos[to] - pos[from];
-                let dist = delta.length().max(min_dist);
-                let force = delta.normalize_or_zero() * attraction * (dist - ideal_length);
-                forces[from] += force;
-                forces[to] -= force;
-            }
-
-            // Update velocities and positions
-            for i in 0..n {
-                velocities[i] = (velocities[i] + forces[i]) * damping;
-                pos[i] += velocities[i];
-            }
-        }
-
-        let mut map: IndexMap<SymbolId, Vec2> = ids.into_iter().zip(pos).collect();
+        let mut map = state.positions().0;
         pack_components(&mut map, graph);
         Positions(map)
     }
