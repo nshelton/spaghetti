@@ -1,10 +1,12 @@
 //! The main eframe application for spaghetti.
 
 use std::collections::HashSet;
+use std::time::Instant;
 
 use core_ir::{EdgeKind, Graph, SymbolId, SymbolKind};
 use egui::{Color32, Pos2, Rect, Stroke, StrokeKind, Vec2};
 use layout::{LayoutState, Positions};
+use tracing::info;
 
 use crate::camera::{self, Camera2D, NODE_HEIGHT, NODE_WIDTH};
 
@@ -65,6 +67,12 @@ pub struct SpaghettiApp {
     search: String,
     /// The node currently being dragged, if any.
     dragging: Option<SymbolId>,
+    /// Whether we have already logged convergence.
+    converged: bool,
+    /// Timestamp when the app was created (for time-to-convergence).
+    created_at: Instant,
+    /// Frame counter for periodic per-frame logging.
+    frame_count: u64,
 }
 
 impl SpaghettiApp {
@@ -81,6 +89,9 @@ impl SpaghettiApp {
             edge_filter: EdgeKindFilter::default(),
             search: String::new(),
             dragging: None,
+            converged: false,
+            created_at: Instant::now(),
+            frame_count: 0,
         }
     }
 
@@ -235,11 +246,39 @@ impl SpaghettiApp {
             // --- Run incremental simulation ---
             let active_kinds = self.edge_filter.active_kinds();
             self.layout_state.set_visible_edge_kinds(&active_kinds);
+
+            let step_start = Instant::now();
             self.layout_state.step(STEPS_PER_FRAME);
+            let step_elapsed = step_start.elapsed();
             self.positions = self.layout_state.positions();
+            self.frame_count += 1;
+
+            let energy = self.layout_state.energy();
+
+            // Log per-frame step time periodically (every 60 frames ≈ once per second)
+            if self.frame_count.is_multiple_of(60) && energy > ENERGY_THRESHOLD {
+                info!(
+                    frame = self.frame_count,
+                    step_us = step_elapsed.as_micros(),
+                    energy = format!("{:.2}", energy),
+                    "per-frame layout step"
+                );
+            }
+
+            // Log convergence once
+            if !self.converged && energy <= ENERGY_THRESHOLD {
+                self.converged = true;
+                let time_to_converge = self.created_at.elapsed();
+                info!(
+                    frames = self.frame_count,
+                    time_ms = format!("{:.1}", time_to_converge.as_secs_f64() * 1000.0),
+                    final_energy = format!("{:.4}", energy),
+                    "layout converged"
+                );
+            }
 
             // Request repaint while the layout is still settling.
-            if self.layout_state.energy() > ENERGY_THRESHOLD || self.dragging.is_some() {
+            if energy > ENERGY_THRESHOLD || self.dragging.is_some() {
                 ui.ctx().request_repaint();
             }
 
