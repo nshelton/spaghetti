@@ -11,6 +11,8 @@ use core_ir::{EdgeKind, Graph, SymbolId};
 use glam::Vec2;
 use indexmap::IndexMap;
 use std::collections::{HashMap, VecDeque};
+use std::time::Instant;
+use tracing::info;
 
 /// Mapping from symbol IDs to 2D positions.
 ///
@@ -131,6 +133,11 @@ impl LayoutState {
             pins: IndexMap::new(),
             params,
         }
+    }
+
+    /// Number of nodes in the simulation.
+    pub fn node_count(&self) -> usize {
+        self.ids.len()
     }
 
     /// Run `n` simulation iterations.
@@ -324,11 +331,28 @@ impl Layout for ForceDirected {
             return Positions(IndexMap::new());
         }
 
+        let start = Instant::now();
         let mut state = LayoutState::new(graph, self.seed, ForceParams::default());
-        state.step_inner(self.iterations, true);
+        let init_elapsed = start.elapsed();
 
+        let sim_start = Instant::now();
+        state.step_inner(self.iterations, true);
+        let sim_elapsed = sim_start.elapsed();
+
+        let pack_start = Instant::now();
         let mut map = state.positions().0;
         pack_components(&mut map, graph);
+        let pack_elapsed = pack_start.elapsed();
+
+        info!(
+            nodes = state.node_count(),
+            iterations = self.iterations,
+            init_ms = format!("{:.1}", init_elapsed.as_secs_f64() * 1000.0),
+            sim_ms = format!("{:.1}", sim_elapsed.as_secs_f64() * 1000.0),
+            pack_ms = format!("{:.1}", pack_elapsed.as_secs_f64() * 1000.0),
+            "batch layout complete"
+        );
+
         Positions(map)
     }
 }

@@ -11,6 +11,7 @@
 //! - Windows: install LLVM prebuilt, set `LIBCLANG_PATH`
 
 use std::path::Path;
+use std::time::Instant;
 
 use core_ir::{Edge, EdgeKind, Graph, Location, Symbol, SymbolId, SymbolKind};
 // Note: libclang only allows one `Clang` instance per process, so we index
@@ -63,6 +64,9 @@ pub fn index_project(compile_commands: &Path) -> Result<Graph, ClangError> {
         "indexing project from compile_commands.json"
     );
 
+    let indexing_start = Instant::now();
+    let mut tu_times: Vec<f64> = Vec::new();
+
     let partial_graphs: Vec<Graph> = commands
         .iter()
         .filter_map(|cmd| {
@@ -77,9 +81,12 @@ pub fn index_project(compile_commands: &Path) -> Result<Graph, ClangError> {
                 cc_parent.join(dir_path)
             };
             let file_path = work_dir.join(&cmd.file);
+            let tu_start = Instant::now();
             match index_translation_unit(cmd, &work_dir) {
                 Ok(g) => {
-                    debug!(file = %file_path.display(), symbols = g.symbol_count(), "indexed TU");
+                    let tu_elapsed = tu_start.elapsed().as_secs_f64();
+                    tu_times.push(tu_elapsed);
+                    debug!(file = %file_path.display(), symbols = g.symbol_count(), time_ms = tu_elapsed * 1000.0, "indexed TU");
                     Some(g)
                 }
                 Err(e) => {
@@ -90,6 +97,25 @@ pub fn index_project(compile_commands: &Path) -> Result<Graph, ClangError> {
         })
         .collect();
 
+    let indexing_elapsed = indexing_start.elapsed();
+
+    // Log per-TU timing stats
+    if !tu_times.is_empty() {
+        let min = tu_times.iter().copied().fold(f64::INFINITY, f64::min);
+        let max = tu_times.iter().copied().fold(f64::NEG_INFINITY, f64::max);
+        let total: f64 = tu_times.iter().sum();
+        let avg = total / tu_times.len() as f64;
+        info!(
+            tus = tu_times.len(),
+            min_ms = format!("{:.1}", min * 1000.0),
+            max_ms = format!("{:.1}", max * 1000.0),
+            avg_ms = format!("{:.1}", avg * 1000.0),
+            total_ms = format!("{:.1}", total * 1000.0),
+            "per-TU timing stats"
+        );
+    }
+
+    let merge_start = Instant::now();
     let mut graph = Graph::new();
     for g in partial_graphs {
         graph.merge(g);
@@ -97,10 +123,13 @@ pub fn index_project(compile_commands: &Path) -> Result<Graph, ClangError> {
 
     // Deduplicate edges (same headers are processed by multiple TUs)
     dedup_edges(&mut graph);
+    let merge_elapsed = merge_start.elapsed();
 
     info!(
         symbols = graph.symbol_count(),
         edges = graph.edge_count(),
+        indexing_ms = format!("{:.1}", indexing_elapsed.as_secs_f64() * 1000.0),
+        merge_ms = format!("{:.1}", merge_elapsed.as_secs_f64() * 1000.0),
         "indexing complete"
     );
     Ok(graph)
