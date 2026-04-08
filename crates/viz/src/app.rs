@@ -72,6 +72,8 @@ pub struct SpaghettiApp {
     pub(crate) search: String,
     /// The node currently being dragged, if any.
     pub(crate) dragging: Option<SymbolId>,
+    /// Whether the initial auto-fit has been performed.
+    pub(crate) auto_fitted: bool,
 
     // -- Menu / UI state --
     pub(crate) show_console: bool,
@@ -104,6 +106,7 @@ impl SpaghettiApp {
             edge_filter: EdgeKindFilter::default(),
             search: String::new(),
             dragging: None,
+            auto_fitted: false,
             show_console: false,
             indexing: false,
             log_buffer,
@@ -249,6 +252,7 @@ impl SpaghettiApp {
                     self.selection = None;
                     self.camera = Camera2D::default();
                     self.dragging = None;
+                    self.auto_fitted = false;
                     self.finish_indexing();
                 }
                 ProgressMessage::Failed(ref err) => {
