@@ -42,12 +42,7 @@ fn main() -> Result<()> {
     eframe::run_native(
         "spaghetti",
         native_options,
-        Box::new(move |_cc| {
-            Ok(Box::new(app::SpaghettiApp::with_layout_state(
-                graph,
-                layout_state,
-            )))
-        }),
+        Box::new(move |_cc| Ok(Box::new(app::SpaghettiApp::new(graph, layout_state)))),
     )
     .map_err(|e| anyhow::anyhow!("eframe error: {e}"))?;
 

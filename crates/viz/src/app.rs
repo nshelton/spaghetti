@@ -5,7 +5,7 @@ use std::collections::HashSet;
 use core_ir::{EdgeKind, Graph, SymbolId, SymbolKind};
 use egui::{Color32, Pos2, Rect, Stroke, StrokeKind, Vec2};
 use glam::Vec2 as GVec2;
-use layout::{ForceParams, LayoutState, Positions};
+use layout::{LayoutState, Positions};
 
 /// Edge kind filter state.
 struct EdgeKindFilter {
@@ -101,24 +101,9 @@ const NODE_WIDTH: f32 = 120.0;
 const NODE_HEIGHT: f32 = 30.0;
 
 impl SpaghettiApp {
-    /// Create a new app with the given graph and pre-computed positions.
-    pub fn new(graph: Graph, positions: Positions) -> Self {
-        let layout_state = LayoutState::new(&graph, 42, ForceParams::default());
-        Self {
-            graph,
-            positions,
-            layout_state,
-            camera: Camera2D::default(),
-            selection: None,
-            edge_filter: EdgeKindFilter::default(),
-            search: String::new(),
-            dragging: None,
-        }
-    }
-
     /// Create a new app with a live [`LayoutState`] that drives positions
-    /// incrementally (used for the interactive path).
-    pub fn with_layout_state(graph: Graph, layout_state: LayoutState) -> Self {
+    /// incrementally each frame.
+    pub fn new(graph: Graph, layout_state: LayoutState) -> Self {
         let positions = layout_state.positions();
         Self {
             graph,
