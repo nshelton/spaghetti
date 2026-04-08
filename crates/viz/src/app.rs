@@ -1,11 +1,14 @@
 //! The main eframe application for spaghetti.
 
 use std::collections::HashSet;
+use std::time::Instant;
 
 use core_ir::{EdgeKind, Graph, SymbolId, SymbolKind};
 use egui::{Color32, Pos2, Rect, Stroke, StrokeKind, Vec2};
-use glam::Vec2 as GVec2;
-use layout::Positions;
+use layout::{LayoutState, Positions};
+use tracing::info;
+
+use crate::camera::{self, Camera2D, NODE_HEIGHT, NODE_WIDTH};
 
 /// Edge kind filter state.
 struct EdgeKindFilter {
@@ -45,60 +48,50 @@ impl EdgeKindFilter {
     }
 }
 
-/// 2D camera for pan and zoom.
-struct Camera2D {
-    offset: Vec2,
-    zoom: f32,
-}
+/// Energy threshold below which the simulation is considered settled and
+/// repaints are no longer requested.
+const ENERGY_THRESHOLD: f32 = 0.5;
 
-impl Default for Camera2D {
-    fn default() -> Self {
-        Self {
-            offset: Vec2::ZERO,
-            zoom: 1.0,
-        }
-    }
-}
-
-impl Camera2D {
-    /// Transform a world position to screen position.
-    fn world_to_screen(&self, world: GVec2, canvas_center: Pos2) -> Pos2 {
-        let x = canvas_center.x + (world.x + self.offset.x) * self.zoom;
-        let y = canvas_center.y + (world.y + self.offset.y) * self.zoom;
-        Pos2::new(x, y)
-    }
-
-    /// Transform a screen position to world position.
-    fn screen_to_world(&self, screen: Pos2, canvas_center: Pos2) -> GVec2 {
-        let x = (screen.x - canvas_center.x) / self.zoom - self.offset.x;
-        let y = (screen.y - canvas_center.y) / self.zoom - self.offset.y;
-        GVec2::new(x, y)
-    }
-}
+/// Number of force-simulation steps to run each frame while the layout is
+/// still settling.
+const STEPS_PER_FRAME: u32 = 3;
 
 /// Main application state.
 pub struct SpaghettiApp {
     graph: Graph,
     positions: Positions,
+    layout_state: LayoutState,
     camera: Camera2D,
     selection: Option<SymbolId>,
     edge_filter: EdgeKindFilter,
     search: String,
+    /// The node currently being dragged, if any.
+    dragging: Option<SymbolId>,
+    /// Whether we have already logged convergence.
+    converged: bool,
+    /// Timestamp when the app was created (for time-to-convergence).
+    created_at: Instant,
+    /// Frame counter for periodic per-frame logging.
+    frame_count: u64,
 }
 
-const NODE_WIDTH: f32 = 120.0;
-const NODE_HEIGHT: f32 = 30.0;
-
 impl SpaghettiApp {
-    /// Create a new app with the given graph and pre-computed positions.
-    pub fn new(graph: Graph, positions: Positions) -> Self {
+    /// Create a new app with a live [`LayoutState`] that drives positions
+    /// incrementally each frame.
+    pub fn new(graph: Graph, layout_state: LayoutState) -> Self {
+        let positions = layout_state.positions();
         Self {
             graph,
             positions,
+            layout_state,
             camera: Camera2D::default(),
             selection: None,
             edge_filter: EdgeKindFilter::default(),
             search: String::new(),
+            dragging: None,
+            converged: false,
+            created_at: Instant::now(),
+            frame_count: 0,
         }
     }
 
@@ -203,29 +196,93 @@ impl SpaghettiApp {
             let scroll_delta = ui.input(|i| i.smooth_scroll_delta.y);
             if scroll_delta != 0.0 {
                 let zoom_factor = 1.0 + scroll_delta * 0.002;
-                self.camera.zoom = (self.camera.zoom * zoom_factor).clamp(0.1, 10.0);
+                self.camera.apply_zoom(zoom_factor);
             }
 
-            // Handle pan (drag)
-            if response.dragged_by(egui::PointerButton::Primary)
-                && self
-                    .hit_test(response.interact_pointer_pos(), canvas_center)
-                    .is_none()
-            {
-                let delta = response.drag_delta();
-                self.camera.offset.x += delta.x / self.camera.zoom;
-                self.camera.offset.y += delta.y / self.camera.zoom;
+            // --- Drag / pan / click interaction ---
+
+            // Drag started: determine whether we are dragging a node or panning.
+            if response.drag_started_by(egui::PointerButton::Primary) {
+                if let Some(hit) = self.hit_test(response.interact_pointer_pos(), canvas_center) {
+                    // Begin dragging a node.
+                    self.dragging = Some(hit);
+                    self.selection = Some(hit);
+                    if let Some(&world) = self.positions.0.get(&hit) {
+                        self.layout_state.pin(hit, world);
+                    }
+                }
             }
 
-            // Handle click (select)
+            // Ongoing drag.
+            if response.dragged_by(egui::PointerButton::Primary) {
+                if let Some(dragged_id) = self.dragging {
+                    // Move the pinned node to follow the cursor.
+                    if let Some(pointer) = response.interact_pointer_pos() {
+                        let world = self.camera.screen_to_world(pointer, canvas_center);
+                        self.layout_state.set_position(dragged_id, world);
+                    }
+                } else {
+                    // No node drag — pan the camera.
+                    let delta = response.drag_delta();
+                    self.camera.offset.x += delta.x / self.camera.zoom;
+                    self.camera.offset.y += delta.y / self.camera.zoom;
+                }
+            }
+
+            // Drag released: unpin the node.
+            if response.drag_stopped_by(egui::PointerButton::Primary) {
+                if let Some(dragged_id) = self.dragging.take() {
+                    self.layout_state.unpin(dragged_id);
+                }
+            }
+
+            // Handle click (select) — only when not dragging.
             if response.clicked() {
                 if let Some(pointer) = response.interact_pointer_pos() {
                     self.selection = self.hit_test(Some(pointer), canvas_center);
                 }
             }
 
-            // Draw edges
+            // --- Run incremental simulation ---
             let active_kinds = self.edge_filter.active_kinds();
+            self.layout_state.set_visible_edge_kinds(&active_kinds);
+
+            let step_start = Instant::now();
+            self.layout_state.step(STEPS_PER_FRAME);
+            let step_elapsed = step_start.elapsed();
+            self.positions = self.layout_state.positions();
+            self.frame_count += 1;
+
+            let energy = self.layout_state.energy();
+
+            // Log per-frame step time periodically (every 60 frames ≈ once per second)
+            if self.frame_count.is_multiple_of(60) && energy > ENERGY_THRESHOLD {
+                info!(
+                    frame = self.frame_count,
+                    step_us = step_elapsed.as_micros(),
+                    energy = format!("{:.2}", energy),
+                    "per-frame layout step"
+                );
+            }
+
+            // Log convergence once
+            if !self.converged && energy <= ENERGY_THRESHOLD {
+                self.converged = true;
+                let time_to_converge = self.created_at.elapsed();
+                info!(
+                    frames = self.frame_count,
+                    time_ms = format!("{:.1}", time_to_converge.as_secs_f64() * 1000.0),
+                    final_energy = format!("{:.4}", energy),
+                    "layout converged"
+                );
+            }
+
+            // Request repaint while the layout is still settling.
+            if energy > ENERGY_THRESHOLD || self.dragging.is_some() {
+                ui.ctx().request_repaint();
+            }
+
+            // Draw edges
             for edge in &self.graph.edges {
                 if !active_kinds.contains(&edge.kind) {
                     continue;
@@ -252,10 +309,11 @@ impl SpaghettiApp {
                     let rect = Rect::from_center_size(screen_pos, node_size);
 
                     // Background
+                    let base = node_color(sym.kind);
                     let bg = if self.selection == Some(*id) {
-                        Color32::from_rgb(80, 140, 220)
+                        brighten(base, 2.0)
                     } else {
-                        node_color(sym.kind)
+                        base
                     };
                     painter.rect_filled(rect, 4.0, bg);
                     painter.rect_stroke(
@@ -283,18 +341,7 @@ impl SpaghettiApp {
     /// Hit-test: find which symbol (if any) is under the pointer.
     // TODO: quadtree for efficient hit testing
     fn hit_test(&self, pointer: Option<Pos2>, canvas_center: Pos2) -> Option<SymbolId> {
-        let pointer = pointer?;
-        let world = self.camera.screen_to_world(pointer, canvas_center);
-
-        let half_w = NODE_WIDTH / 2.0;
-        let half_h = NODE_HEIGHT / 2.0;
-
-        for (id, pos) in &self.positions.0 {
-            if (world.x - pos.x).abs() < half_w && (world.y - pos.y).abs() < half_h {
-                return Some(*id);
-            }
-        }
-        None
+        camera::hit_test(&self.camera, &self.positions, pointer, canvas_center)
     }
 }
 
@@ -308,16 +355,25 @@ impl eframe::App for SpaghettiApp {
 
 fn node_color(kind: SymbolKind) -> Color32 {
     match kind {
-        SymbolKind::Class => Color32::from_rgb(70, 130, 180),
-        SymbolKind::Struct => Color32::from_rgb(60, 160, 120),
-        SymbolKind::Function => Color32::from_rgb(180, 100, 60),
-        SymbolKind::Method => Color32::from_rgb(140, 100, 180),
-        SymbolKind::Field => Color32::from_rgb(160, 160, 80),
-        SymbolKind::Namespace => Color32::from_rgb(100, 100, 100),
-        SymbolKind::TemplateInstantiation => Color32::from_rgb(180, 80, 140),
-        SymbolKind::TranslationUnit => Color32::from_rgb(80, 80, 80),
-        _ => Color32::from_rgb(120, 120, 120),
+        SymbolKind::Class => Color32::from_rgb(30, 55, 80),
+        SymbolKind::Struct => Color32::from_rgb(25, 70, 50),
+        SymbolKind::Function => Color32::from_rgb(80, 45, 25),
+        SymbolKind::Method => Color32::from_rgb(60, 45, 80),
+        SymbolKind::Field => Color32::from_rgb(70, 70, 35),
+        SymbolKind::Namespace => Color32::from_rgb(45, 45, 45),
+        SymbolKind::TemplateInstantiation => Color32::from_rgb(80, 35, 60),
+        SymbolKind::TranslationUnit => Color32::from_rgb(35, 35, 35),
+        _ => Color32::from_rgb(50, 50, 50),
     }
+}
+
+/// Brighten a color by a multiplier, clamping to 255.
+fn brighten(color: Color32, factor: f32) -> Color32 {
+    Color32::from_rgb(
+        (color.r() as f32 * factor).min(255.0) as u8,
+        (color.g() as f32 * factor).min(255.0) as u8,
+        (color.b() as f32 * factor).min(255.0) as u8,
+    )
 }
 
 fn edge_color(kind: EdgeKind) -> Color32 {

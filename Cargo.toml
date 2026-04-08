@@ -2,10 +2,10 @@
 resolver = "2"
 members = [
     "crates/core-ir",
+    "crates/frontend-clang",
     "crates/layout",
     "crates/query",
     "crates/viz",
-    # frontend-clang is only included when the "clang" feature is active
 ]
 
 [workspace.dependencies]
@@ -40,5 +40,6 @@ seahash = "4"
 
 # Internal crates
 core-ir = { path = "crates/core-ir" }
+frontend-clang = { path = "crates/frontend-clang" }
 layout = { path = "crates/layout" }
 query = { path = "crates/query" }

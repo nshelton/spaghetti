@@ -4,7 +4,7 @@ A cross-platform desktop visualizer for code structure and dataflow. Points at a
 
 This is a personal project hosted on GitHub. It is not published to crates.io. Internal crate names exist for workspace organization only.
 
-See `PLAN.md` for the full v0 scaffold spec.
+See [docs/Architecture.md](docs/Architecture.md) for detailed architecture documentation.
 
 ## Architecture
 
@@ -39,35 +39,30 @@ examples/
 ## Running
 
 ```bash
-# Fallback path (no libclang required) — uses pre-serialized graph
-cargo run -p viz -- examples/tiny-cpp/graph.json
-
-# Real indexing path (requires libclang)
-cargo run -p viz -- examples/tiny-cpp/compile_commands.json
+# Requires libclang
+LIBCLANG_PATH=$(brew --prefix llvm)/lib cargo run -p viz -- examples/tiny-cpp/compile_commands.json
 ```
 
-Expected result: a window showing 3 classes (Shape, Circle, Square) with inheritance edges and call edges from `main`.
+Expected result: a window showing classes (Shape, Circle, Square), methods, and `main` with inheritance, call, contains, and overrides edges. The force-directed layout animates into place over ~1-2 seconds.
 
 ## libclang Setup
 
-Required only for the `frontend-clang` crate. The viz app works without it via the JSON fallback.
+Required to build. The viz binary always uses `frontend-clang` for indexing.
 
 - **Linux**: `sudo apt install libclang-dev`
 - **macOS**: `brew install llvm && export LIBCLANG_PATH=$(brew --prefix llvm)/lib`
 - **Windows**: install LLVM prebuilt from llvm.org, set `LIBCLANG_PATH` to `<llvm>/bin`
 
-If libclang is not available in the current environment, the `clang` workspace feature is off by default and the frontend-clang crate is excluded from the build. Do not attempt to stub libclang calls with `todo!()` — use the JSON fallback path instead.
-
 ## Testing
 
 ```bash
 cargo test --workspace                      # default, skips clang integration tests
-cargo test --workspace --features clang     # includes libclang-dependent tests
+cargo test -p frontend-clang --features clang-tests  # includes libclang-dependent tests
 cargo clippy --workspace -- -D warnings
 cargo fmt --check
 ```
 
-Every crate has at least one test. `frontend-clang` integration tests are gated on the `clang` feature.
+Every crate has at least one test. `frontend-clang` integration tests are gated on the `clang-tests` feature. The `viz` crate's `camera` module has unit tests for coordinate transforms and hit-testing.
 
 ## Coding Conventions
 
@@ -108,21 +103,22 @@ This list exists because scope creep kills this kind of project. If you find you
 - Incremental re-indexing
 - Uninstantiated template modeling
 - SFINAE / concept overload visualization
-- Edge kinds beyond `Calls` and `Inherits` in the clang frontend
-- Symbol kinds beyond `Class` and `Method` in the clang frontend
+- Symbol kinds beyond `Class`, `Method`, and `Function` in the clang frontend
 
 The core-ir enums may contain more variants than the frontend currently emits — that is intentional, to avoid churning the IR later.
 
 ## Current Status
 
-v0 scaffold. The definition of done is in `PLAN.md` under "Definition of Done". If you are starting a session and unsure what state the repo is in, run:
+The clang frontend is functional, emitting `Class`, `Method`, and `Function` symbols with `Calls`, `Inherits`, `Contains`, and `Overrides` edges. The layout uses an incremental force-directed simulation (`LayoutState`) driven frame-by-frame with node dragging/pinning support. The camera module (`viz/src/camera.rs`) handles pan, zoom, and hit-testing.
+
+To verify the project is healthy:
 
 ```bash
-cargo check --workspace && cargo test --workspace && cargo run -p viz -- examples/tiny-cpp/graph.json
+LIBCLANG_PATH=$(brew --prefix llvm)/lib cargo check --workspace && cargo test --workspace && cargo run -p viz -- examples/tiny-cpp/compile_commands.json
 ```
 
-If all three succeed and a window appears, the scaffold is complete and any further work should be explicitly requested, not volunteered.
+All three should succeed and a window should appear showing the indexed graph with animated layout.
 
 ## Handoff Rule
 
-**Stop and ask before adding functionality not specified in `PLAN.md`.** Helpful expansion is actively harmful at this stage. The goal is a tight, working foundation.
+**Stop and ask before adding functionality not listed above or in the Non-Goals section.** Helpful expansion is actively harmful. The goal is a tight, working foundation.

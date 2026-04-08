@@ -1,0 +1,44 @@
+{
+  "version": "2.0.0",
+  "options": {
+    "env": {
+      "LIBCLANG_PATH": "/opt/homebrew/opt/llvm/lib"
+    }
+  },
+  "tasks": [
+    {
+      "label": "cargo build",
+      "type": "cargo",
+      "command": "build",
+      "args": ["--workspace"],
+      "problemMatcher": ["$rustc"],
+      "group": {
+        "kind": "build",
+        "isDefault": true
+      }
+    },
+    {
+      "label": "cargo test",
+      "type": "cargo",
+      "command": "test",
+      "args": ["--workspace"],
+      "problemMatcher": ["$rustc"],
+      "group": "test"
+    },
+    {
+      "label": "cargo clippy",
+      "type": "cargo",
+      "command": "clippy",
+      "args": ["--workspace", "--", "-D", "warnings"],
+      "problemMatcher": ["$rustc"],
+      "group": "test"
+    },
+    {
+      "label": "cargo run (viz)",
+      "type": "cargo",
+      "command": "run",
+      "args": ["-p", "viz", "--", "/Users/nshelton/flatbuffers/compile_commands.json"],
+      "problemMatcher": ["$rustc"]
+    }
+  ]
+}

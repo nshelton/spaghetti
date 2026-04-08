@@ -8,8 +8,8 @@ clang-tests = []
 
 [dependencies]
 core-ir = { workspace = true }
-rayon = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
 thiserror = { workspace = true }
 tracing = { workspace = true }
-serde_json = { workspace = true }
 clang = "2"

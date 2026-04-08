@@ -11,11 +11,11 @@
 //! - Windows: install LLVM prebuilt, set `LIBCLANG_PATH`
 
 use std::path::Path;
+use std::time::Instant;
 
-use core_ir::{
-    Edge, EdgeKind, FileId, Graph, Location, Symbol, SymbolId, SymbolKind,
-};
-use rayon::prelude::*;
+use core_ir::{Edge, EdgeKind, Graph, Location, Symbol, SymbolId, SymbolKind};
+// Note: libclang only allows one `Clang` instance per process, so we index
+// translation units sequentially rather than with rayon.
 use thiserror::Error;
 use tracing::{debug, info, warn};
 
@@ -52,22 +52,41 @@ pub fn index_project(compile_commands: &Path) -> Result<Graph, ClangError> {
     let contents = std::fs::read_to_string(compile_commands)?;
     let commands: Vec<CompileCommand> = serde_json::from_str(&contents)?;
 
-    let base_dir = compile_commands
-        .parent()
-        .unwrap_or_else(|| Path::new("."));
+    // Canonicalize the compile_commands.json path so we can resolve relative
+    // `directory` entries. Per the JSON Compilation Database spec, `directory`
+    // is the working directory of the compile command. In CMake output it is
+    // always absolute; for hand-written files it may be relative to the
+    // project root. We resolve relative to compile_commands.json's parent.
+    let cc_parent = compile_commands.parent().unwrap_or_else(|| Path::new("."));
 
     info!(
         entries = commands.len(),
         "indexing project from compile_commands.json"
     );
 
+    let indexing_start = Instant::now();
+    let mut tu_times: Vec<f64> = Vec::new();
+
     let partial_graphs: Vec<Graph> = commands
-        .par_iter()
+        .iter()
         .filter_map(|cmd| {
-            let file_path = base_dir.join(&cmd.directory).join(&cmd.file);
-            match index_translation_unit(cmd, base_dir) {
+            // Per the spec, `directory` is the working directory for the
+            // compile command. CMake always writes absolute paths. For
+            // relative paths, resolve against the compile_commands.json
+            // parent directory.
+            let dir_path = Path::new(&cmd.directory);
+            let work_dir = if dir_path.is_absolute() {
+                dir_path.to_path_buf()
+            } else {
+                cc_parent.join(dir_path)
+            };
+            let file_path = work_dir.join(&cmd.file);
+            let tu_start = Instant::now();
+            match index_translation_unit(cmd, &work_dir) {
                 Ok(g) => {
-                    debug!(file = %file_path.display(), symbols = g.symbol_count(), "indexed TU");
+                    let tu_elapsed = tu_start.elapsed().as_secs_f64();
+                    tu_times.push(tu_elapsed);
+                    debug!(file = %file_path.display(), symbols = g.symbol_count(), time_ms = tu_elapsed * 1000.0, "indexed TU");
                     Some(g)
                 }
                 Err(e) => {
@@ -78,25 +97,50 @@ pub fn index_project(compile_commands: &Path) -> Result<Graph, ClangError> {
         })
         .collect();
 
+    let indexing_elapsed = indexing_start.elapsed();
+
+    // Log per-TU timing stats
+    if !tu_times.is_empty() {
+        let min = tu_times.iter().copied().fold(f64::INFINITY, f64::min);
+        let max = tu_times.iter().copied().fold(f64::NEG_INFINITY, f64::max);
+        let total: f64 = tu_times.iter().sum();
+        let avg = total / tu_times.len() as f64;
+        info!(
+            tus = tu_times.len(),
+            min_ms = format!("{:.1}", min * 1000.0),
+            max_ms = format!("{:.1}", max * 1000.0),
+            avg_ms = format!("{:.1}", avg * 1000.0),
+            total_ms = format!("{:.1}", total * 1000.0),
+            "per-TU timing stats"
+        );
+    }
+
+    let merge_start = Instant::now();
     let mut graph = Graph::new();
     for g in partial_graphs {
         graph.merge(g);
     }
 
+    // Deduplicate edges (same headers are processed by multiple TUs)
+    dedup_edges(&mut graph);
+    let merge_elapsed = merge_start.elapsed();
+
     info!(
         symbols = graph.symbol_count(),
         edges = graph.edge_count(),
+        indexing_ms = format!("{:.1}", indexing_elapsed.as_secs_f64() * 1000.0),
+        merge_ms = format!("{:.1}", merge_elapsed.as_secs_f64() * 1000.0),
         "indexing complete"
     );
     Ok(graph)
 }
 
 /// Index a single translation unit.
-fn index_translation_unit(cmd: &CompileCommand, base_dir: &Path) -> Result<Graph, ClangError> {
+fn index_translation_unit(cmd: &CompileCommand, work_dir: &Path) -> Result<Graph, ClangError> {
     let clang = clang::Clang::new().map_err(|e| ClangError::Parse(e.to_string()))?;
     let index = clang::Index::new(&clang, false, true);
 
-    let file_path = base_dir.join(&cmd.directory).join(&cmd.file);
+    let file_path = work_dir.join(&cmd.file);
 
     // Extract compiler arguments
     let args = if let Some(arguments) = &cmd.arguments {
@@ -108,7 +152,8 @@ fn index_translation_unit(cmd: &CompileCommand, base_dir: &Path) -> Result<Graph
         vec![]
     };
 
-    // Filter out -o and -c flags and their arguments, keep only -I, -D, -std flags
+    // Filter out flags that conflict with libclang's parser (-o, -c, and the
+    // source file itself). Keep everything else (-I, -D, -std, -W, etc.).
     let mut filtered_args = Vec::new();
     let mut skip_next = false;
     for arg in &args {
@@ -120,15 +165,22 @@ fn index_translation_unit(cmd: &CompileCommand, base_dir: &Path) -> Result<Graph
             skip_next = true;
             continue;
         }
-        if arg.starts_with("-I") || arg.starts_with("-D") || arg.starts_with("-std") {
-            // Resolve -I paths relative to the command directory
-            if arg.starts_with("-I") && !arg.starts_with("-I/") {
-                let include_path = base_dir.join(&cmd.directory).join(&arg[2..]);
-                filtered_args.push(format!("-I{}", include_path.display()));
-            } else {
-                filtered_args.push(arg.clone());
-            }
+        // Skip the source file path (clang parser gets it separately)
+        if arg == &cmd.file || arg.ends_with(".cpp") || arg.ends_with(".c") {
+            continue;
         }
+        // Resolve relative -I paths to absolute
+        if arg.starts_with("-I") && !arg.starts_with("-I/") {
+            let include_path = work_dir.join(&arg[2..]);
+            filtered_args.push(format!("-I{}", include_path.display()));
+        } else {
+            filtered_args.push(arg.clone());
+        }
+    }
+
+    // Add system C++ include paths so libclang can resolve standard headers.
+    for path in system_include_paths() {
+        filtered_args.push(format!("-isystem{}", path));
     }
 
     let tu = index
@@ -138,8 +190,21 @@ fn index_translation_unit(cmd: &CompileCommand, base_dir: &Path) -> Result<Graph
         .map_err(|e| ClangError::Parse(format!("{:?}", e)))?;
 
     let mut graph = Graph::new();
-    visit_cursor(&tu.get_entity(), &mut graph, base_dir);
+    visit_cursor(&tu.get_entity(), &mut graph, work_dir);
     Ok(graph)
+}
+
+/// Returns true if the cursor is located in a file under the project directory.
+fn is_in_project(cursor: &clang::Entity, project_dir: &Path) -> bool {
+    let loc = match cursor.get_location() {
+        Some(l) => l,
+        None => return true, // No location = probably a built-in, allow to proceed
+    };
+    let file_loc = loc.get_file_location();
+    match file_loc.file {
+        Some(f) => f.get_path().starts_with(project_dir),
+        None => true,
+    }
 }
 
 /// Recursively visit AST nodes and populate the graph.
@@ -148,14 +213,11 @@ fn visit_cursor(cursor: &clang::Entity, graph: &mut Graph, base_dir: &Path) {
 
     match cursor.get_kind() {
         EntityKind::ClassDecl | EntityKind::StructDecl => {
-            if cursor.is_definition() {
+            if cursor.is_definition() && is_in_project(cursor, base_dir) {
                 if let Some(name) = cursor.get_name() {
                     let qualified = qualified_name(cursor);
-                    let kind = if cursor.get_kind() == EntityKind::ClassDecl {
-                        SymbolKind::Class
-                    } else {
-                        SymbolKind::Class // Treat structs as classes for now
-                    };
+                    // Treat structs as classes for now (v0 scope)
+                    let kind = SymbolKind::Class;
                     let location = cursor_location(cursor, graph, base_dir);
                     let id = SymbolId::from_parts(&qualified, kind);
 
@@ -211,6 +273,10 @@ fn visit_cursor(cursor: &clang::Entity, graph: &mut Graph, base_dir: &Path) {
         }
 
         EntityKind::Method | EntityKind::FunctionDecl => {
+            if !is_in_project(cursor, base_dir) {
+                // Don't recurse into system headers
+                return;
+            }
             if let Some(name) = cursor.get_name() {
                 let qualified = qualified_name(cursor);
                 let kind = if cursor.get_kind() == EntityKind::Method {
@@ -220,6 +286,9 @@ fn visit_cursor(cursor: &clang::Entity, graph: &mut Graph, base_dir: &Path) {
                 };
                 let location = cursor_location(cursor, graph, base_dir);
                 let id = SymbolId::from_parts(&qualified, kind);
+
+                let is_def = cursor.is_definition();
+                let has_body = !cursor.get_children().is_empty();
 
                 graph.add_symbol(Symbol {
                     id,
@@ -231,8 +300,62 @@ fn visit_cursor(cursor: &clang::Entity, graph: &mut Graph, base_dir: &Path) {
                     attrs: Default::default(),
                 });
 
-                // Check for call expressions within this function/method
-                if cursor.is_definition() {
+                // Emit Contains edge: owning class → this method
+                if cursor.get_kind() == EntityKind::Method {
+                    if let Some(parent) = cursor.get_semantic_parent() {
+                        if matches!(
+                            parent.get_kind(),
+                            EntityKind::ClassDecl | EntityKind::StructDecl
+                        ) {
+                            let parent_qualified = qualified_name(&parent);
+                            let parent_id =
+                                SymbolId::from_parts(&parent_qualified, SymbolKind::Class);
+                            graph.add_edge(Edge {
+                                from: parent_id,
+                                to: id,
+                                kind: EdgeKind::Contains,
+                                location: None,
+                            });
+                        }
+                    }
+
+                    // Emit Overrides edges
+                    if let Some(overridden) = cursor.get_overridden_methods() {
+                        for base_method in &overridden {
+                            if let Some(base_name) = base_method.get_name() {
+                                let base_qualified = qualified_name(base_method);
+                                let base_kind = SymbolKind::Method;
+                                let base_id = SymbolId::from_parts(&base_qualified, base_kind);
+
+                                // Ensure overridden method symbol exists
+                                if !graph.symbols.contains_key(&base_id) {
+                                    let base_loc = cursor_location(base_method, graph, base_dir);
+                                    graph.add_symbol(Symbol {
+                                        id: base_id,
+                                        kind: base_kind,
+                                        name: base_name,
+                                        qualified_name: base_qualified,
+                                        location: base_loc,
+                                        module: None,
+                                        attrs: Default::default(),
+                                    });
+                                }
+
+                                graph.add_edge(Edge {
+                                    from: id,
+                                    to: base_id,
+                                    kind: EdgeKind::Overrides,
+                                    location: None,
+                                });
+                            }
+                        }
+                    }
+                }
+
+                // Check for call expressions within this function/method.
+                // Use has_body as fallback — is_definition() can return false
+                // when there are parse errors (e.g. missing system headers).
+                if is_def || has_body {
                     visit_calls(cursor, id, graph, base_dir);
                 }
             }
@@ -249,12 +372,7 @@ fn visit_cursor(cursor: &clang::Entity, graph: &mut Graph, base_dir: &Path) {
 }
 
 /// Visit call expressions within a function body.
-fn visit_calls(
-    cursor: &clang::Entity,
-    caller_id: SymbolId,
-    graph: &mut Graph,
-    base_dir: &Path,
-) {
+fn visit_calls(cursor: &clang::Entity, caller_id: SymbolId, graph: &mut Graph, base_dir: &Path) {
     use clang::EntityKind;
 
     for child in cursor.get_children() {
@@ -298,6 +416,17 @@ fn visit_calls(
     }
 }
 
+/// Remove duplicate edges from the graph.
+///
+/// Multiple translation units may produce identical edges when they include
+/// the same headers. We deduplicate by (from, to, kind).
+fn dedup_edges(graph: &mut Graph) {
+    let mut seen = std::collections::HashSet::new();
+    graph
+        .edges
+        .retain(|e| seen.insert((e.from, e.to, std::mem::discriminant(&e.kind))));
+}
+
 /// Build a qualified name from a cursor's semantic parent chain.
 fn qualified_name(cursor: &clang::Entity) -> String {
     let mut parts = Vec::new();
@@ -325,11 +454,7 @@ fn qualified_name(cursor: &clang::Entity) -> String {
 }
 
 /// Extract a source location from a cursor.
-fn cursor_location(
-    cursor: &clang::Entity,
-    graph: &mut Graph,
-    base_dir: &Path,
-) -> Option<Location> {
+fn cursor_location(cursor: &clang::Entity, graph: &mut Graph, base_dir: &Path) -> Option<Location> {
     let loc = cursor.get_location()?;
     let file_loc = loc.get_file_location();
 
@@ -347,35 +472,95 @@ fn cursor_location(
     })
 }
 
-#[cfg(test)]
-#[cfg(feature = "clang-tests")]
-mod tests {
-    use super::*;
+/// Discover system C++ include paths by querying the compiler.
+///
+/// Runs `clang++ -E -x c++ -v /dev/null` and parses the `#include <...>`
+/// search list from stderr. Falls back to well-known paths if the command
+/// fails.
+fn system_include_paths() -> Vec<String> {
+    use std::sync::OnceLock;
+    static PATHS: OnceLock<Vec<String>> = OnceLock::new();
+    PATHS
+        .get_or_init(|| {
+            // Try LIBCLANG_PATH-relative paths first, then fall back to
+            // querying the system compiler.
+            if let Ok(libclang_path) = std::env::var("LIBCLANG_PATH") {
+                let llvm_root = std::path::Path::new(&libclang_path)
+                    .parent()
+                    .unwrap_or(std::path::Path::new("."));
+                let candidates = [
+                    llvm_root.join("include/c++/v1"),
+                    llvm_root
+                        .join("lib/clang")
+                        .join(
+                            // Find the clang version directory
+                            std::fs::read_dir(llvm_root.join("lib/clang"))
+                                .ok()
+                                .and_then(|mut d| d.next())
+                                .and_then(|e| e.ok())
+                                .map(|e| e.file_name().to_string_lossy().into_owned())
+                                .unwrap_or_default(),
+                        )
+                        .join("include"),
+                ];
+                let mut paths: Vec<String> = candidates
+                    .iter()
+                    .filter(|p| p.is_dir())
+                    .map(|p| p.to_string_lossy().into_owned())
+                    .collect();
+                if !paths.is_empty() {
+                    info!(
+                        count = paths.len(),
+                        "discovered system includes from LIBCLANG_PATH"
+                    );
+                    // Also add SDK includes on macOS
+                    if let Ok(output) = std::process::Command::new("xcrun")
+                        .args(["--show-sdk-path"])
+                        .output()
+                    {
+                        let sdk = String::from_utf8_lossy(&output.stdout).trim().to_string();
+                        let usr_include = format!("{sdk}/usr/include");
+                        if std::path::Path::new(&usr_include).is_dir() {
+                            paths.push(usr_include);
+                        }
+                    }
+                    return paths;
+                }
+            }
 
-    #[test]
-    fn test_index_tiny_cpp() {
-        let compile_commands = Path::new(env!("CARGO_MANIFEST_DIR"))
-            .join("../../examples/tiny-cpp/compile_commands.json");
+            // Fall back: ask the system clang for its search paths
+            let output = std::process::Command::new("clang++")
+                .args(["-E", "-x", "c++", "-v", "/dev/null"])
+                .output();
 
-        let graph = index_project(&compile_commands).expect("indexing failed");
+            let stderr = match output {
+                Ok(o) => String::from_utf8_lossy(&o.stderr).into_owned(),
+                Err(_) => return vec![],
+            };
 
-        // Should have at least Shape, Circle, Square classes
-        assert!(
-            graph.symbol_count() >= 3,
-            "expected at least 3 symbols, got {}",
-            graph.symbol_count()
-        );
-
-        // Should have inheritance edges
-        let inherits_count = graph
-            .edges
-            .iter()
-            .filter(|e| e.kind == EdgeKind::Inherits)
-            .count();
-        assert!(
-            inherits_count >= 2,
-            "expected at least 2 inheritance edges, got {}",
-            inherits_count
-        );
-    }
+            let mut paths = Vec::new();
+            let mut in_search_list = false;
+            for line in stderr.lines() {
+                if line.contains("#include <...> search starts here:") {
+                    in_search_list = true;
+                    continue;
+                }
+                if line.contains("End of search list") {
+                    break;
+                }
+                if in_search_list {
+                    let path = line.trim();
+                    // Skip framework directories
+                    if !path.contains("(framework directory)") && !path.is_empty() {
+                        paths.push(path.to_string());
+                    }
+                }
+            }
+            info!(
+                count = paths.len(),
+                "discovered system includes from clang++"
+            );
+            paths
+        })
+        .clone()
 }

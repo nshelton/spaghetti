@@ -1,0 +1,19 @@
+{
+  "seed": 42,
+  "iterations": 100,
+  "graph": {
+    "symbols": [
+      { "name": "A", "kind": "Class" },
+      { "name": "B", "kind": "Class" },
+      { "name": "C", "kind": "Class" }
+    ],
+    "edges": [
+      { "from": "A", "to": "B", "kind": "Inherits" }
+    ]
+  },
+  "expected_positions": {
+    "5208314085342315798": [1126747475, 1081875024],
+    "15936484975747101909": [0, 0],
+    "6956613391019514499": [1132881578, 0]
+  }
+}
