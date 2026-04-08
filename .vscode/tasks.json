@@ -1,5 +1,10 @@
 {
   "version": "2.0.0",
+  "options": {
+    "env": {
+      "LIBCLANG_PATH": "/opt/homebrew/opt/llvm/lib"
+    }
+  },
   "tasks": [
     {
       "label": "cargo build",
@@ -32,7 +37,7 @@
       "label": "cargo run (viz)",
       "type": "cargo",
       "command": "run",
-      "args": ["-p", "viz", "--", "examples/tiny-cpp/graph.json"],
+      "args": ["-p", "viz", "--", "examples/tiny-cpp/compile_commands.json"],
       "problemMatcher": ["$rustc"]
     }
   ]
