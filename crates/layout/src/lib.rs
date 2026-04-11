@@ -69,6 +69,10 @@ pub struct ForceParams {
     /// parent-directory attraction is half of same-directory attraction.
     #[serde(default = "default_location_falloff")]
     pub location_falloff: f32,
+    /// Strength of the containment force that pulls children of an expanded
+    /// container toward their siblings' centroid. `0.0` disables.
+    #[serde(default = "default_containment_strength")]
+    pub containment_strength: f32,
 }
 
 fn default_location_strength() -> f32 {
@@ -77,6 +81,10 @@ fn default_location_strength() -> f32 {
 
 fn default_location_falloff() -> f32 {
     0.5
+}
+
+fn default_containment_strength() -> f32 {
+    0.02
 }
 
 impl Default for ForceParams {
@@ -158,6 +166,7 @@ impl Default for ForceParams {
             edge_params,
             location_strength: default_location_strength(),
             location_falloff: default_location_falloff(),
+            containment_strength: default_containment_strength(),
         }
     }
 }
@@ -190,6 +199,18 @@ pub struct LayoutState {
     dir_groups: Vec<Vec<Vec<usize>>>,
     /// Maximum directory depth across all nodes (cached for force scaling).
     max_dir_depth: usize,
+    /// Maps each node index to its parent container index (via Contains edges).
+    parent_of: Vec<Option<usize>>,
+    /// Maps each container node index to its children indices.
+    children_of: Vec<Vec<usize>>,
+    /// Set of node indices that are containers (have >=1 Contains-child).
+    containers: HashSet<usize>,
+    /// Which containers are currently expanded (children visible).
+    expanded: HashSet<usize>,
+    /// Nodes hidden by collapse (tracked separately from file-tree hidden).
+    collapse_hidden: HashSet<usize>,
+    /// Nodes hidden by external callers (file-tree visibility).
+    external_hidden: HashSet<usize>,
 }
 
 impl LayoutState {
@@ -250,6 +271,30 @@ impl LayoutState {
         let dir_groups = build_dir_groups(graph, &ids, &id_to_idx);
         let max_dir_depth = dir_groups.len().saturating_sub(1);
 
+        // Build containment hierarchy from Contains edges.
+        let mut parent_of = vec![None; n];
+        let mut children_of = vec![Vec::new(); n];
+        let mut containers = HashSet::new();
+        for &(from, to, kind) in &edge_pairs {
+            if kind == EdgeKind::Contains {
+                parent_of[to] = Some(from);
+                children_of[from].push(to);
+                containers.insert(from);
+            }
+        }
+
+        // Default: all containers collapsed. Hide their children.
+        let expanded = HashSet::new();
+        let mut collapse_hidden = HashSet::new();
+        for &c in &containers {
+            for &child in &children_of[c] {
+                collapse_hidden.insert(child);
+            }
+        }
+
+        // Combine collapse-hidden into the main hidden set.
+        let hidden = collapse_hidden.clone();
+
         Self {
             ids,
             positions,
@@ -261,9 +306,15 @@ impl LayoutState {
             params,
             degrees,
             total_steps: 0,
-            hidden: HashSet::new(),
+            hidden,
             dir_groups,
             max_dir_depth,
+            parent_of,
+            children_of,
+            containers,
+            expanded,
+            collapse_hidden,
+            external_hidden: HashSet::new(),
         }
     }
 
@@ -405,6 +456,40 @@ impl LayoutState {
                 // Scale by 1/sqrt(degree) at each endpoint so hubs stay calm.
                 forces[from] += dir * displacement / self.degrees[from].sqrt();
                 forces[to] -= dir * displacement / self.degrees[to].sqrt();
+            }
+
+            // Containment force: for expanded containers, pull children
+            // toward their siblings' centroid so they stay clustered.
+            if p.containment_strength > 0.0 {
+                for &c in &self.containers {
+                    if !self.expanded.contains(&c) {
+                        continue;
+                    }
+                    let children = &self.children_of[c];
+                    if children.len() < 2 {
+                        continue;
+                    }
+                    // Compute centroid of visible children.
+                    let mut centroid = Vec2::ZERO;
+                    let mut count = 0u32;
+                    for &child in children {
+                        if !self.hidden.contains(&child) {
+                            centroid += self.positions[child];
+                            count += 1;
+                        }
+                    }
+                    if count < 2 {
+                        continue;
+                    }
+                    centroid /= count as f32;
+
+                    for &child in children {
+                        if !self.hidden.contains(&child) {
+                            forces[child] +=
+                                (centroid - self.positions[child]) * p.containment_strength;
+                        }
+                    }
+                }
             }
 
             // Location-affinity force: pull nodes toward their directory
@@ -604,19 +689,145 @@ impl LayoutState {
         let _ = n;
     }
 
-    /// Set which symbols are hidden from the simulation.
+    /// Set which symbols are hidden from the simulation (by external callers,
+    /// e.g. file-tree visibility toggles).
     ///
     /// Hidden nodes are excluded from all force computations (repulsion,
     /// attraction, gravity, location affinity) and their positions/velocities
     /// are not updated. They still occupy their slot so indices remain stable.
+    ///
+    /// This merges with collapse-hidden state — nodes hidden by either
+    /// mechanism are excluded.
     pub fn set_hidden(&mut self, ids: &[SymbolId]) {
-        self.hidden.clear();
+        self.external_hidden.clear();
         for id in ids {
             if let Some(&idx) = self.id_to_idx.get(id) {
-                self.hidden.insert(idx);
+                self.external_hidden.insert(idx);
             }
         }
+        self.rebuild_hidden();
         self.reheat();
+    }
+
+    /// Rebuild the effective hidden set from collapse + external sources.
+    fn rebuild_hidden(&mut self) {
+        self.hidden = &self.collapse_hidden | &self.external_hidden;
+    }
+
+    /// Collapse a container node: hide all its children.
+    ///
+    /// Children's positions are moved to the parent's position so they
+    /// animate outward on subsequent expand.
+    pub fn collapse(&mut self, id: SymbolId) {
+        let Some(&idx) = self.id_to_idx.get(&id) else {
+            return;
+        };
+        if !self.containers.contains(&idx) {
+            return;
+        }
+        self.expanded.remove(&idx);
+        let parent_pos = self.positions[idx];
+        for &child in &self.children_of[idx] {
+            self.collapse_hidden.insert(child);
+            self.positions[child] = parent_pos;
+            self.velocities[child] = Vec2::ZERO;
+        }
+        self.rebuild_hidden();
+        self.reheat();
+    }
+
+    /// Expand a container node: show all its children.
+    ///
+    /// Children are scattered in a small radius around the parent so they
+    /// animate into place.
+    pub fn expand(&mut self, id: SymbolId) {
+        let Some(&idx) = self.id_to_idx.get(&id) else {
+            return;
+        };
+        if !self.containers.contains(&idx) {
+            return;
+        }
+        self.expanded.insert(idx);
+        let parent_pos = self.positions[idx];
+        let children = self.children_of[idx].clone();
+        for (i, &child) in children.iter().enumerate() {
+            self.collapse_hidden.remove(&child);
+            // Scatter children in a circle around the parent.
+            let angle = (i as f32) * std::f32::consts::TAU / children.len().max(1) as f32;
+            let offset = Vec2::new(angle.cos(), angle.sin()) * 50.0;
+            self.positions[child] = parent_pos + offset;
+            self.velocities[child] = Vec2::ZERO;
+        }
+        self.rebuild_hidden();
+        self.reheat();
+    }
+
+    /// Toggle a container between collapsed and expanded.
+    pub fn toggle_expand(&mut self, id: SymbolId) {
+        let Some(&idx) = self.id_to_idx.get(&id) else {
+            return;
+        };
+        if self.expanded.contains(&idx) {
+            self.collapse(id);
+        } else {
+            self.expand(id);
+        }
+    }
+
+    /// Check whether a container is currently expanded.
+    pub fn is_expanded(&self, id: SymbolId) -> bool {
+        let Some(&idx) = self.id_to_idx.get(&id) else {
+            return false;
+        };
+        self.expanded.contains(&idx)
+    }
+
+    /// Check whether a symbol is a container (has children via Contains edges).
+    pub fn is_container(&self, id: SymbolId) -> bool {
+        let Some(&idx) = self.id_to_idx.get(&id) else {
+            return false;
+        };
+        self.containers.contains(&idx)
+    }
+
+    /// Return the children of a container node.
+    pub fn children_of(&self, id: SymbolId) -> Vec<SymbolId> {
+        let Some(&idx) = self.id_to_idx.get(&id) else {
+            return Vec::new();
+        };
+        self.children_of[idx].iter().map(|&i| self.ids[i]).collect()
+    }
+
+    /// Return the parent container of a node, if any.
+    pub fn parent_of(&self, id: SymbolId) -> Option<SymbolId> {
+        let &idx = self.id_to_idx.get(&id)?;
+        self.parent_of[idx].map(|p| self.ids[p])
+    }
+
+    /// Collapse all container nodes.
+    pub fn collapse_all(&mut self) {
+        let container_ids: Vec<SymbolId> =
+            self.containers.iter().map(|&idx| self.ids[idx]).collect();
+        for id in container_ids {
+            self.collapse(id);
+        }
+    }
+
+    /// Expand all container nodes.
+    pub fn expand_all(&mut self) {
+        let container_ids: Vec<SymbolId> =
+            self.containers.iter().map(|&idx| self.ids[idx]).collect();
+        for id in container_ids {
+            self.expand(id);
+        }
+    }
+
+    /// Return all symbol IDs that are currently hidden due to collapsed containers.
+    pub fn collapsed_hidden_ids(&self) -> Vec<SymbolId> {
+        self.collapse_hidden
+            .iter()
+            .map(|&idx| self.ids[idx])
+            .collect()
     }
 }
 

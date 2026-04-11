@@ -13,7 +13,7 @@ use tracing::Level;
 
 use crate::file_tree::FileTree;
 
-use crate::camera::{self, Camera2D};
+use crate::camera::Camera2D;
 use crate::fps::FpsCounter;
 use crate::log_capture::LogBuffer;
 use crate::progress::{ProgressMessage, ProgressState};
@@ -146,6 +146,11 @@ pub struct SpaghettiApp {
 
     // -- FPS counter --
     pub(crate) fps: FpsCounter,
+
+    // -- Compound node state --
+    /// Screen-space rects of expanded containers (computed each frame for
+    /// hit-testing). Pairs of (container SymbolId, screen Rect).
+    pub(crate) container_rects: Vec<(SymbolId, egui::Rect)>,
 }
 
 impl SpaghettiApp {
@@ -195,7 +200,18 @@ impl SpaghettiApp {
             cancel_tx: None,
             pending_file_dialog: None,
             fps: FpsCounter::new(60),
+            container_rects: Vec::new(),
         }
+    }
+
+    /// Recompute the effective hidden-symbols set by merging file-tree
+    /// visibility with layout collapse state.
+    pub(crate) fn sync_hidden_symbols(&mut self) {
+        let file_hidden = self.file_tree.hidden_symbols();
+        let collapse_hidden = self.layout_state.collapsed_hidden_ids();
+        self.hidden_symbols = &file_hidden | &collapse_hidden.into_iter().collect();
+        let hidden_vec: Vec<_> = file_hidden.into_iter().collect();
+        self.layout_state.set_hidden(&hidden_vec);
     }
 
     /// Snapshot the current view state for serialization.
@@ -365,17 +381,16 @@ impl SpaghettiApp {
                     layout_state,
                 } => {
                     self.file_tree = FileTree::from_graph(&graph);
-                    self.hidden_symbols = self.file_tree.hidden_symbols();
                     self.graph = *graph;
                     self.layout_state = *layout_state;
-                    let hidden_vec: Vec<_> = self.hidden_symbols.iter().copied().collect();
-                    self.layout_state.set_hidden(&hidden_vec);
+                    self.sync_hidden_symbols();
                     self.positions = self.layout_state.positions();
                     self.selection = None;
                     self.camera = Camera2D::default();
                     self.dragging = None;
                     self.auto_fitted = false;
                     self.frame_count = 0;
+                    self.container_rects.clear();
                     self.finish_indexing();
                 }
                 ProgressMessage::Failed(ref err) => {
@@ -397,26 +412,6 @@ impl SpaghettiApp {
         self.progress_state = None;
         self.progress_rx = None;
         self.cancel_tx = None;
-    }
-
-    /// Hit-test: find which symbol (if any) is under the pointer.
-    pub(crate) fn hit_test(
-        &self,
-        pointer: Option<egui::Pos2>,
-        canvas_center: egui::Pos2,
-    ) -> Option<SymbolId> {
-        let radius = if self.render.circle_mode {
-            Some(self.render.circle_radius)
-        } else {
-            None
-        };
-        camera::hit_test(
-            &self.camera,
-            &self.positions,
-            pointer,
-            canvas_center,
-            radius,
-        )
     }
 
     /// Draw the progress overlay (modal).

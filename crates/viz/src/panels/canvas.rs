@@ -1,11 +1,20 @@
 //! Central canvas panel: node and edge rendering, pan/zoom, dragging, selection.
 
+use std::collections::{HashMap, HashSet};
+
 use egui::{Color32, Rect, Stroke, StrokeKind, Vec2};
 use glam::Vec2 as GVec2;
+
+use core_ir::SymbolId;
 
 use crate::app::{SpaghettiApp, ENERGY_THRESHOLD};
 use crate::camera::{NODE_HEIGHT, NODE_WIDTH};
 use crate::fps::paint_fps_overlay;
+
+/// Scale factor for collapsed container nodes (slightly larger than normal).
+const COLLAPSED_CONTAINER_SCALE: f32 = 1.3;
+/// World-space padding around children for expanded container backgrounds.
+const CONTAINER_PADDING: f32 = 30.0;
 
 impl SpaghettiApp {
     /// Draw the central canvas: nodes and edges with interactive dragging.
@@ -27,7 +36,9 @@ impl SpaghettiApp {
 
             // Drag started: determine whether we are dragging a node or panning.
             if response.drag_started_by(egui::PointerButton::Primary) {
-                if let Some(hit) = self.hit_test(response.interact_pointer_pos(), canvas_center) {
+                if let Some(hit) =
+                    self.hit_test_compound(response.interact_pointer_pos(), canvas_center)
+                {
                     // Begin dragging a node.
                     self.dragging = Some(hit);
                     self.selection = Some(hit);
@@ -63,7 +74,19 @@ impl SpaghettiApp {
             // Handle click (select) — only when not dragging.
             if response.clicked() {
                 if let Some(pointer) = response.interact_pointer_pos() {
-                    self.selection = self.hit_test(Some(pointer), canvas_center);
+                    self.selection = self.hit_test_compound(Some(pointer), canvas_center);
+                }
+            }
+
+            // Handle double-click: toggle expand/collapse on container nodes.
+            if response.double_clicked() {
+                if let Some(pointer) = response.interact_pointer_pos() {
+                    if let Some(hit) = self.hit_test_compound(Some(pointer), canvas_center) {
+                        if self.layout_state.is_container(hit) {
+                            self.layout_state.toggle_expand(hit);
+                            self.sync_hidden_symbols();
+                        }
+                    }
                 }
             }
 
@@ -114,18 +137,130 @@ impl SpaghettiApp {
             let draw_labels = !circle_mode && self.camera.zoom >= 0.4;
             let draw_rects = !circle_mode && self.camera.zoom >= 0.15;
 
-            // Draw edges (skip if both endpoints are outside the viewport)
+            // --- Build edge rerouting map for collapsed containers ---
+            let reroute = self.build_edge_reroute_map();
+
+            // --- 1. Draw expanded container backgrounds ---
+            // Store container screen rects for hit-testing.
+            self.container_rects.clear();
+            for (id, sym) in &self.graph.symbols {
+                if !self.layout_state.is_container(*id) || !self.layout_state.is_expanded(*id) {
+                    continue;
+                }
+                if self.hidden_symbols.contains(id) {
+                    continue;
+                }
+                let children = self.layout_state.children_of(*id);
+                if children.is_empty() {
+                    continue;
+                }
+
+                // Compute world-space bounding box of visible children.
+                let mut min_w = GVec2::splat(f32::INFINITY);
+                let mut max_w = GVec2::splat(f32::NEG_INFINITY);
+                let mut has_visible = false;
+                for &child_id in &children {
+                    if self.hidden_symbols.contains(&child_id) {
+                        continue;
+                    }
+                    if let Some(&pos) = self.positions.0.get(&child_id) {
+                        min_w = min_w.min(pos - GVec2::new(NODE_WIDTH / 2.0, NODE_HEIGHT / 2.0));
+                        max_w = max_w.max(pos + GVec2::new(NODE_WIDTH / 2.0, NODE_HEIGHT / 2.0));
+                        has_visible = true;
+                    }
+                }
+                if !has_visible {
+                    continue;
+                }
+
+                // Also include the container node itself in the bounds.
+                if let Some(&parent_pos) = self.positions.0.get(id) {
+                    min_w = min_w.min(parent_pos - GVec2::new(NODE_WIDTH / 2.0, NODE_HEIGHT / 2.0));
+                    max_w = max_w.max(parent_pos + GVec2::new(NODE_WIDTH / 2.0, NODE_HEIGHT / 2.0));
+                }
+
+                // Add padding and leave space for the title at the top.
+                let title_height = 20.0; // world units for the title bar
+                min_w -= GVec2::new(CONTAINER_PADDING, CONTAINER_PADDING + title_height);
+                max_w += GVec2::new(CONTAINER_PADDING, CONTAINER_PADDING);
+
+                // Viewport culling for the container.
+                if max_w.x < vis_min.x
+                    || min_w.x > vis_max.x
+                    || max_w.y < vis_min.y
+                    || min_w.y > vis_max.y
+                {
+                    continue;
+                }
+
+                let screen_min = self.camera.world_to_screen(min_w, canvas_center);
+                let screen_max = self.camera.world_to_screen(max_w, canvas_center);
+                let container_rect = Rect::from_min_max(screen_min, screen_max);
+
+                // Store for hit-testing.
+                self.container_rects.push((*id, container_rect));
+
+                // Draw background.
+                let base_color = self.render.node_color(sym.kind);
+                let bg = with_alpha(base_color, 0.15);
+                painter.rect_filled(container_rect, 8.0, bg);
+                painter.rect_stroke(
+                    container_rect,
+                    8.0,
+                    Stroke::new(1.0, with_alpha(base_color, 0.4)),
+                    StrokeKind::Outside,
+                );
+
+                // Draw container title at the top-left.
+                if draw_labels {
+                    let title_pos =
+                        egui::Pos2::new(container_rect.left() + 6.0, container_rect.top() + 2.0);
+                    let font = egui::FontId::proportional(13.0 * self.camera.zoom);
+                    painter.text(
+                        title_pos,
+                        egui::Align2::LEFT_TOP,
+                        &sym.name,
+                        font,
+                        with_alpha(Color32::WHITE, 0.8),
+                    );
+                }
+            }
+
+            // --- 2. Draw edges (with rerouting for collapsed containers) ---
+            let mut drawn_aggregated: HashSet<(SymbolId, SymbolId, u8)> = HashSet::new();
+
             for edge in &self.graph.edges {
                 if !active_kinds.contains(&edge.kind) {
                     continue;
                 }
-                if self.hidden_symbols.contains(&edge.from)
-                    || self.hidden_symbols.contains(&edge.to)
-                {
+
+                // Reroute endpoints through collapsed containers.
+                let from_id = reroute.get(&edge.from).copied().unwrap_or(edge.from);
+                let to_id = reroute.get(&edge.to).copied().unwrap_or(edge.to);
+
+                // Skip internal edges (both endpoints reroute to same container).
+                if from_id == to_id {
                     continue;
                 }
-                let from_pos = self.positions.0.get(&edge.from);
-                let to_pos = self.positions.0.get(&edge.to);
+
+                // Skip if either effective endpoint is hidden.
+                if self.hidden_symbols.contains(&from_id) || self.hidden_symbols.contains(&to_id) {
+                    continue;
+                }
+
+                // Dedup aggregated edges: if this is a rerouted edge, only draw
+                // one line per (from_container, to_container, kind) triple.
+                let is_rerouted =
+                    reroute.contains_key(&edge.from) || reroute.contains_key(&edge.to);
+                if is_rerouted {
+                    let kind_disc = edge.kind as u8;
+                    if !drawn_aggregated.insert((from_id, to_id, kind_disc)) {
+                        continue;
+                    }
+                }
+
+                let from_pos = self.positions.0.get(&from_id);
+                let to_pos = self.positions.0.get(&to_id);
                 if let (Some(&from), Some(&to)) = (from_pos, to_pos) {
                     // Cull: skip edge if both endpoints are outside the viewport.
                     let from_visible = from.x >= vis_min.x
@@ -145,15 +280,18 @@ impl SpaghettiApp {
 
                     let color =
                         with_alpha(self.render.edge_color(edge.kind), self.render.edge_opacity);
-                    painter.line_segment([screen_from, screen_to], Stroke::new(1.5, color));
+                    let thickness = if is_rerouted { 2.5 } else { 1.5 };
+                    painter.line_segment([screen_from, screen_to], Stroke::new(thickness, color));
                 }
             }
 
-            // Draw nodes
+            // --- 3. Draw nodes ---
             let node_size = Vec2::new(
                 NODE_WIDTH * self.camera.zoom,
                 NODE_HEIGHT * self.camera.zoom,
             );
+            let container_node_size = node_size * COLLAPSED_CONTAINER_SCALE;
+
             for (id, sym) in &self.graph.symbols {
                 if self.hidden_symbols.contains(id) {
                     continue;
@@ -172,8 +310,16 @@ impl SpaghettiApp {
                     let base =
                         with_alpha(self.render.node_color(sym.kind), self.render.node_opacity);
 
+                    let is_container = self.layout_state.is_container(*id);
+                    let is_collapsed = is_container && !self.layout_state.is_expanded(*id);
+
                     if draw_rects {
-                        let rect = Rect::from_center_size(screen_pos, node_size);
+                        let size = if is_collapsed {
+                            container_node_size
+                        } else {
+                            node_size
+                        };
+                        let rect = Rect::from_center_size(screen_pos, size);
 
                         let bg = if self.selection == Some(*id) {
                             brighten(base, 2.0)
@@ -181,20 +327,29 @@ impl SpaghettiApp {
                             base
                         };
                         painter.rect_filled(rect, 4.0, bg);
+
+                        // Collapsed containers get a thicker border.
+                        let border_width = if is_collapsed { 2.0 } else { 1.0 };
                         painter.rect_stroke(
                             rect,
                             4.0,
-                            Stroke::new(1.0, Color32::from_gray(60)),
+                            Stroke::new(border_width, Color32::from_gray(60)),
                             StrokeKind::Outside,
                         );
 
                         // Label (only when zoomed in enough)
                         if draw_labels {
                             let font = egui::FontId::proportional(12.0 * self.camera.zoom);
+                            let label = if is_collapsed {
+                                let n = self.layout_state.children_of(*id).len();
+                                format!("{} (+{})", sym.name, n)
+                            } else {
+                                sym.name.clone()
+                            };
                             painter.text(
                                 screen_pos,
                                 egui::Align2::CENTER_CENTER,
-                                &sym.name,
+                                &label,
                                 font,
                                 Color32::WHITE,
                             );
@@ -207,7 +362,12 @@ impl SpaghettiApp {
                             base
                         };
                         let r = if circle_mode {
-                            circle_radius * self.camera.zoom
+                            let base_r = circle_radius * self.camera.zoom;
+                            if is_collapsed {
+                                base_r * COLLAPSED_CONTAINER_SCALE
+                            } else {
+                                base_r
+                            }
                         } else {
                             2.0
                         };
@@ -220,6 +380,59 @@ impl SpaghettiApp {
             self.fps.tick();
             paint_fps_overlay(ui, response.rect, self.fps.fps());
         });
+    }
+
+    /// Build a map from child symbol ID -> collapsed parent symbol ID
+    /// for edge rerouting.
+    fn build_edge_reroute_map(&self) -> HashMap<SymbolId, SymbolId> {
+        let mut reroute = HashMap::new();
+        for (id, _sym) in &self.graph.symbols {
+            if self.layout_state.is_container(*id) && !self.layout_state.is_expanded(*id) {
+                for child_id in self.layout_state.children_of(*id) {
+                    reroute.insert(child_id, *id);
+                }
+            }
+        }
+        reroute
+    }
+
+    /// Hit-test that accounts for expanded container backgrounds.
+    ///
+    /// Checks children first (they're on top), then regular nodes,
+    /// then expanded container backgrounds.
+    fn hit_test_compound(
+        &self,
+        pointer: Option<egui::Pos2>,
+        canvas_center: egui::Pos2,
+    ) -> Option<SymbolId> {
+        // First try the normal node hit-test (children and regular nodes).
+        let radius = if self.render.circle_mode {
+            Some(self.render.circle_radius)
+        } else {
+            None
+        };
+        if let Some(hit) = crate::camera::hit_test(
+            &self.camera,
+            &self.positions,
+            pointer,
+            canvas_center,
+            radius,
+        ) {
+            // Only return if the node is visible (not hidden by collapse/file-tree).
+            if !self.hidden_symbols.contains(&hit) {
+                return Some(hit);
+            }
+        }
+
+        // Then check expanded container background rects.
+        let pointer = pointer?;
+        for &(id, rect) in self.container_rects.iter().rev() {
+            if rect.contains(pointer) {
+                return Some(id);
+            }
+        }
+
+        None
     }
 }
 
