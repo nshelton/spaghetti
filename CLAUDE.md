@@ -122,12 +122,10 @@ This list exists because scope creep kills this kind of project. If you find you
 - Uninstantiated template modeling
 - SFINAE / concept overload visualization
 
-The core-ir enums may contain more variants than the frontend currently emits — that is intentional, to avoid churning the IR later.
-
 ## Current Status
 
 ### Clang Frontend
-The clang frontend emits `Class`, `Method`, `Function`, and `Field` symbols with `Calls`, `Inherits`, `Contains`, `Overrides`, `ReadsField`, and `WritesField` edges. A per-TU disk cache (`.spaghetti-cache/`, seahash-keyed) skips re-parsing unchanged translation units.
+The clang frontend emits all `SymbolKind` variants defined in `core-ir`: `Class`, `Struct`, `Function`, `Method`, `Field`, `Namespace`, `TemplateInstantiation`, and `TranslationUnit`. It also emits all `EdgeKind` variants: `Calls`, `Inherits`, `Contains`, `Overrides`, `ReadsField`, `WritesField`, `Includes`, `Instantiates`, and `HasType`. A per-TU disk cache (`.spaghetti-cache/`, seahash-keyed) skips re-parsing unchanged translation units.
 
 ### Layout
 The layout uses an incremental force-directed simulation (`LayoutState`) driven frame-by-frame with budgeted stepping (respects a per-frame time budget). Supports node dragging/pinning, per-edge-kind tunable `ForceParams`, location-affinity forces (nodes in the same directory attract), and grid-based spatial bucketing for repulsion optimization on large graphs. Rayon parallelism kicks in at 500+ nodes.

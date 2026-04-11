@@ -1,7 +1,8 @@
 //! `frontend-clang` — libclang-based C++ indexer that produces a [`core_ir::Graph`].
 //!
 //! Entry point: [`index_project`]. Reads a `compile_commands.json` and drives
-//! libclang to extract classes, methods, and their relationships.
+//! libclang to extract classes, structs, methods, fields, namespaces, template
+//! instantiations, and their relationships.
 //!
 //! # Dependencies
 //!
@@ -232,8 +233,7 @@ fn visit_cursor(cursor: &clang::Entity, graph: &mut Graph, base_dir: &Path) {
             if cursor.is_definition() && is_in_project(cursor, base_dir) {
                 if let Some(name) = cursor.get_name() {
                     let qualified = qualified_name(cursor);
-                    // Treat structs as classes for now (v0 scope)
-                    let kind = SymbolKind::Class;
+                    let kind = class_or_struct_kind(cursor);
                     let location = cursor_location(cursor, graph, base_dir);
                     let id = SymbolId::from_parts(&qualified, kind);
 
@@ -254,7 +254,7 @@ fn visit_cursor(cursor: &clang::Entity, graph: &mut Graph, base_dir: &Path) {
                                 if let Some(base_decl) = base_type.get_declaration() {
                                     if let Some(base_name) = base_decl.get_name() {
                                         let base_qualified = qualified_name(&base_decl);
-                                        let base_kind = SymbolKind::Class;
+                                        let base_kind = class_or_struct_kind(&base_decl);
                                         let base_id =
                                             SymbolId::from_parts(&base_qualified, base_kind);
 
@@ -284,11 +284,75 @@ fn visit_cursor(cursor: &clang::Entity, graph: &mut Graph, base_dir: &Path) {
                             }
                         }
                     }
+
+                    // Emit Contains edge: namespace → this class/struct
+                    if let Some(parent) = cursor.get_semantic_parent() {
+                        if parent.get_kind() == EntityKind::Namespace && parent.get_name().is_some()
+                        {
+                            let parent_qualified = qualified_name(&parent);
+                            let parent_id =
+                                SymbolId::from_parts(&parent_qualified, SymbolKind::Namespace);
+                            graph.add_edge(Edge {
+                                from: parent_id,
+                                to: id,
+                                kind: EdgeKind::Contains,
+                                location: None,
+                            });
+                        }
+                    }
                 }
             }
         }
 
-        EntityKind::Method | EntityKind::FunctionDecl => {
+        EntityKind::Namespace => {
+            if is_in_project(cursor, base_dir) {
+                if let Some(name) = cursor.get_name() {
+                    // Skip anonymous namespaces
+                    if !name.is_empty() {
+                        let qualified = qualified_name(cursor);
+                        let kind = SymbolKind::Namespace;
+                        let location = cursor_location(cursor, graph, base_dir);
+                        let id = SymbolId::from_parts(&qualified, kind);
+
+                        graph.add_symbol(Symbol {
+                            id,
+                            kind,
+                            name,
+                            qualified_name: qualified,
+                            location,
+                            module: None,
+                            attrs: Default::default(),
+                        });
+                    }
+                }
+            }
+        }
+
+        EntityKind::ClassTemplate => {
+            // Class templates are handled similarly to ClassDecl. We emit
+            // the template itself as a Class; explicit specializations
+            // are handled via ClassTemplatePartialSpecialization below.
+            if cursor.is_definition() && is_in_project(cursor, base_dir) {
+                if let Some(name) = cursor.get_name() {
+                    let qualified = qualified_name(cursor);
+                    let kind = SymbolKind::Class;
+                    let location = cursor_location(cursor, graph, base_dir);
+                    let id = SymbolId::from_parts(&qualified, kind);
+
+                    graph.add_symbol(Symbol {
+                        id,
+                        kind,
+                        name,
+                        qualified_name: qualified,
+                        location,
+                        module: None,
+                        attrs: Default::default(),
+                    });
+                }
+            }
+        }
+
+        EntityKind::Method | EntityKind::FunctionDecl | EntityKind::FunctionTemplate => {
             if !is_in_project(cursor, base_dir) {
                 // Don't recurse into system headers
                 return;
@@ -316,16 +380,18 @@ fn visit_cursor(cursor: &clang::Entity, graph: &mut Graph, base_dir: &Path) {
                     attrs: Default::default(),
                 });
 
-                // Emit Contains edge: owning class → this method
+                // Emit Contains edge: owning class/struct → this method
                 if cursor.get_kind() == EntityKind::Method {
                     if let Some(parent) = cursor.get_semantic_parent() {
                         if matches!(
                             parent.get_kind(),
-                            EntityKind::ClassDecl | EntityKind::StructDecl
+                            EntityKind::ClassDecl
+                                | EntityKind::StructDecl
+                                | EntityKind::ClassTemplate
                         ) {
                             let parent_qualified = qualified_name(&parent);
-                            let parent_id =
-                                SymbolId::from_parts(&parent_qualified, SymbolKind::Class);
+                            let parent_kind = class_or_struct_kind(&parent);
+                            let parent_id = SymbolId::from_parts(&parent_qualified, parent_kind);
                             graph.add_edge(Edge {
                                 from: parent_id,
                                 to: id,
@@ -368,6 +434,26 @@ fn visit_cursor(cursor: &clang::Entity, graph: &mut Graph, base_dir: &Path) {
                     }
                 }
 
+                // Emit Contains edge: namespace → this function
+                if cursor.get_kind() == EntityKind::FunctionDecl
+                    || cursor.get_kind() == EntityKind::FunctionTemplate
+                {
+                    if let Some(parent) = cursor.get_semantic_parent() {
+                        if parent.get_kind() == EntityKind::Namespace && parent.get_name().is_some()
+                        {
+                            let parent_qualified = qualified_name(&parent);
+                            let parent_id =
+                                SymbolId::from_parts(&parent_qualified, SymbolKind::Namespace);
+                            graph.add_edge(Edge {
+                                from: parent_id,
+                                to: id,
+                                kind: EdgeKind::Contains,
+                                location: None,
+                            });
+                        }
+                    }
+                }
+
                 // Check for call expressions within this function/method.
                 // Use has_body as fallback — is_definition() can return false
                 // when there are parse errors (e.g. missing system headers).
@@ -388,22 +474,24 @@ fn visit_cursor(cursor: &clang::Entity, graph: &mut Graph, base_dir: &Path) {
                     graph.add_symbol(Symbol {
                         id,
                         kind,
-                        name,
+                        name: name.clone(),
                         qualified_name: qualified,
                         location,
                         module: None,
                         attrs: Default::default(),
                     });
 
-                    // Emit Contains edge: owning class → this field
+                    // Emit Contains edge: owning class/struct → this field
                     if let Some(parent) = cursor.get_semantic_parent() {
                         if matches!(
                             parent.get_kind(),
-                            EntityKind::ClassDecl | EntityKind::StructDecl
+                            EntityKind::ClassDecl
+                                | EntityKind::StructDecl
+                                | EntityKind::ClassTemplate
                         ) {
                             let parent_qualified = qualified_name(&parent);
-                            let parent_id =
-                                SymbolId::from_parts(&parent_qualified, SymbolKind::Class);
+                            let parent_kind = class_or_struct_kind(&parent);
+                            let parent_id = SymbolId::from_parts(&parent_qualified, parent_kind);
                             graph.add_edge(Edge {
                                 from: parent_id,
                                 to: id,
@@ -412,11 +500,107 @@ fn visit_cursor(cursor: &clang::Entity, graph: &mut Graph, base_dir: &Path) {
                             });
                         }
                     }
+
+                    // Emit HasType edge: field → type declaration (if it
+                    // refers to a class/struct in the project).
+                    if let Some(field_type) = cursor.get_type() {
+                        // Peel through pointers, references, and typedefs to
+                        // get the underlying named declaration.
+                        let canonical = field_type.get_canonical_type();
+                        if let Some(type_decl) = canonical.get_declaration() {
+                            if matches!(
+                                type_decl.get_kind(),
+                                EntityKind::ClassDecl
+                                    | EntityKind::StructDecl
+                                    | EntityKind::ClassTemplate
+                            ) {
+                                if let Some(type_name) = type_decl.get_name() {
+                                    let type_qualified = qualified_name(&type_decl);
+                                    let type_kind = class_or_struct_kind(&type_decl);
+                                    let type_id = SymbolId::from_parts(&type_qualified, type_kind);
+
+                                    // Ensure the type symbol exists.
+                                    if !graph.symbols.contains_key(&type_id) {
+                                        let type_loc = cursor_location(&type_decl, graph, base_dir);
+                                        graph.add_symbol(Symbol {
+                                            id: type_id,
+                                            kind: type_kind,
+                                            name: type_name,
+                                            qualified_name: type_qualified,
+                                            location: type_loc,
+                                            module: None,
+                                            attrs: Default::default(),
+                                        });
+                                    }
+
+                                    graph.add_edge(Edge {
+                                        from: id,
+                                        to: type_id,
+                                        kind: EdgeKind::HasType,
+                                        location: None,
+                                    });
+                                }
+                            }
+                        }
+                    }
                 }
             }
         }
 
-        // TODO: Handle TemplateInstantiation, Namespace, etc.
+        EntityKind::VarDecl => {
+            // For variable declarations whose type is a template
+            // specialization, emit a TemplateInstantiation symbol and an
+            // Instantiates edge back to the primary template.
+            if is_in_project(cursor, base_dir) {
+                if let Some(var_type) = cursor.get_type() {
+                    emit_template_instantiation(cursor, &var_type, graph, base_dir);
+                }
+            }
+        }
+
+        EntityKind::InclusionDirective => {
+            // Emit Includes edges between TranslationUnit symbols.
+            // The inclusion directive's file location tells us which TU
+            // contains the #include, and get_file() gives us the included file.
+            if is_in_project(cursor, base_dir) {
+                if let Some(included_file) = cursor.get_file() {
+                    let included_path = included_file.get_path();
+                    let included_str = included_path
+                        .strip_prefix(base_dir)
+                        .unwrap_or(&included_path)
+                        .to_string_lossy();
+
+                    // Determine the including file from the cursor's location.
+                    if let Some(loc) = cursor.get_location() {
+                        let file_loc = loc.get_file_location();
+                        if let Some(src_file) = file_loc.file {
+                            let src_path = src_file.get_path();
+                            let src_str = src_path
+                                .strip_prefix(base_dir)
+                                .unwrap_or(&src_path)
+                                .to_string_lossy();
+
+                            let src_id =
+                                SymbolId::from_parts(&src_str, SymbolKind::TranslationUnit);
+                            let inc_id =
+                                SymbolId::from_parts(&included_str, SymbolKind::TranslationUnit);
+
+                            // Ensure both TU symbols exist.
+                            ensure_tu_symbol(graph, src_id, &src_str);
+                            ensure_tu_symbol(graph, inc_id, &included_str);
+
+                            graph.add_edge(Edge {
+                                from: src_id,
+                                to: inc_id,
+                                kind: EdgeKind::Includes,
+                                location: None,
+                            });
+                        }
+                    }
+                }
+            }
+        }
+
         _ => {}
     }
 
@@ -530,6 +714,84 @@ fn visit_body(
     }
 }
 
+/// Check a type for template specialization and emit a
+/// [`SymbolKind::TemplateInstantiation`] symbol + [`EdgeKind::Instantiates`] edge
+/// if it refers to a class template.
+fn emit_template_instantiation(
+    context_cursor: &clang::Entity,
+    ty: &clang::Type,
+    graph: &mut Graph,
+    base_dir: &Path,
+) {
+    // Walk through the template argument list. If the type has template
+    // arguments, it's a specialization (e.g. std::vector<int>).
+    let n_args = ty.get_template_argument_types().map(|a| a.len());
+    if n_args.unwrap_or(0) == 0 {
+        return;
+    }
+
+    // Get the display name of the specialization (e.g. "vector<int>").
+    let display = ty.get_display_name();
+    if display.is_empty() {
+        return;
+    }
+
+    // Try to find the primary template declaration.
+    let canonical = ty.get_canonical_type();
+    let decl = match canonical.get_declaration() {
+        Some(d) => d,
+        None => return,
+    };
+
+    // The primary template is the specialized cursor's template, if available.
+    let template_cursor = decl.get_template().unwrap_or(decl);
+    let template_name = match template_cursor.get_name() {
+        Some(n) => n,
+        None => return,
+    };
+
+    let template_qualified = qualified_name(&template_cursor);
+    let template_kind = class_or_struct_kind(&template_cursor);
+    let template_id = SymbolId::from_parts(&template_qualified, template_kind);
+
+    let inst_id = SymbolId::from_parts(&display, SymbolKind::TemplateInstantiation);
+
+    // Only emit if we haven't already created this instantiation.
+    if !graph.symbols.contains_key(&inst_id) {
+        let location = cursor_location(context_cursor, graph, base_dir);
+        graph.add_symbol(Symbol {
+            id: inst_id,
+            kind: SymbolKind::TemplateInstantiation,
+            name: display.clone(),
+            qualified_name: display,
+            location,
+            module: None,
+            attrs: Default::default(),
+        });
+    }
+
+    // Ensure the primary template exists.
+    if !graph.symbols.contains_key(&template_id) {
+        let tmpl_loc = cursor_location(&template_cursor, graph, base_dir);
+        graph.add_symbol(Symbol {
+            id: template_id,
+            kind: template_kind,
+            name: template_name,
+            qualified_name: template_qualified,
+            location: tmpl_loc,
+            module: None,
+            attrs: Default::default(),
+        });
+    }
+
+    graph.add_edge(Edge {
+        from: inst_id,
+        to: template_id,
+        kind: EdgeKind::Instantiates,
+        location: None,
+    });
+}
+
 /// Emit a ReadsField or WritesField edge for a field access.
 fn emit_field_access(
     access_cursor: &clang::Entity,
@@ -582,6 +844,38 @@ fn dedup_edges(graph: &mut Graph) {
     graph
         .edges
         .retain(|e| seen.insert((e.from, e.to, std::mem::discriminant(&e.kind))));
+}
+
+/// Map a class/struct/template cursor to the appropriate `SymbolKind`.
+///
+/// `ClassTemplate` cursors are treated as `Class` since the IR doesn't
+/// distinguish templated from non-templated class definitions.
+fn class_or_struct_kind(cursor: &clang::Entity) -> SymbolKind {
+    use clang::EntityKind;
+    match cursor.get_kind() {
+        EntityKind::StructDecl => SymbolKind::Struct,
+        _ => SymbolKind::Class,
+    }
+}
+
+/// Ensure a [`SymbolKind::TranslationUnit`] symbol exists in the graph.
+fn ensure_tu_symbol(graph: &mut Graph, id: SymbolId, path: &str) {
+    if !graph.symbols.contains_key(&id) {
+        // Use the file name as the short name.
+        let name = std::path::Path::new(path)
+            .file_name()
+            .map(|n| n.to_string_lossy().into_owned())
+            .unwrap_or_else(|| path.to_string());
+        graph.add_symbol(Symbol {
+            id,
+            kind: SymbolKind::TranslationUnit,
+            name,
+            qualified_name: path.to_string(),
+            location: None,
+            module: None,
+            attrs: Default::default(),
+        });
+    }
 }
 
 /// Build a qualified name from a cursor's semantic parent chain.
