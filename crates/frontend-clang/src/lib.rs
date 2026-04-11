@@ -262,6 +262,11 @@ fn visit_cursor(cursor: &clang::Entity, graph: &mut Graph, base_dir: &Path) {
                                         if !graph.symbols.contains_key(&base_id) {
                                             let base_loc =
                                                 cursor_location(&base_decl, graph, base_dir);
+                                            let mut attrs: smallvec::SmallVec<[core_ir::Attr; 2]> =
+                                                Default::default();
+                                            if !is_in_project(&base_decl, base_dir) {
+                                                attrs.push(core_ir::Attr::External);
+                                            }
                                             graph.add_symbol(Symbol {
                                                 id: base_id,
                                                 kind: base_kind,
@@ -269,7 +274,7 @@ fn visit_cursor(cursor: &clang::Entity, graph: &mut Graph, base_dir: &Path) {
                                                 qualified_name: base_qualified,
                                                 location: base_loc,
                                                 module: None,
-                                                attrs: Default::default(),
+                                                attrs,
                                             });
                                         }
 
@@ -346,6 +351,11 @@ fn visit_cursor(cursor: &clang::Entity, graph: &mut Graph, base_dir: &Path) {
                                 // Ensure overridden method symbol exists
                                 if !graph.symbols.contains_key(&base_id) {
                                     let base_loc = cursor_location(base_method, graph, base_dir);
+                                    let mut attrs: smallvec::SmallVec<[core_ir::Attr; 2]> =
+                                        Default::default();
+                                    if !is_in_project(base_method, base_dir) {
+                                        attrs.push(core_ir::Attr::External);
+                                    }
                                     graph.add_symbol(Symbol {
                                         id: base_id,
                                         kind: base_kind,
@@ -353,7 +363,7 @@ fn visit_cursor(cursor: &clang::Entity, graph: &mut Graph, base_dir: &Path) {
                                         qualified_name: base_qualified,
                                         location: base_loc,
                                         module: None,
-                                        attrs: Default::default(),
+                                        attrs,
                                     });
                                 }
 
@@ -466,6 +476,11 @@ fn visit_body(
                         // Ensure callee symbol exists
                         if !graph.symbols.contains_key(&callee_id) {
                             let ref_loc = cursor_location(&referenced, graph, base_dir);
+                            let mut attrs: smallvec::SmallVec<[core_ir::Attr; 2]> =
+                                Default::default();
+                            if !is_in_project(&referenced, base_dir) {
+                                attrs.push(core_ir::Attr::External);
+                            }
                             graph.add_symbol(Symbol {
                                 id: callee_id,
                                 kind: ref_kind,
@@ -473,7 +488,7 @@ fn visit_body(
                                 qualified_name: ref_qualified,
                                 location: ref_loc,
                                 module: None,
-                                attrs: Default::default(),
+                                attrs,
                             });
                         }
                     }
@@ -560,6 +575,10 @@ fn emit_field_access(
         // Ensure field symbol exists
         if !graph.symbols.contains_key(&field_id) {
             let field_loc = cursor_location(field_decl, graph, base_dir);
+            let mut attrs: smallvec::SmallVec<[core_ir::Attr; 2]> = Default::default();
+            if !is_in_project(field_decl, base_dir) {
+                attrs.push(core_ir::Attr::External);
+            }
             graph.add_symbol(Symbol {
                 id: field_id,
                 kind: SymbolKind::Field,
@@ -567,7 +586,7 @@ fn emit_field_access(
                 qualified_name: field_qualified,
                 location: field_loc,
                 module: None,
-                attrs: Default::default(),
+                attrs,
             });
         }
     }
@@ -765,4 +784,221 @@ fn system_include_paths() -> Vec<String> {
             paths
         })
         .clone()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // -----------------------------------------------------------------------
+    // extract_args
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn extract_args_from_arguments_field() {
+        let cmd = CompileCommand {
+            directory: ".".into(),
+            arguments: Some(vec![
+                "clang++".into(),
+                "-std=c++17".into(),
+                "-Ifoo".into(),
+                "main.cpp".into(),
+            ]),
+            command: None,
+            file: "main.cpp".into(),
+        };
+        let args = extract_args(&cmd);
+        assert_eq!(args, vec!["-std=c++17", "-Ifoo", "main.cpp"]);
+    }
+
+    #[test]
+    fn extract_args_from_command_string() {
+        let cmd = CompileCommand {
+            directory: ".".into(),
+            arguments: None,
+            command: Some("g++ -Wall -O2 main.cpp".into()),
+            file: "main.cpp".into(),
+        };
+        let args = extract_args(&cmd);
+        assert_eq!(args, vec!["-Wall", "-O2", "main.cpp"]);
+    }
+
+    #[test]
+    fn extract_args_empty_arguments() {
+        let cmd = CompileCommand {
+            directory: ".".into(),
+            arguments: Some(vec![]),
+            command: None,
+            file: "main.cpp".into(),
+        };
+        let args = extract_args(&cmd);
+        assert!(args.is_empty());
+    }
+
+    #[test]
+    fn extract_args_single_element_arguments() {
+        let cmd = CompileCommand {
+            directory: ".".into(),
+            arguments: Some(vec!["clang++".into()]),
+            command: None,
+            file: "main.cpp".into(),
+        };
+        let args = extract_args(&cmd);
+        assert!(args.is_empty());
+    }
+
+    #[test]
+    fn extract_args_empty_command_string() {
+        let cmd = CompileCommand {
+            directory: ".".into(),
+            arguments: None,
+            command: Some("".into()),
+            file: "main.cpp".into(),
+        };
+        let args = extract_args(&cmd);
+        assert!(args.is_empty());
+    }
+
+    #[test]
+    fn extract_args_neither_field() {
+        let cmd = CompileCommand {
+            directory: ".".into(),
+            arguments: None,
+            command: None,
+            file: "main.cpp".into(),
+        };
+        let args = extract_args(&cmd);
+        assert!(args.is_empty());
+    }
+
+    // -----------------------------------------------------------------------
+    // dedup_edges
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn dedup_edges_removes_duplicates() {
+        let mut graph = Graph::new();
+        let a = SymbolId::from_parts("A", SymbolKind::Class);
+        let b = SymbolId::from_parts("B", SymbolKind::Class);
+        graph.add_symbol(Symbol {
+            id: a,
+            kind: SymbolKind::Class,
+            name: "A".into(),
+            qualified_name: "A".into(),
+            location: None,
+            module: None,
+            attrs: Default::default(),
+        });
+        graph.add_symbol(Symbol {
+            id: b,
+            kind: SymbolKind::Class,
+            name: "B".into(),
+            qualified_name: "B".into(),
+            location: None,
+            module: None,
+            attrs: Default::default(),
+        });
+        // Add the same edge twice (from two TUs)
+        graph.add_edge(Edge {
+            from: a,
+            to: b,
+            kind: EdgeKind::Inherits,
+            location: None,
+        });
+        graph.add_edge(Edge {
+            from: a,
+            to: b,
+            kind: EdgeKind::Inherits,
+            location: None,
+        });
+        assert_eq!(graph.edges.len(), 2);
+
+        dedup_edges(&mut graph);
+        assert_eq!(graph.edges.len(), 1);
+    }
+
+    #[test]
+    fn dedup_edges_preserves_different_kinds() {
+        let mut graph = Graph::new();
+        let a = SymbolId::from_parts("A", SymbolKind::Function);
+        let b = SymbolId::from_parts("B", SymbolKind::Function);
+        graph.add_edge(Edge {
+            from: a,
+            to: b,
+            kind: EdgeKind::Calls,
+            location: None,
+        });
+        graph.add_edge(Edge {
+            from: a,
+            to: b,
+            kind: EdgeKind::Contains,
+            location: None,
+        });
+        dedup_edges(&mut graph);
+        assert_eq!(graph.edges.len(), 2);
+    }
+
+    // -----------------------------------------------------------------------
+    // common_ancestor
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn common_ancestor_same_path() {
+        let a = PathBuf::from("/usr/src/foo");
+        let result = common_ancestor(&a, &a);
+        assert_eq!(result, PathBuf::from("/usr/src/foo"));
+    }
+
+    #[test]
+    fn common_ancestor_shared_prefix() {
+        let a = PathBuf::from("/project/src/a.cpp");
+        let b = PathBuf::from("/project/src/b.cpp");
+        assert_eq!(common_ancestor(&a, &b), PathBuf::from("/project/src"));
+    }
+
+    #[test]
+    fn common_ancestor_divergent() {
+        let a = PathBuf::from("/alpha/one");
+        let b = PathBuf::from("/beta/two");
+        assert_eq!(common_ancestor(&a, &b), PathBuf::from("/"));
+    }
+
+    // -----------------------------------------------------------------------
+    // index_project error paths
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn index_project_missing_file() {
+        let result = index_project(Path::new("/nonexistent/compile_commands.json"));
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn index_project_malformed_json() {
+        let dir = std::env::temp_dir().join("spaghetti_test_malformed");
+        let _ = std::fs::create_dir_all(&dir);
+        let path = dir.join("compile_commands.json");
+        std::fs::write(&path, "this is not json").unwrap();
+
+        let result = index_project(&path);
+        assert!(result.is_err());
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn index_project_empty_array() {
+        let dir = std::env::temp_dir().join("spaghetti_test_empty");
+        let _ = std::fs::create_dir_all(&dir);
+        let path = dir.join("compile_commands.json");
+        std::fs::write(&path, "[]").unwrap();
+
+        let result = index_project(&path);
+        assert!(result.is_ok());
+        let graph = result.unwrap();
+        assert_eq!(graph.symbol_count(), 0);
+        assert_eq!(graph.edge_count(), 0);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 }

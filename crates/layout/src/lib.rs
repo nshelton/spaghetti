@@ -127,6 +127,27 @@ impl Default for ForceParams {
     }
 }
 
+impl ForceParams {
+    /// Clamp all parameters to physically valid ranges, preventing division
+    /// by zero and other numerical hazards in the simulation.
+    pub fn sanitize(&mut self) {
+        self.repulsion = self.repulsion.max(0.0);
+        self.attraction = self.attraction.max(0.0);
+        self.damping = self.damping.clamp(0.01, 1.0);
+        self.max_velocity = self.max_velocity.max(0.1);
+        self.ideal_length = self.ideal_length.max(1.0);
+        self.min_dist = self.min_dist.max(0.01);
+        self.repulsion_cutoff = self.repulsion_cutoff.max(1.0);
+        self.gravity = self.gravity.max(0.0);
+        self.location_strength = self.location_strength.max(0.0);
+        self.location_falloff = self.location_falloff.clamp(0.0, 1.0);
+        for ep in self.edge_params.values_mut() {
+            ep.target_distance = ep.target_distance.max(1.0);
+            ep.attraction = ep.attraction.max(0.0);
+        }
+    }
+}
+
 /// Incremental force-directed simulation state.
 ///
 /// Created from a [`Graph`] and driven frame-by-frame via [`step`](Self::step).
@@ -162,7 +183,8 @@ impl LayoutState {
     ///
     /// `seed` controls the deterministic initial scatter. `params` sets the
     /// force constants.
-    pub fn new(graph: &Graph, seed: u64, params: ForceParams) -> Self {
+    pub fn new(graph: &Graph, seed: u64, mut params: ForceParams) -> Self {
+        params.sanitize();
         let ids: Vec<SymbolId> = graph.symbols.keys().copied().collect();
         let n = ids.len();
 
@@ -462,7 +484,7 @@ impl LayoutState {
                 } else {
                     *vel = (*vel + *force) * effective_damping;
                     let speed = vel.length();
-                    if speed > max_vel {
+                    if speed > max_vel && speed > 0.0 {
                         *vel *= max_vel / speed;
                     }
                     *pos += *vel;
@@ -546,6 +568,7 @@ impl LayoutState {
     /// Partially reset the cooling schedule so parameter changes take visible
     /// effect. Call after modifying [`ForceParams`] via [`params_mut`](Self::params_mut).
     pub fn reheat(&mut self) {
+        self.params.sanitize();
         self.total_steps = self.total_steps.saturating_sub(100);
     }
 

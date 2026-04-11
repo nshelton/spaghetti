@@ -6,10 +6,18 @@ use std::path::PathBuf;
 use layout::ForceParams;
 use serde::{Deserialize, Serialize};
 
+/// Current schema version. Bump when the settings format changes
+/// in a backwards-incompatible way to enable future migration logic.
+pub const SETTINGS_VERSION: u32 = 1;
+
 /// Persisted application settings.
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AppSettings {
+    /// Schema version for forward compatibility / migration.
+    #[serde(default = "default_version")]
+    pub version: u32,
     /// Force-directed layout parameters.
+    #[serde(default)]
     pub force_params: ForceParams,
     /// Rendering parameters (colors, circle mode, etc.).
     #[serde(default)]
@@ -17,6 +25,21 @@ pub struct AppSettings {
     /// View state (edge filters, camera, console, file tree visibility).
     #[serde(default)]
     pub view: ViewSettings,
+}
+
+fn default_version() -> u32 {
+    SETTINGS_VERSION
+}
+
+impl Default for AppSettings {
+    fn default() -> Self {
+        Self {
+            version: SETTINGS_VERSION,
+            force_params: ForceParams::default(),
+            render: RenderSettings::default(),
+            view: ViewSettings::default(),
+        }
+    }
 }
 
 /// Persisted view settings — UI state that should survive across sessions.
@@ -156,13 +179,55 @@ impl RenderSettings {
 }
 
 impl AppSettings {
-    /// Path to the settings file (next to the binary).
+    /// Path to the settings file, using platform config directories.
+    ///
+    /// - **Linux**: `$XDG_CONFIG_HOME/spaghetti/settings.json` (or `~/.config/spaghetti/settings.json`)
+    /// - **macOS**: `~/Library/Application Support/spaghetti/settings.json`
+    /// - **Windows**: `%APPDATA%/spaghetti/settings.json`
+    /// - **Fallback**: next to the binary.
     pub fn path() -> Option<PathBuf> {
+        // Try platform config directory first.
+        let config_dir = if cfg!(target_os = "macos") {
+            dirs_config_macos()
+        } else if cfg!(target_os = "windows") {
+            std::env::var("APPDATA").ok().map(PathBuf::from)
+        } else {
+            // Linux / other Unix: XDG_CONFIG_HOME or ~/.config
+            std::env::var("XDG_CONFIG_HOME")
+                .ok()
+                .map(PathBuf::from)
+                .or_else(|| {
+                    std::env::var("HOME")
+                        .ok()
+                        .map(|h| PathBuf::from(h).join(".config"))
+                })
+        };
+
+        if let Some(dir) = config_dir {
+            return Some(dir.join("spaghetti").join("settings.json"));
+        }
+
+        // Fallback: next to the binary.
         std::env::current_exe()
             .ok()
             .and_then(|p| p.parent().map(|dir| dir.join("spaghetti_settings.json")))
     }
+}
 
+/// macOS: `~/Library/Application Support`
+#[cfg(target_os = "macos")]
+fn dirs_config_macos() -> Option<PathBuf> {
+    std::env::var("HOME")
+        .ok()
+        .map(|h| PathBuf::from(h).join("Library/Application Support"))
+}
+
+#[cfg(not(target_os = "macos"))]
+fn dirs_config_macos() -> Option<PathBuf> {
+    None
+}
+
+impl AppSettings {
     /// Load from disk, returning defaults if file is missing or corrupt.
     pub fn load() -> Self {
         let Some(path) = Self::path() else {
@@ -183,6 +248,13 @@ impl AppSettings {
             tracing::warn!("could not determine settings path");
             return;
         };
+        // Ensure the parent directory exists.
+        if let Some(parent) = path.parent() {
+            if let Err(e) = std::fs::create_dir_all(parent) {
+                tracing::warn!("failed to create settings directory: {e}");
+                return;
+            }
+        }
         match serde_json::to_string_pretty(self) {
             Ok(json) => {
                 if let Err(e) = std::fs::write(&path, json) {
@@ -191,5 +263,65 @@ impl AppSettings {
             }
             Err(e) => tracing::warn!("failed to serialize settings: {e}"),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn settings_roundtrip() {
+        let original = AppSettings::default();
+        let json = serde_json::to_string_pretty(&original).expect("serialize");
+        let restored: AppSettings = serde_json::from_str(&json).expect("deserialize");
+
+        assert_eq!(restored.version, SETTINGS_VERSION);
+        assert_eq!(restored.render.circle_mode, original.render.circle_mode);
+        assert!((restored.render.edge_opacity - original.render.edge_opacity).abs() < f32::EPSILON);
+        assert!((restored.view.camera_zoom - original.view.camera_zoom).abs() < f32::EPSILON);
+        assert_eq!(restored.view.show_console, original.view.show_console);
+        assert_eq!(restored.view.console_level, original.view.console_level);
+    }
+
+    #[test]
+    fn settings_missing_version_defaults() {
+        // Simulate a settings file from before the version field existed.
+        // force_params is omitted entirely so it uses Default.
+        let json = r#"{}"#;
+        let settings: AppSettings = serde_json::from_str(json).expect("deserialize");
+        assert_eq!(settings.version, SETTINGS_VERSION);
+    }
+
+    #[test]
+    fn settings_missing_fields_use_defaults() {
+        let json = "{}";
+        let settings: AppSettings = serde_json::from_str(json).expect("deserialize");
+        assert_eq!(settings.version, SETTINGS_VERSION);
+        assert!(!settings.render.circle_mode);
+        assert!((settings.view.camera_zoom - 1.0).abs() < f32::EPSILON);
+    }
+
+    #[test]
+    fn render_settings_node_color_lookup() {
+        let render = RenderSettings::default();
+        let color = render.node_color(core_ir::SymbolKind::Class);
+        // Default Class color is [30, 55, 80]
+        assert_eq!(color, egui::Color32::from_rgb(30, 55, 80));
+    }
+
+    #[test]
+    fn render_settings_unknown_kind_fallback() {
+        let render = RenderSettings {
+            node_colors: HashMap::new(),
+            edge_colors: HashMap::new(),
+            circle_mode: false,
+            circle_radius: 5.0,
+            edge_opacity: 0.6,
+            node_opacity: 1.0,
+        };
+        // Unknown kind should fall back to grey
+        let color = render.node_color(core_ir::SymbolKind::Class);
+        assert_eq!(color, egui::Color32::from_rgb(50, 50, 50));
     }
 }

@@ -9,5 +9,4 @@ serde_json = { workspace = true }
 indexmap = { workspace = true }
 smallvec = { workspace = true }
 thiserror = { workspace = true }
-tracing = { workspace = true }
 seahash = { workspace = true }

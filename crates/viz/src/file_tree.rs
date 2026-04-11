@@ -274,3 +274,165 @@ fn collect_visibility_recursive(dir: &DirNode, parent_path: &str, map: &mut Hash
         collect_visibility_recursive(child, &path, map);
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use core_ir::{Location, Symbol};
+
+    /// Helper: build a graph with symbols at given relative file paths.
+    fn graph_with_files(entries: &[(&str, &str, SymbolKind)]) -> Graph {
+        let mut graph = Graph::new();
+        for &(qualified, path, kind) in entries {
+            let id = SymbolId::from_parts(qualified, kind);
+            let file_id = graph.files.intern(path);
+            graph.add_symbol(Symbol {
+                id,
+                kind,
+                name: qualified.split("::").last().unwrap_or(qualified).to_owned(),
+                qualified_name: qualified.to_owned(),
+                location: Some(Location {
+                    file: file_id,
+                    line: 1,
+                    col: 1,
+                }),
+                module: None,
+                attrs: Default::default(),
+            });
+        }
+        graph
+    }
+
+    #[test]
+    fn from_graph_groups_by_directory() {
+        let graph = graph_with_files(&[
+            ("Shape", "shapes/shape.h", SymbolKind::Class),
+            ("Circle", "shapes/circle.h", SymbolKind::Class),
+            ("main", "main.cpp", SymbolKind::Function),
+        ]);
+
+        let tree = FileTree::from_graph(&graph);
+
+        // One root directory "shapes" and one root file "main.cpp"
+        assert_eq!(tree.roots.len(), 1);
+        assert_eq!(tree.roots[0].name, "shapes");
+        assert_eq!(tree.roots[0].files.len(), 2);
+        assert_eq!(tree.root_files.len(), 1);
+        assert_eq!(tree.root_files[0].name, "main.cpp");
+    }
+
+    #[test]
+    fn from_graph_external_symbols() {
+        let mut graph = Graph::new();
+        // Symbol with no location → external
+        let id = SymbolId::from_parts("std::vector", SymbolKind::Class);
+        graph.add_symbol(Symbol {
+            id,
+            kind: SymbolKind::Class,
+            name: "vector".into(),
+            qualified_name: "std::vector".into(),
+            location: None,
+            module: None,
+            attrs: Default::default(),
+        });
+
+        let tree = FileTree::from_graph(&graph);
+        assert_eq!(tree.external_symbols.len(), 1);
+        assert_eq!(tree.roots.len(), 0);
+    }
+
+    #[test]
+    fn hidden_symbols_hides_external_by_default() {
+        let mut graph = Graph::new();
+        let ext_id = SymbolId::from_parts("std::string", SymbolKind::Class);
+        graph.add_symbol(Symbol {
+            id: ext_id,
+            kind: SymbolKind::Class,
+            name: "string".into(),
+            qualified_name: "std::string".into(),
+            location: None,
+            module: None,
+            attrs: Default::default(),
+        });
+
+        let tree = FileTree::from_graph(&graph);
+        let hidden = tree.hidden_symbols();
+        assert!(hidden.contains(&ext_id));
+    }
+
+    #[test]
+    fn visibility_toggle_hides_directory() {
+        let graph = graph_with_files(&[
+            ("Shape", "shapes/shape.h", SymbolKind::Class),
+            ("main", "main.cpp", SymbolKind::Function),
+        ]);
+        let mut tree = FileTree::from_graph(&graph);
+
+        // Initially all visible, only externals hidden
+        let hidden = tree.hidden_symbols();
+        let shape_id = SymbolId::from_parts("Shape", SymbolKind::Class);
+        assert!(!hidden.contains(&shape_id));
+
+        // Hide the shapes directory
+        tree.roots[0].visible = false;
+        let hidden = tree.hidden_symbols();
+        assert!(hidden.contains(&shape_id));
+
+        // main.cpp should still be visible
+        let main_id = SymbolId::from_parts("main", SymbolKind::Function);
+        assert!(!hidden.contains(&main_id));
+    }
+
+    #[test]
+    fn visibility_map_roundtrip() {
+        let graph = graph_with_files(&[
+            ("Shape", "shapes/shape.h", SymbolKind::Class),
+            ("Circle", "shapes/inner/circle.h", SymbolKind::Class),
+            ("main", "main.cpp", SymbolKind::Function),
+        ]);
+        let mut tree = FileTree::from_graph(&graph);
+
+        // Hide the inner directory
+        tree.roots[0].children_dirs[0].visible = false;
+        let saved = tree.visibility_map();
+        assert_eq!(saved.get("shapes/inner"), Some(&false));
+
+        // Rebuild tree and apply saved visibility
+        let mut tree2 = FileTree::from_graph(&graph);
+        tree2.apply_visibility(&saved);
+        assert!(!tree2.roots[0].children_dirs[0].visible);
+        // Parent should still be visible
+        assert!(tree2.roots[0].visible);
+    }
+
+    #[test]
+    fn file_summary_format() {
+        let file = FileNode {
+            name: "circle.cpp".into(),
+            symbols: vec![
+                (
+                    SymbolId::from_parts("Circle", SymbolKind::Class),
+                    SymbolKind::Class,
+                    "Circle".into(),
+                ),
+                (
+                    SymbolId::from_parts("Circle::area", SymbolKind::Method),
+                    SymbolKind::Method,
+                    "area".into(),
+                ),
+            ],
+        };
+        let summary = file_summary(&file);
+        assert_eq!(summary, "circle.cpp (1 class, 1 method)");
+    }
+
+    #[test]
+    fn empty_graph_produces_empty_tree() {
+        let graph = Graph::new();
+        let tree = FileTree::from_graph(&graph);
+        assert!(tree.roots.is_empty());
+        assert!(tree.root_files.is_empty());
+        assert!(tree.external_symbols.is_empty());
+        assert!(tree.hidden_symbols().is_empty());
+    }
+}

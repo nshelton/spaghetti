@@ -95,3 +95,25 @@ pub fn callers_of(g: &Graph, id: SymbolId) -> Vec<SymbolId> {
         .map(|e| e.from)
         .collect()
 }
+
+/// Find all symbols that `id` calls (outgoing `Calls` edges).
+///
+/// # Direction semantics
+///
+/// Only **outgoing** `Calls` edges are considered: an edge `A → B` with kind
+/// `Calls` means A calls B. This function returns the `to` side of such edges
+/// where `from == id`. Incoming edges (callers of `id`) are excluded.
+///
+/// Non-call edge kinds (`Inherits`, `Contains`, etc.) are ignored entirely.
+///
+/// If `id` does not exist in the graph or calls nothing, an empty `Vec` is
+/// returned — the function never panics on an unknown ID.
+///
+/// If `id` calls itself (self-loop), it appears in the result.
+pub fn callees_of(g: &Graph, id: SymbolId) -> Vec<SymbolId> {
+    g.edges
+        .iter()
+        .filter(|e| e.from == id && e.kind == EdgeKind::Calls)
+        .map(|e| e.to)
+        .collect()
+}

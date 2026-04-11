@@ -11,6 +11,55 @@ use core_ir::{EdgeKind, Graph, SymbolId};
 use layout::{LayoutState, Positions};
 use tracing::Level;
 
+/// Pre-grouped edges for the selected symbol, keyed by edge kind.
+/// Rebuilt when `selection` changes (instead of scanning all edges per frame).
+#[derive(Default)]
+pub(crate) struct EdgeCache {
+    /// (edge_kind, direction, target_qualified_name, is_external)
+    pub entries: Vec<(EdgeKind, EdgeDir, String, bool)>,
+    /// The symbol this cache was built for.
+    pub for_symbol: Option<SymbolId>,
+}
+
+/// Direction of an edge relative to the selected symbol.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum EdgeDir {
+    Outgoing,
+    Incoming,
+}
+
+impl EdgeCache {
+    /// Rebuild the cache for a new selection.
+    pub fn rebuild(&mut self, graph: &Graph, selection: Option<SymbolId>) {
+        self.for_symbol = selection;
+        self.entries.clear();
+
+        let Some(sel_id) = selection else { return };
+
+        for edge in &graph.edges {
+            if edge.from == sel_id {
+                if let Some(target) = graph.symbols.get(&edge.to) {
+                    self.entries.push((
+                        edge.kind,
+                        EdgeDir::Outgoing,
+                        target.qualified_name.clone(),
+                        graph.is_external(edge.to),
+                    ));
+                }
+            } else if edge.to == sel_id {
+                if let Some(source) = graph.symbols.get(&edge.from) {
+                    self.entries.push((
+                        edge.kind,
+                        EdgeDir::Incoming,
+                        source.qualified_name.clone(),
+                        graph.is_external(edge.from),
+                    ));
+                }
+            }
+        }
+    }
+}
+
 use crate::file_tree::FileTree;
 
 use crate::camera::{self, Camera2D};
@@ -118,12 +167,14 @@ pub struct SpaghettiApp {
     pub(crate) dragging: Option<SymbolId>,
     /// Whether the initial auto-fit has been performed.
     pub(crate) auto_fitted: bool,
-    /// Frame counter used to trigger auto-fit after a timeout.
-    pub(crate) frame_count: u32,
+    /// When the current graph was loaded, for auto-fit timeout.
+    pub(crate) load_time: std::time::Instant,
     /// File/directory tree built from symbol locations.
     pub(crate) file_tree: FileTree,
     /// Symbols currently hidden by file-tree visibility toggles.
     pub(crate) hidden_symbols: HashSet<SymbolId>,
+    /// Cached edge groupings for the selected symbol (rebuilt on selection change).
+    pub(crate) edge_cache: EdgeCache,
 
     // -- Rendering settings (persisted) --
     pub(crate) render: crate::settings::RenderSettings,
@@ -182,9 +233,10 @@ impl SpaghettiApp {
             search: String::new(),
             dragging: None,
             auto_fitted: false,
-            frame_count: 0,
+            load_time: std::time::Instant::now(),
             file_tree,
             hidden_symbols,
+            edge_cache: EdgeCache::default(),
             render,
             show_console: view.show_console,
             indexing: false,
@@ -207,6 +259,14 @@ impl SpaghettiApp {
             show_console: self.show_console,
             console_level: format!("{}", self.console_level_filter),
             dir_visibility: self.file_tree.visibility_map(),
+        }
+    }
+
+    /// Update the selected symbol and rebuild the edge cache.
+    pub(crate) fn set_selection(&mut self, sel: Option<SymbolId>) {
+        if self.selection != sel {
+            self.selection = sel;
+            self.edge_cache.rebuild(&self.graph, sel);
         }
     }
 
@@ -371,11 +431,11 @@ impl SpaghettiApp {
                     let hidden_vec: Vec<_> = self.hidden_symbols.iter().copied().collect();
                     self.layout_state.set_hidden(&hidden_vec);
                     self.positions = self.layout_state.positions();
-                    self.selection = None;
+                    self.set_selection(None);
                     self.camera = Camera2D::default();
                     self.dragging = None;
                     self.auto_fitted = false;
-                    self.frame_count = 0;
+                    self.load_time = std::time::Instant::now();
                     self.finish_indexing();
                 }
                 ProgressMessage::Failed(ref err) => {
@@ -491,6 +551,7 @@ impl eframe::App for SpaghettiApp {
 
     fn on_exit(&mut self) {
         let settings = crate::settings::AppSettings {
+            version: crate::settings::SETTINGS_VERSION,
             force_params: self.layout_state.params().clone(),
             render: self.render.clone(),
             view: self.view_settings(),

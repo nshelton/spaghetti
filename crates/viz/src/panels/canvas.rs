@@ -30,7 +30,7 @@ impl SpaghettiApp {
                 if let Some(hit) = self.hit_test(response.interact_pointer_pos(), canvas_center) {
                     // Begin dragging a node.
                     self.dragging = Some(hit);
-                    self.selection = Some(hit);
+                    self.set_selection(Some(hit));
                     if let Some(&world) = self.positions.0.get(&hit) {
                         self.layout_state.pin(hit, world);
                     }
@@ -63,7 +63,8 @@ impl SpaghettiApp {
             // Handle click (select) — only when not dragging.
             if response.clicked() {
                 if let Some(pointer) = response.interact_pointer_pos() {
-                    self.selection = self.hit_test(Some(pointer), canvas_center);
+                    let hit = self.hit_test(Some(pointer), canvas_center);
+                    self.set_selection(hit);
                 }
             }
 
@@ -75,10 +76,9 @@ impl SpaghettiApp {
                 .step_budgeted(std::time::Duration::from_millis(8));
             self.positions = self.layout_state.positions();
 
-            // Auto-fit camera once the layout settles or after a timeout.
+            // Auto-fit camera once the layout settles or after a 2-second timeout.
             let energy = self.layout_state.energy();
-            self.frame_count = self.frame_count.saturating_add(1);
-            let auto_fit_timeout = self.frame_count >= 120; // ~2s at 60fps
+            let auto_fit_timeout = self.load_time.elapsed() >= std::time::Duration::from_secs(2);
             if !self.auto_fitted && (energy < ENERGY_THRESHOLD || auto_fit_timeout) {
                 self.camera
                     .fit_to_bounds(&self.positions, response.rect.size());

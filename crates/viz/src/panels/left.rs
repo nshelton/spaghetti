@@ -63,6 +63,7 @@ impl SpaghettiApp {
                             ui.label(format!("<external> ({ext_count} symbols)"));
                         })
                         .body(|ui| {
+                            let mut new_sel = None;
                             for &(sym_id, kind, ref name) in &self.file_tree.external_symbols {
                                 if let Some(search) = search {
                                     if !name.to_lowercase().contains(search) {
@@ -72,8 +73,11 @@ impl SpaghettiApp {
                                 let label = format!("{kind:?} {name}");
                                 let selected = self.selection == Some(sym_id);
                                 if ui.selectable_label(selected, &label).clicked() {
-                                    self.selection = Some(sym_id);
+                                    new_sel = Some(sym_id);
                                 }
+                            }
+                            if let Some(id) = new_sel {
+                                self.set_selection(Some(id));
                             }
                         });
                     }

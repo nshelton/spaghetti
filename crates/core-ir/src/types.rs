@@ -190,6 +190,8 @@ pub enum Attr {
     Static,
     /// Symbol is const.
     Const,
+    /// Symbol is external to the project (e.g. from a system header).
+    External,
     /// Custom attribute string.
     Custom(String),
 }
@@ -315,13 +317,18 @@ impl Graph {
     /// considered external.
     pub fn is_external(&self, id: SymbolId) -> bool {
         match self.symbols.get(&id) {
-            Some(sym) => match &sym.location {
-                Some(loc) => {
-                    let path = self.files.resolve(loc.file).unwrap_or("");
-                    path.starts_with('/')
+            Some(sym) => {
+                if sym.attrs.contains(&Attr::External) {
+                    return true;
                 }
-                None => true,
-            },
+                match &sym.location {
+                    Some(loc) => {
+                        let path = self.files.resolve(loc.file).unwrap_or("");
+                        path.starts_with('/')
+                    }
+                    None => true,
+                }
+            }
             None => true,
         }
     }

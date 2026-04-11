@@ -1,7 +1,7 @@
 //! Tests for query functions.
 
 use core_ir::{Edge, EdgeKind, Graph, Symbol, SymbolId, SymbolKind};
-use query::{callers_of, find_by_name, subgraph_around};
+use query::{callees_of, callers_of, find_by_name, subgraph_around};
 
 fn make_symbol(name: &str, kind: SymbolKind) -> Symbol {
     Symbol {
@@ -408,4 +408,61 @@ fn test_cap008_self_call() {
         callers.contains(&t),
         "target calls itself — it should appear in its own callers list"
     );
+}
+
+// -----------------------------------------------------------------------
+// callees_of
+// -----------------------------------------------------------------------
+
+/// callees_of returns outgoing Calls edges only.
+#[test]
+fn test_callees_of_basic() {
+    let (g, caller_a, _, target, ..) = cap008_graph();
+    // caller_a -> target
+    let callees = callees_of(&g, caller_a);
+    assert!(
+        callees.contains(&target),
+        "caller_a calls target — target should appear in callees"
+    );
+}
+
+/// callees_of excludes incoming edges (callers).
+#[test]
+fn test_callees_of_excludes_callers() {
+    let (g, caller_a, _, target, ..) = cap008_graph();
+    // target is called by caller_a, but callees_of(caller_a) should not
+    // include caller_a itself (unless it self-calls).
+    let callees = callees_of(&g, target);
+    assert!(
+        !callees.contains(&caller_a),
+        "caller_a is a caller of target, not a callee"
+    );
+}
+
+/// callees_of returns empty for a symbol that calls nothing.
+#[test]
+fn test_callees_of_empty() {
+    let (g, _, _, _, _, non_caller) = cap008_graph();
+    let callees = callees_of(&g, non_caller);
+    assert!(callees.is_empty(), "non_caller has no outgoing Calls edges");
+}
+
+/// callees_of self-call: target calls itself.
+#[test]
+fn test_callees_of_self_call() {
+    let (g, _, _, target, ..) = cap008_graph();
+    let callees = callees_of(&g, target);
+    assert!(
+        callees.contains(&target),
+        "target calls itself — should appear in its own callees"
+    );
+}
+
+/// callees_of unknown ID returns empty.
+#[test]
+fn test_callees_of_unknown() {
+    let (g, ..) = cap008_graph();
+    let missing = SymbolId::from_parts("does_not_exist", SymbolKind::Function);
+    let callees = callees_of(&g, missing);
+    assert!(callees.is_empty());
 }

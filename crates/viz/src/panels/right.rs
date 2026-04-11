@@ -1,6 +1,6 @@
 //! Right panel: details of the selected symbol + layout controls.
 
-use crate::app::{SpaghettiApp, ALL_EDGE_KINDS};
+use crate::app::{EdgeDir, SpaghettiApp, ALL_EDGE_KINDS};
 
 impl SpaghettiApp {
     /// Draw the right panel: details of selected symbol + layout controls.
@@ -34,7 +34,7 @@ impl SpaghettiApp {
                                 ui.label(format!("Attrs: {:?}", sym.attrs));
                             }
 
-                            // -- Edge summary by type --
+                            // -- Edge summary by type (uses cached edge index) --
                             ui.separator();
                             ui.heading("Connections");
 
@@ -45,26 +45,21 @@ impl SpaghettiApp {
                                     continue;
                                 }
 
-                                // Collect outgoing and incoming edges of this kind.
-                                let mut outgoing: Vec<(&str, bool)> = Vec::new();
-                                let mut incoming: Vec<(&str, bool)> = Vec::new();
-
-                                for edge in &self.graph.edges {
-                                    if edge.kind != kind {
-                                        continue;
-                                    }
-                                    if edge.from == sel_id {
-                                        if let Some(target) = self.graph.symbols.get(&edge.to) {
-                                            let is_external = self.graph.is_external(edge.to);
-                                            outgoing.push((&target.qualified_name, is_external));
-                                        }
-                                    } else if edge.to == sel_id {
-                                        if let Some(source) = self.graph.symbols.get(&edge.from) {
-                                            let is_external = self.graph.is_external(edge.from);
-                                            incoming.push((&source.qualified_name, is_external));
-                                        }
-                                    }
-                                }
+                                // Use the pre-built edge cache instead of scanning all edges.
+                                let outgoing: Vec<(&str, bool)> = self
+                                    .edge_cache
+                                    .entries
+                                    .iter()
+                                    .filter(|(k, d, _, _)| *k == kind && *d == EdgeDir::Outgoing)
+                                    .map(|(_, _, name, ext)| (name.as_str(), *ext))
+                                    .collect();
+                                let incoming: Vec<(&str, bool)> = self
+                                    .edge_cache
+                                    .entries
+                                    .iter()
+                                    .filter(|(k, d, _, _)| *k == kind && *d == EdgeDir::Incoming)
+                                    .map(|(_, _, name, ext)| (name.as_str(), *ext))
+                                    .collect();
 
                                 let total = outgoing.len() + incoming.len();
                                 if total == 0 {
