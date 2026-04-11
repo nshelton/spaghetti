@@ -6,6 +6,7 @@
 
 mod app;
 mod camera;
+mod file_tree;
 mod fps;
 mod log_capture;
 mod panels;
@@ -58,7 +59,13 @@ fn main() -> Result<()> {
         // Create incremental layout state with persisted force params.
         let layout_state = layout::LayoutState::new(&graph, 42, saved_settings.force_params);
 
-        app::SpaghettiApp::new(graph, layout_state, log_buffer, saved_settings.render)
+        app::SpaghettiApp::new(
+            graph,
+            layout_state,
+            log_buffer,
+            saved_settings.render,
+            saved_settings.view,
+        )
     } else {
         info!("no file argument — starting with empty canvas");
         app::SpaghettiApp::empty(log_buffer)

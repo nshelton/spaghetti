@@ -377,7 +377,46 @@ fn visit_cursor(cursor: &clang::Entity, graph: &mut Graph, base_dir: &Path) {
             }
         }
 
-        // TODO: Handle TemplateInstantiation, Field, Namespace, etc.
+        EntityKind::FieldDecl => {
+            if is_in_project(cursor, base_dir) {
+                if let Some(name) = cursor.get_name() {
+                    let qualified = qualified_name(cursor);
+                    let kind = SymbolKind::Field;
+                    let location = cursor_location(cursor, graph, base_dir);
+                    let id = SymbolId::from_parts(&qualified, kind);
+
+                    graph.add_symbol(Symbol {
+                        id,
+                        kind,
+                        name,
+                        qualified_name: qualified,
+                        location,
+                        module: None,
+                        attrs: Default::default(),
+                    });
+
+                    // Emit Contains edge: owning class → this field
+                    if let Some(parent) = cursor.get_semantic_parent() {
+                        if matches!(
+                            parent.get_kind(),
+                            EntityKind::ClassDecl | EntityKind::StructDecl
+                        ) {
+                            let parent_qualified = qualified_name(&parent);
+                            let parent_id =
+                                SymbolId::from_parts(&parent_qualified, SymbolKind::Class);
+                            graph.add_edge(Edge {
+                                from: parent_id,
+                                to: id,
+                                kind: EdgeKind::Contains,
+                                location: None,
+                            });
+                        }
+                    }
+                }
+            }
+        }
+
+        // TODO: Handle TemplateInstantiation, Namespace, etc.
         _ => {}
     }
 
@@ -387,48 +426,150 @@ fn visit_cursor(cursor: &clang::Entity, graph: &mut Graph, base_dir: &Path) {
     }
 }
 
-/// Visit call expressions within a function body.
+/// Visit expressions within a function body: calls and field accesses.
 fn visit_calls(cursor: &clang::Entity, caller_id: SymbolId, graph: &mut Graph, base_dir: &Path) {
+    visit_body(cursor, caller_id, graph, base_dir, false);
+}
+
+/// Recursive body visitor. `is_write_context` is true when the current subtree
+/// is on the left-hand side of an assignment.
+fn visit_body(
+    cursor: &clang::Entity,
+    caller_id: SymbolId,
+    graph: &mut Graph,
+    base_dir: &Path,
+    is_write_context: bool,
+) {
     use clang::EntityKind;
 
     for child in cursor.get_children() {
-        if child.get_kind() == EntityKind::CallExpr {
-            if let Some(referenced) = child.get_reference() {
-                if let Some(ref_name) = referenced.get_name() {
-                    let ref_qualified = qualified_name(&referenced);
-                    let ref_kind = if referenced.get_kind() == EntityKind::Method {
-                        SymbolKind::Method
-                    } else {
-                        SymbolKind::Function
-                    };
-                    let callee_id = SymbolId::from_parts(&ref_qualified, ref_kind);
+        match child.get_kind() {
+            EntityKind::CallExpr => {
+                if let Some(referenced) = child.get_reference() {
+                    if let Some(ref_name) = referenced.get_name() {
+                        let ref_qualified = qualified_name(&referenced);
+                        let ref_kind = if referenced.get_kind() == EntityKind::Method {
+                            SymbolKind::Method
+                        } else {
+                            SymbolKind::Function
+                        };
+                        let callee_id = SymbolId::from_parts(&ref_qualified, ref_kind);
 
-                    let call_loc = cursor_location(&child, graph, base_dir);
-                    graph.add_edge(Edge {
-                        from: caller_id,
-                        to: callee_id,
-                        kind: EdgeKind::Calls,
-                        location: call_loc,
-                    });
-
-                    // Ensure callee symbol exists
-                    if !graph.symbols.contains_key(&callee_id) {
-                        let ref_loc = cursor_location(&referenced, graph, base_dir);
-                        graph.add_symbol(Symbol {
-                            id: callee_id,
-                            kind: ref_kind,
-                            name: ref_name,
-                            qualified_name: ref_qualified,
-                            location: ref_loc,
-                            module: None,
-                            attrs: Default::default(),
+                        let call_loc = cursor_location(&child, graph, base_dir);
+                        graph.add_edge(Edge {
+                            from: caller_id,
+                            to: callee_id,
+                            kind: EdgeKind::Calls,
+                            location: call_loc,
                         });
+
+                        // Ensure callee symbol exists
+                        if !graph.symbols.contains_key(&callee_id) {
+                            let ref_loc = cursor_location(&referenced, graph, base_dir);
+                            graph.add_symbol(Symbol {
+                                id: callee_id,
+                                kind: ref_kind,
+                                name: ref_name,
+                                qualified_name: ref_qualified,
+                                location: ref_loc,
+                                module: None,
+                                attrs: Default::default(),
+                            });
+                        }
+                    }
+                }
+                // Recurse into call arguments (may contain field reads)
+                visit_body(&child, caller_id, graph, base_dir, false);
+            }
+
+            // Direct field access: obj.field or ptr->field
+            EntityKind::MemberRefExpr => {
+                if let Some(referenced) = child.get_reference() {
+                    if referenced.get_kind() == EntityKind::FieldDecl {
+                        emit_field_access(
+                            &child,
+                            &referenced,
+                            caller_id,
+                            graph,
+                            base_dir,
+                            is_write_context,
+                        );
+                    }
+                }
+                // Recurse (e.g. chained member access a.b.c)
+                visit_body(&child, caller_id, graph, base_dir, false);
+            }
+
+            // Constructor member initializer: radius_(radius)
+            EntityKind::MemberRef => {
+                if let Some(referenced) = child.get_reference() {
+                    if referenced.get_kind() == EntityKind::FieldDecl {
+                        // Member initializers are always writes.
+                        emit_field_access(&child, &referenced, caller_id, graph, base_dir, true);
                     }
                 }
             }
+
+            // Binary operators (=, +=, -=, etc.): LHS is a write context.
+            EntityKind::BinaryOperator | EntityKind::CompoundAssignOperator => {
+                let children = child.get_children();
+                if children.len() == 2 {
+                    // LHS is write context
+                    visit_body(&children[0], caller_id, graph, base_dir, true);
+                    // RHS is read context
+                    visit_body(&children[1], caller_id, graph, base_dir, false);
+                } else {
+                    visit_body(&child, caller_id, graph, base_dir, false);
+                }
+            }
+
+            _ => {
+                visit_body(&child, caller_id, graph, base_dir, is_write_context);
+            }
         }
-        // Recurse to find nested calls
-        visit_calls(&child, caller_id, graph, base_dir);
+    }
+}
+
+/// Emit a ReadsField or WritesField edge for a field access.
+fn emit_field_access(
+    access_cursor: &clang::Entity,
+    field_decl: &clang::Entity,
+    accessor_id: SymbolId,
+    graph: &mut Graph,
+    base_dir: &Path,
+    is_write: bool,
+) {
+    if let Some(field_name) = field_decl.get_name() {
+        let field_qualified = qualified_name(field_decl);
+        let field_id = SymbolId::from_parts(&field_qualified, SymbolKind::Field);
+
+        let edge_kind = if is_write {
+            EdgeKind::WritesField
+        } else {
+            EdgeKind::ReadsField
+        };
+
+        let loc = cursor_location(access_cursor, graph, base_dir);
+        graph.add_edge(Edge {
+            from: accessor_id,
+            to: field_id,
+            kind: edge_kind,
+            location: loc,
+        });
+
+        // Ensure field symbol exists
+        if !graph.symbols.contains_key(&field_id) {
+            let field_loc = cursor_location(field_decl, graph, base_dir);
+            graph.add_symbol(Symbol {
+                id: field_id,
+                kind: SymbolKind::Field,
+                name: field_name,
+                qualified_name: field_qualified,
+                location: field_loc,
+                module: None,
+                attrs: Default::default(),
+            });
+        }
     }
 }
 

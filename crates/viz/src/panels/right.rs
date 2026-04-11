@@ -1,17 +1,6 @@
 //! Right panel: details of the selected symbol + layout controls.
 
-use core_ir::EdgeKind;
-
-use crate::app::SpaghettiApp;
-use crate::widgets::toggle_button;
-
-/// The four edge kinds currently emitted by the clang frontend.
-const ACTIVE_EDGE_KINDS: [EdgeKind; 4] = [
-    EdgeKind::Calls,
-    EdgeKind::Inherits,
-    EdgeKind::Contains,
-    EdgeKind::Overrides,
-];
+use crate::app::{SpaghettiApp, ALL_EDGE_KINDS};
 
 impl SpaghettiApp {
     /// Draw the right panel: details of selected symbol + layout controls.
@@ -51,7 +40,7 @@ impl SpaghettiApp {
 
                             let active = self.edge_filter.active_kinds();
 
-                            for &kind in &ACTIVE_EDGE_KINDS {
+                            for &kind in &ALL_EDGE_KINDS {
                                 if !active.contains(&kind) {
                                     continue;
                                 }
@@ -128,7 +117,7 @@ impl SpaghettiApp {
                     ui.heading("Rendering");
                     ui.separator();
 
-                    toggle_button(ui, &mut self.render.circle_mode, "Circle mode");
+                    crate::widgets::toggle_button(ui, &mut self.render.circle_mode, "Circle mode");
                     if self.render.circle_mode {
                         ui.add(
                             egui::Slider::new(&mut self.render.circle_radius, 1.0..=50.0)
@@ -168,55 +157,21 @@ impl SpaghettiApp {
                             "TemplateInstantiation",
                             "TranslationUnit",
                         ] {
-                            let rgb = self
-                                .render
-                                .node_colors
-                                .entry(kind_name.to_string())
-                                .or_insert([50, 50, 50]);
-                            let mut color = egui::Color32::from_rgb(rgb[0], rgb[1], rgb[2]);
-                            if ui.color_edit_button_srgba(&mut color).changed() {
-                                *rgb = [color.r(), color.g(), color.b()];
-                            }
-                            ui.label(*kind_name);
-                            ui.end_row();
+                            color_swatch_row(ui, &mut self.render.node_colors, kind_name);
                         }
                     });
 
-                    // Edge colors
-                    let eid = ui.make_persistent_id("render_edge_colors");
-                    egui::collapsing_header::CollapsingState::load_with_default_open(
-                        ui.ctx(),
-                        eid,
-                        false,
-                    )
-                    .show_header(ui, |ui| {
-                        ui.label("Edge Colors");
-                    })
-                    .body(|ui| {
-                        for kind_name in &[
-                            "Calls",
-                            "Inherits",
-                            "Contains",
-                            "Overrides",
-                            "ReadsField",
-                            "WritesField",
-                            "Includes",
-                            "Instantiates",
-                            "HasType",
-                        ] {
-                            let rgb = self
-                                .render
-                                .edge_colors
-                                .entry(kind_name.to_string())
-                                .or_insert([128, 128, 128]);
-                            let mut color = egui::Color32::from_rgb(rgb[0], rgb[1], rgb[2]);
-                            if ui.color_edit_button_srgba(&mut color).changed() {
-                                *rgb = [color.r(), color.g(), color.b()];
-                            }
-                            ui.label(*kind_name);
-                            ui.end_row();
+                    // Edge types: toggleable color swatches that also control filtering.
+                    ui.add_space(4.0);
+                    ui.label("Edge Types");
+                    for &kind in &ALL_EDGE_KINDS {
+                        let kind_name = format!("{kind:?}");
+                        let enabled = self.edge_filter.is_enabled(kind);
+                        if edge_toggle_swatch(ui, &mut self.render.edge_colors, &kind_name, enabled)
+                        {
+                            self.edge_filter.toggle(kind);
                         }
-                    });
+                    }
 
                     ui.add_space(4.0);
                     if ui.button("Reset colors").clicked() {
@@ -262,7 +217,7 @@ impl SpaghettiApp {
                     ui.add_space(8.0);
                     ui.label("Per-Edge Kind");
 
-                    for kind in &ACTIVE_EDGE_KINDS {
+                    for kind in &ALL_EDGE_KINDS {
                         let label = format!("{kind:?}");
                         let id = ui.make_persistent_id(format!("edge_kind_{label}"));
                         egui::collapsing_header::CollapsingState::load_with_default_open(
@@ -294,6 +249,24 @@ impl SpaghettiApp {
                         });
                     }
 
+                    ui.add_space(8.0);
+                    ui.label("Location Affinity");
+
+                    let params = self.layout_state.params_mut();
+                    changed |= ui
+                        .add(
+                            egui::Slider::new(&mut params.location_strength, 0.0..=2.0)
+                                .text("Strength"),
+                        )
+                        .changed();
+
+                    changed |= ui
+                        .add(
+                            egui::Slider::new(&mut params.location_falloff, 0.0..=1.0)
+                                .text("Falloff"),
+                        )
+                        .changed();
+
                     ui.add_space(4.0);
                     if ui.button("Reset to defaults").clicked() {
                         *self.layout_state.params_mut() = layout::ForceParams::default();
@@ -306,4 +279,92 @@ impl SpaghettiApp {
                 });
             });
     }
+}
+
+/// Draw a single color swatch row: a wide colored rectangle with the label
+/// inside it, clicking opens a color picker.
+fn color_swatch_row(
+    ui: &mut egui::Ui,
+    colors: &mut std::collections::HashMap<String, crate::settings::Rgb>,
+    name: &str,
+) {
+    let rgb = colors.entry(name.to_string()).or_insert([80, 80, 80]);
+    let mut color = egui::Color32::from_rgb(rgb[0], rgb[1], rgb[2]);
+
+    // Draw a colored button that fills the available width.
+    let available = ui.available_width();
+    let size = egui::vec2(available, 20.0);
+    let (rect, response) = ui.allocate_exact_size(size, egui::Sense::click());
+
+    // Paint the swatch background.
+    ui.painter().rect_filled(rect, 3.0, color);
+
+    // Paint the label text on top.
+    ui.painter().text(
+        rect.center(),
+        egui::Align2::CENTER_CENTER,
+        name,
+        egui::FontId::proportional(12.0),
+        egui::Color32::WHITE,
+    );
+
+    // Open a color popup on click.
+    egui::Popup::from_toggle_button_response(&response).show(|ui: &mut egui::Ui| {
+        ui.set_min_width(200.0);
+        egui::color_picker::color_picker_color32(ui, &mut color, egui::color_picker::Alpha::Opaque);
+        *rgb = [color.r(), color.g(), color.b()];
+    });
+}
+
+/// Draw an edge toggle swatch: a wide colored rectangle with the label inside.
+/// Left-click toggles the edge type on/off. Right-click opens the color picker.
+/// Returns `true` if the toggle state changed.
+fn edge_toggle_swatch(
+    ui: &mut egui::Ui,
+    colors: &mut std::collections::HashMap<String, crate::settings::Rgb>,
+    name: &str,
+    enabled: bool,
+) -> bool {
+    let rgb = colors.entry(name.to_string()).or_insert([80, 80, 80]);
+    let mut color = egui::Color32::from_rgb(rgb[0], rgb[1], rgb[2]);
+
+    let available = ui.available_width();
+    let size = egui::vec2(available, 20.0);
+    let (rect, response) =
+        ui.allocate_exact_size(size, egui::Sense::click().union(egui::Sense::click()));
+
+    // Paint the swatch: full color when enabled, dark grey when disabled.
+    let bg = if enabled {
+        color
+    } else {
+        egui::Color32::from_gray(40)
+    };
+    ui.painter().rect_filled(rect, 3.0, bg);
+
+    // Text color: white when enabled, dim grey when disabled.
+    let text_color = if enabled {
+        egui::Color32::WHITE
+    } else {
+        egui::Color32::from_gray(120)
+    };
+    ui.painter().text(
+        rect.center(),
+        egui::Align2::CENTER_CENTER,
+        name,
+        egui::FontId::proportional(12.0),
+        text_color,
+    );
+
+    // Right-click opens color picker via context menu.
+    response
+        .clone()
+        .on_hover_text("Click: toggle, Right-click: color");
+    response.context_menu(|ui: &mut egui::Ui| {
+        ui.set_min_width(200.0);
+        egui::color_picker::color_picker_color32(ui, &mut color, egui::color_picker::Alpha::Opaque);
+        *rgb = [color.r(), color.g(), color.b()];
+    });
+
+    // Left-click toggles.
+    response.clicked()
 }

@@ -109,16 +109,13 @@ impl SpaghettiApp {
             let draw_labels = !circle_mode && self.camera.zoom >= 0.4;
             let draw_rects = !circle_mode && self.camera.zoom >= 0.15;
 
-            // When hiding externals, skip edges touching external symbols.
-            let hide_ext = self.hide_externals;
-
             // Draw edges (skip if both endpoints are outside the viewport)
             for edge in &self.graph.edges {
                 if !active_kinds.contains(&edge.kind) {
                     continue;
                 }
-                if hide_ext
-                    && (self.graph.is_external(edge.from) || self.graph.is_external(edge.to))
+                if self.hidden_symbols.contains(&edge.from)
+                    || self.hidden_symbols.contains(&edge.to)
                 {
                     continue;
                 }
@@ -153,8 +150,7 @@ impl SpaghettiApp {
                 NODE_HEIGHT * self.camera.zoom,
             );
             for (id, sym) in &self.graph.symbols {
-                // Skip external symbols when filter is active.
-                if hide_ext && self.graph.is_external(*id) {
+                if self.hidden_symbols.contains(id) {
                     continue;
                 }
                 if let Some(&world_pos) = self.positions.0.get(id) {

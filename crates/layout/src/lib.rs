@@ -12,7 +12,7 @@ use glam::Vec2;
 use indexmap::IndexMap;
 use rayon::prelude::*;
 use serde::{Deserialize, Serialize};
-use std::collections::{HashMap, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::time::{Duration, Instant};
 
 /// Mapping from symbol IDs to 2D positions.
@@ -61,6 +61,22 @@ pub struct ForceParams {
     pub gravity: f32,
     /// Per-edge-kind overrides for attraction and target distance.
     pub edge_params: HashMap<EdgeKind, EdgeKindParams>,
+    /// Strength of the location-affinity force that attracts nodes sharing
+    /// filesystem directories. `0.0` disables the force.
+    #[serde(default = "default_location_strength")]
+    pub location_strength: f32,
+    /// Per-depth-level decay for the location force. A value of `0.5` means
+    /// parent-directory attraction is half of same-directory attraction.
+    #[serde(default = "default_location_falloff")]
+    pub location_falloff: f32,
+}
+
+fn default_location_strength() -> f32 {
+    0.3
+}
+
+fn default_location_falloff() -> f32 {
+    0.5
 }
 
 impl Default for ForceParams {
@@ -105,6 +121,8 @@ impl Default for ForceParams {
             repulsion_cutoff: 500.0,
             gravity: 0.5,
             edge_params,
+            location_strength: default_location_strength(),
+            location_falloff: default_location_falloff(),
         }
     }
 }
@@ -124,8 +142,19 @@ pub struct LayoutState {
     id_to_idx: IndexMap<SymbolId, usize>,
     pins: IndexMap<SymbolId, Vec2>,
     params: ForceParams,
+    /// Per-node edge degree (number of edges touching this node).
+    /// Used to normalize spring forces on high-degree hubs.
+    degrees: Vec<f32>,
     /// Total steps run so far, used for adaptive cooling.
     total_steps: u32,
+    /// Node indices that are hidden (excluded from all force computation).
+    hidden: HashSet<usize>,
+    /// Hierarchical directory groups for the location-affinity force.
+    /// `dir_groups[depth][group_idx]` is a list of node indices sharing
+    /// the same directory prefix at that depth.
+    dir_groups: Vec<Vec<Vec<usize>>>,
+    /// Maximum directory depth across all nodes (cached for force scaling).
+    max_dir_depth: usize,
 }
 
 impl LayoutState {
@@ -176,6 +205,17 @@ impl LayoutState {
 
         let velocities = vec![Vec2::ZERO; n];
 
+        // Precompute per-node degree for force normalization.
+        let mut degrees = vec![1.0f32; n];
+        for &(from, to, _) in &edge_pairs {
+            degrees[from] += 1.0;
+            degrees[to] += 1.0;
+        }
+
+        // Build hierarchical directory groups from symbol file locations.
+        let dir_groups = build_dir_groups(graph, &ids, &id_to_idx);
+        let max_dir_depth = dir_groups.len().saturating_sub(1);
+
         Self {
             ids,
             positions,
@@ -185,7 +225,11 @@ impl LayoutState {
             id_to_idx,
             pins: IndexMap::new(),
             params,
+            degrees,
             total_steps: 0,
+            hidden: HashSet::new(),
+            dir_groups,
+            max_dir_depth,
         }
     }
 
@@ -237,7 +281,7 @@ impl LayoutState {
             let repulsion = p.repulsion;
             let min_dist = p.min_dist;
 
-            // Build spatial grid: assign each node to a cell.
+            // Build spatial grid: assign each node to a cell (skip hidden).
             let cell_keys: Vec<(i32, i32)> = self
                 .positions
                 .iter()
@@ -250,7 +294,9 @@ impl LayoutState {
 
             let mut grid: HashMap<(i32, i32), Vec<usize>> = HashMap::with_capacity(len / 4 + 1);
             for (i, &key) in cell_keys.iter().enumerate() {
-                grid.entry(key).or_default().push(i);
+                if !self.hidden.contains(&i) {
+                    grid.entry(key).or_default().push(i);
+                }
             }
 
             // Compute repulsive forces per-node in parallel.
@@ -259,10 +305,14 @@ impl LayoutState {
             let positions_ref = &self.positions;
             let grid_ref = &grid;
 
+            let hidden_ref = &self.hidden;
             let repulsive_forces: Vec<Vec2> = if len >= PARALLEL_THRESHOLD {
                 (0..len)
                     .into_par_iter()
                     .map(|i| {
+                        if hidden_ref.contains(&i) {
+                            return Vec2::ZERO;
+                        }
                         compute_repulsion_for_node(
                             i,
                             positions_ref,
@@ -278,6 +328,9 @@ impl LayoutState {
             } else {
                 (0..len)
                     .map(|i| {
+                        if hidden_ref.contains(&i) {
+                            return Vec2::ZERO;
+                        }
                         compute_repulsion_for_node(
                             i,
                             positions_ref,
@@ -294,9 +347,16 @@ impl LayoutState {
 
             let mut forces = repulsive_forces;
 
-            // Attractive forces along visible edges only (per-edge-kind params)
+            // Attractive forces along visible edges only (per-edge-kind params).
+            //
+            // Linear spring, but each endpoint's force is divided by
+            // sqrt(degree) so hub nodes (many connections) don't get
+            // yanked across the canvas by the sum of all their edges.
             for &(from, to, kind) in &self.edge_pairs {
                 if !self.visible_edge_kinds.contains(&kind) {
+                    continue;
+                }
+                if self.hidden.contains(&from) || self.hidden.contains(&to) {
                     continue;
                 }
                 let (attr, rest_len) = if let Some(ep) = p.edge_params.get(&kind) {
@@ -306,16 +366,73 @@ impl LayoutState {
                 };
                 let delta = self.positions[to] - self.positions[from];
                 let dist = delta.length().max(p.min_dist);
-                let force = delta.normalize_or_zero() * attr * (dist - rest_len);
-                forces[from] += force;
-                forces[to] -= force;
+                let displacement = attr * (dist - rest_len);
+                let dir = delta.normalize_or_zero();
+                // Scale by 1/sqrt(degree) at each endpoint so hubs stay calm.
+                forces[from] += dir * displacement / self.degrees[from].sqrt();
+                forces[to] -= dir * displacement / self.degrees[to].sqrt();
             }
 
-            // Gravity: gentle pull toward the centroid
+            // Location-affinity force: pull nodes toward their directory
+            // group centroids at each depth level.
+            if p.location_strength > 0.0 && !self.dir_groups.is_empty() {
+                let max_d = self.max_dir_depth;
+                for (depth, groups_at_depth) in self.dir_groups.iter().enumerate() {
+                    // Deeper = more specific = stronger. Scale so the deepest
+                    // level gets full strength and shallower levels decay.
+                    let level_scale = if max_d > 0 {
+                        p.location_falloff.powi((max_d - depth) as i32)
+                    } else {
+                        1.0
+                    };
+                    let strength = p.location_strength * level_scale;
+                    if strength < 1e-6 {
+                        continue;
+                    }
+
+                    for group in groups_at_depth {
+                        // Compute centroid of visible nodes in this group.
+                        let mut centroid = Vec2::ZERO;
+                        let mut count = 0u32;
+                        for &idx in group {
+                            if !self.hidden.contains(&idx) {
+                                centroid += self.positions[idx];
+                                count += 1;
+                            }
+                        }
+                        if count < 2 {
+                            continue;
+                        }
+                        centroid /= count as f32;
+
+                        for &idx in group {
+                            if !self.hidden.contains(&idx) {
+                                forces[idx] += (centroid - self.positions[idx]) * strength;
+                            }
+                        }
+                    }
+                }
+            }
+
+            // Gravity: gentle pull toward the centroid (skip hidden)
             if p.gravity > 0.0 {
-                let centroid = self.positions.iter().copied().sum::<Vec2>() / len as f32;
-                for (force, pos) in forces.iter_mut().zip(self.positions.iter()) {
-                    *force += (centroid - *pos) * p.gravity;
+                let mut centroid = Vec2::ZERO;
+                let mut visible_count = 0u32;
+                for (i, pos) in self.positions.iter().enumerate() {
+                    if !self.hidden.contains(&i) {
+                        centroid += *pos;
+                        visible_count += 1;
+                    }
+                }
+                if visible_count > 0 {
+                    centroid /= visible_count as f32;
+                    for (i, (force, pos)) in
+                        forces.iter_mut().zip(self.positions.iter()).enumerate()
+                    {
+                        if !self.hidden.contains(&i) {
+                            *force += (centroid - *pos) * p.gravity;
+                        }
+                    }
                 }
             }
 
@@ -326,21 +443,24 @@ impl LayoutState {
             let max_vel = p.max_velocity * cooling;
             self.total_steps += 1;
 
-            // Update velocities and positions (skip pinned nodes)
-            let iter = self
+            // Update velocities and positions (skip pinned and hidden nodes)
+            for (i, (((id, pos), vel), force)) in self
                 .ids
                 .iter()
                 .zip(self.positions.iter_mut())
                 .zip(self.velocities.iter_mut())
-                .zip(forces.iter());
-            for (((id, pos), vel), force) in iter {
+                .zip(forces.iter())
+                .enumerate()
+            {
+                if self.hidden.contains(&i) {
+                    *vel = Vec2::ZERO;
+                    continue;
+                }
                 if let Some(&pin_pos) = self.pins.get(id) {
-                    // Pinned: snap to pin position, zero velocity.
                     *pos = pin_pos;
                     *vel = Vec2::ZERO;
                 } else {
                     *vel = (*vel + *force) * effective_damping;
-                    // Clamp velocity to prevent overshooting.
                     let speed = vel.length();
                     if speed > max_vel {
                         *vel *= max_vel / speed;
@@ -428,6 +548,21 @@ impl LayoutState {
     pub fn reheat(&mut self) {
         self.total_steps = self.total_steps.saturating_sub(100);
     }
+
+    /// Set which symbols are hidden from the simulation.
+    ///
+    /// Hidden nodes are excluded from all force computations (repulsion,
+    /// attraction, gravity, location affinity) and their positions/velocities
+    /// are not updated. They still occupy their slot so indices remain stable.
+    pub fn set_hidden(&mut self, ids: &[SymbolId]) {
+        self.hidden.clear();
+        for id in ids {
+            if let Some(&idx) = self.id_to_idx.get(id) {
+                self.hidden.insert(idx);
+            }
+        }
+        self.reheat();
+    }
 }
 
 /// Compute repulsive force on node `i` from its 3×3 grid neighbourhood.
@@ -472,6 +607,74 @@ fn compute_repulsion_for_node(
         }
     }
     force
+}
+
+/// Build hierarchical directory groups from the graph's file table.
+///
+/// Returns `dir_groups[depth][group_idx]` = list of node indices sharing
+/// the same directory prefix at that depth. For example, if nodes A and B
+/// are in `src/shapes/` and node C is in `src/util/`, then at depth 0
+/// (`src`) all three are grouped, and at depth 1 A,B are in one group
+/// and C in another.
+fn build_dir_groups(
+    graph: &Graph,
+    ids: &[SymbolId],
+    id_to_idx: &IndexMap<SymbolId, usize>,
+) -> Vec<Vec<Vec<usize>>> {
+    // For each node, extract directory path components.
+    let mut node_dir_components: Vec<Option<Vec<String>>> = vec![None; ids.len()];
+    let mut max_depth: usize = 0;
+
+    for (id, sym) in &graph.symbols {
+        let Some(&idx) = id_to_idx.get(id) else {
+            continue;
+        };
+        let Some(loc) = &sym.location else {
+            continue;
+        };
+        let Some(path_str) = graph.files.resolve(loc.file) else {
+            continue;
+        };
+        // Skip external (absolute) paths.
+        if path_str.starts_with('/') {
+            continue;
+        }
+        let path = std::path::Path::new(path_str);
+        let components: Vec<String> = path
+            .parent()
+            .unwrap_or(std::path::Path::new(""))
+            .components()
+            .map(|c| c.as_os_str().to_string_lossy().into_owned())
+            .collect();
+        if !components.is_empty() {
+            max_depth = max_depth.max(components.len());
+            node_dir_components[idx] = Some(components);
+        }
+    }
+
+    if max_depth == 0 {
+        return Vec::new();
+    }
+
+    // Build groups at each depth level.
+    let mut dir_groups: Vec<Vec<Vec<usize>>> = Vec::with_capacity(max_depth);
+
+    for depth in 0..max_depth {
+        let mut groups_map: HashMap<Vec<&str>, Vec<usize>> = HashMap::new();
+        for (idx, comps) in node_dir_components.iter().enumerate() {
+            if let Some(comps) = comps {
+                if comps.len() > depth {
+                    let prefix: Vec<&str> = comps[..=depth].iter().map(|s| s.as_str()).collect();
+                    groups_map.entry(prefix).or_default().push(idx);
+                }
+            }
+        }
+        // Only keep groups with 2+ members (singletons don't need forces).
+        let groups: Vec<Vec<usize>> = groups_map.into_values().filter(|g| g.len() >= 2).collect();
+        dir_groups.push(groups);
+    }
+
+    dir_groups
 }
 
 /// Force-directed layout with grid-based repulsion approximation.

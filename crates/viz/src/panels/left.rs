@@ -1,13 +1,13 @@
-//! Left panel: search bar, edge filters, and symbol list.
+//! Left panel: search bar, edge filters, and file tree.
 
 use crate::app::SpaghettiApp;
-use crate::widgets::toggle_button;
+use crate::file_tree::{self, DirNode, FileNode};
 
 impl SpaghettiApp {
-    /// Draw the left panel: search, filters, symbol list.
+    /// Draw the left panel: search, filters, file tree.
     pub(crate) fn left_panel(&mut self, ui: &mut egui::Ui) {
         egui::Panel::left("left_panel")
-            .default_size(220.0)
+            .default_size(260.0)
             .show_inside(ui, |ui| {
                 ui.heading("spaghetti");
                 ui.label(format!(
@@ -22,56 +22,148 @@ impl SpaghettiApp {
                 ui.text_edit_singleline(&mut self.search);
                 ui.separator();
 
-                // Edge filters
-                ui.label("Edge Filters:");
-                toggle_button(ui, &mut self.edge_filter.calls, "Calls");
-                toggle_button(ui, &mut self.edge_filter.inherits, "Inherits");
-                toggle_button(ui, &mut self.edge_filter.contains, "Contains");
-                toggle_button(ui, &mut self.edge_filter.overrides, "Overrides");
-                ui.separator();
-
-                // Visibility filter
-                toggle_button(ui, &mut self.hide_externals, "Hide external/stdlib");
-                ui.separator();
-
-                // Symbol list
-                ui.label("Symbols:");
-                let search_lower = self.search.to_lowercase();
-                let hide_ext = self.hide_externals;
-                let files = &self.graph.files;
-                let matches: Vec<_> = self
-                    .graph
-                    .symbols
-                    .values()
-                    .filter(|s| {
-                        // Filter external symbols when checkbox is on.
-                        if hide_ext {
-                            let is_ext = match &s.location {
-                                Some(loc) => {
-                                    let path = files.resolve(loc.file).unwrap_or("");
-                                    path.starts_with('/')
-                                }
-                                None => true,
-                            };
-                            if is_ext {
-                                return false;
-                            }
-                        }
-                        search_lower.is_empty()
-                            || s.name.to_lowercase().contains(&search_lower)
-                            || s.qualified_name.to_lowercase().contains(&search_lower)
-                    })
-                    .collect();
+                // File tree
+                ui.label("Files:");
+                let mut visibility_changed = false;
 
                 egui::ScrollArea::vertical().show(ui, |ui| {
-                    for sym in matches {
-                        let label = format!("{:?} {}", sym.kind, sym.qualified_name);
-                        let selected = self.selection == Some(sym.id);
-                        if ui.selectable_label(selected, &label).clicked() {
-                            self.selection = Some(sym.id);
-                        }
+                    let search_lower = self.search.to_lowercase();
+                    let search = if search_lower.is_empty() {
+                        None
+                    } else {
+                        Some(search_lower.as_str())
+                    };
+
+                    // Root-level directories
+                    for dir in &mut self.file_tree.roots {
+                        visibility_changed |= draw_dir_node(ui, dir, &mut self.selection, search);
+                    }
+
+                    // Root-level files
+                    for file in &self.file_tree.root_files {
+                        draw_file_node(ui, file, &mut self.selection, search);
+                    }
+
+                    // External symbols (collapsed, with visibility toggle)
+                    if !self.file_tree.external_symbols.is_empty() {
+                        let ext_count = self.file_tree.external_symbols.len();
+                        let id = ui.make_persistent_id("_externals");
+                        egui::collapsing_header::CollapsingState::load_with_default_open(
+                            ui.ctx(),
+                            id,
+                            false,
+                        )
+                        .show_header(ui, |ui| {
+                            if ui
+                                .checkbox(&mut self.file_tree.externals_visible, "")
+                                .changed()
+                            {
+                                visibility_changed = true;
+                            }
+                            ui.label(format!("<external> ({ext_count} symbols)"));
+                        })
+                        .body(|ui| {
+                            for &(sym_id, kind, ref name) in &self.file_tree.external_symbols {
+                                if let Some(search) = search {
+                                    if !name.to_lowercase().contains(search) {
+                                        continue;
+                                    }
+                                }
+                                let label = format!("{kind:?} {name}");
+                                let selected = self.selection == Some(sym_id);
+                                if ui.selectable_label(selected, &label).clicked() {
+                                    self.selection = Some(sym_id);
+                                }
+                            }
+                        });
                     }
                 });
+
+                // If visibility changed, recompute hidden set and push to layout.
+                if visibility_changed {
+                    self.hidden_symbols = self.file_tree.hidden_symbols();
+                    let hidden_vec: Vec<_> = self.hidden_symbols.iter().copied().collect();
+                    self.layout_state.set_hidden(&hidden_vec);
+                }
             });
     }
+}
+
+/// Draw a directory node with a visibility toggle and collapsible children.
+/// Returns `true` if visibility was toggled.
+fn draw_dir_node(
+    ui: &mut egui::Ui,
+    dir: &mut DirNode,
+    selection: &mut Option<core_ir::SymbolId>,
+    search: Option<&str>,
+) -> bool {
+    let mut changed = false;
+
+    let id = ui.make_persistent_id(format!("dir_{}", dir.name));
+    egui::collapsing_header::CollapsingState::load_with_default_open(ui.ctx(), id, false)
+        .show_header(ui, |ui| {
+            if ui.checkbox(&mut dir.visible, "").changed() {
+                // Propagate visibility to all children.
+                set_visibility_recursive(dir, dir.visible);
+                changed = true;
+            }
+            let total = count_symbols_in_dir(dir);
+            ui.label(format!("{}/  ({total} symbols)", dir.name));
+        })
+        .body(|ui| {
+            for child_dir in &mut dir.children_dirs {
+                changed |= draw_dir_node(ui, child_dir, selection, search);
+            }
+            for file in &dir.files {
+                draw_file_node(ui, file, selection, search);
+            }
+        });
+
+    changed
+}
+
+/// Draw a file node as a collapsible header with symbol summary.
+fn draw_file_node(
+    ui: &mut egui::Ui,
+    file: &FileNode,
+    selection: &mut Option<core_ir::SymbolId>,
+    search: Option<&str>,
+) {
+    let summary = file_tree::file_summary(file);
+    let id = ui.make_persistent_id(format!("file_{}", file.name));
+    egui::collapsing_header::CollapsingState::load_with_default_open(ui.ctx(), id, false)
+        .show_header(ui, |ui| {
+            ui.label(&summary);
+        })
+        .body(|ui| {
+            for &(sym_id, kind, ref name) in &file.symbols {
+                if let Some(search) = search {
+                    if !name.to_lowercase().contains(search) {
+                        continue;
+                    }
+                }
+                let label = format!("{kind:?} {name}");
+                let selected = *selection == Some(sym_id);
+                if ui.selectable_label(selected, &label).clicked() {
+                    *selection = Some(sym_id);
+                }
+            }
+        });
+}
+
+/// Recursively set visibility on all subdirectories.
+fn set_visibility_recursive(dir: &mut DirNode, visible: bool) {
+    dir.visible = visible;
+    for child in &mut dir.children_dirs {
+        set_visibility_recursive(child, visible);
+    }
+}
+
+/// Count total symbols under a directory (recursively).
+fn count_symbols_in_dir(dir: &DirNode) -> usize {
+    let mut count: usize = dir.files.iter().map(|f| f.symbols.len()).sum();
+    for child in &dir.children_dirs {
+        count += count_symbols_in_dir(child);
+    }
+    count
 }

@@ -1,53 +1,100 @@
 //! The main eframe application for spaghetti.
 
+use std::collections::HashSet;
 use std::path::PathBuf;
 use std::sync::mpsc::{Receiver, Sender};
 use std::sync::{Arc, Mutex};
+
+use std::collections::HashMap;
 
 use core_ir::{EdgeKind, Graph, SymbolId};
 use layout::{LayoutState, Positions};
 use tracing::Level;
 
+use crate::file_tree::FileTree;
+
 use crate::camera::{self, Camera2D};
 use crate::fps::FpsCounter;
 use crate::log_capture::LogBuffer;
 use crate::progress::{ProgressMessage, ProgressState};
+use crate::settings::ViewSettings;
 
-/// Edge kind filter state.
+/// All edge kinds in the system.
+pub(crate) const ALL_EDGE_KINDS: [EdgeKind; 9] = [
+    EdgeKind::Calls,
+    EdgeKind::Inherits,
+    EdgeKind::Contains,
+    EdgeKind::Overrides,
+    EdgeKind::ReadsField,
+    EdgeKind::WritesField,
+    EdgeKind::Includes,
+    EdgeKind::Instantiates,
+    EdgeKind::HasType,
+];
+
+/// Edge kind filter state — tracks which edge kinds are visible.
 pub(crate) struct EdgeKindFilter {
-    pub calls: bool,
-    pub inherits: bool,
-    pub contains: bool,
-    pub overrides: bool,
+    enabled: HashSet<EdgeKind>,
 }
 
 impl Default for EdgeKindFilter {
     fn default() -> Self {
         Self {
-            calls: true,
-            inherits: true,
-            contains: true,
-            overrides: true,
+            enabled: ALL_EDGE_KINDS.iter().copied().collect(),
         }
     }
 }
 
 impl EdgeKindFilter {
+    /// Restore from saved edge filter map. Missing keys default to enabled.
+    pub(crate) fn from_saved(saved: &HashMap<String, bool>) -> Self {
+        let mut enabled = HashSet::new();
+        for &kind in &ALL_EDGE_KINDS {
+            let key = format!("{kind:?}");
+            let is_enabled = saved.get(&key).copied().unwrap_or(true);
+            if is_enabled {
+                enabled.insert(kind);
+            }
+        }
+        Self { enabled }
+    }
+
+    /// Export current state as a string-keyed map for serialization.
+    pub(crate) fn to_saved(&self) -> HashMap<String, bool> {
+        ALL_EDGE_KINDS
+            .iter()
+            .map(|&kind| (format!("{kind:?}"), self.enabled.contains(&kind)))
+            .collect()
+    }
+
+    /// Returns the list of currently active edge kinds.
     pub(crate) fn active_kinds(&self) -> Vec<EdgeKind> {
-        let mut kinds = Vec::new();
-        if self.calls {
-            kinds.push(EdgeKind::Calls);
+        self.enabled.iter().copied().collect()
+    }
+
+    /// Check whether a specific edge kind is enabled.
+    pub(crate) fn is_enabled(&self, kind: EdgeKind) -> bool {
+        self.enabled.contains(&kind)
+    }
+
+    /// Toggle a specific edge kind on or off.
+    pub(crate) fn toggle(&mut self, kind: EdgeKind) {
+        if self.enabled.contains(&kind) {
+            self.enabled.remove(&kind);
+        } else {
+            self.enabled.insert(kind);
         }
-        if self.inherits {
-            kinds.push(EdgeKind::Inherits);
-        }
-        if self.contains {
-            kinds.push(EdgeKind::Contains);
-        }
-        if self.overrides {
-            kinds.push(EdgeKind::Overrides);
-        }
-        kinds
+    }
+}
+
+/// Parse a tracing level from a string, defaulting to INFO.
+fn level_from_str(s: &str) -> Level {
+    match s {
+        "ERROR" => Level::ERROR,
+        "WARN" => Level::WARN,
+        "DEBUG" => Level::DEBUG,
+        "TRACE" => Level::TRACE,
+        _ => Level::INFO,
     }
 }
 
@@ -73,8 +120,10 @@ pub struct SpaghettiApp {
     pub(crate) auto_fitted: bool,
     /// Frame counter used to trigger auto-fit after a timeout.
     pub(crate) frame_count: u32,
-    /// When true, symbols without a location (external/stdlib) are hidden.
-    pub(crate) hide_externals: bool,
+    /// File/directory tree built from symbol locations.
+    pub(crate) file_tree: FileTree,
+    /// Symbols currently hidden by file-tree visibility toggles.
+    pub(crate) hidden_symbols: HashSet<SymbolId>,
 
     // -- Rendering settings (persisted) --
     pub(crate) render: crate::settings::RenderSettings,
@@ -104,33 +153,60 @@ impl SpaghettiApp {
     /// incrementally each frame.
     pub fn new(
         graph: Graph,
-        layout_state: LayoutState,
+        mut layout_state: LayoutState,
         log_buffer: Arc<Mutex<LogBuffer>>,
         render: crate::settings::RenderSettings,
+        view: ViewSettings,
     ) -> Self {
         let positions = layout_state.positions();
+        let mut file_tree = FileTree::from_graph(&graph);
+        // Apply saved directory visibility (gracefully ignores stale paths).
+        file_tree.apply_visibility(&view.dir_visibility);
+        let hidden_symbols = file_tree.hidden_symbols();
+        // Push initial hidden set to the layout engine.
+        let hidden_vec: Vec<_> = hidden_symbols.iter().copied().collect();
+        layout_state.set_hidden(&hidden_vec);
+
+        let camera = Camera2D {
+            offset: egui::Vec2::new(view.camera_offset[0], view.camera_offset[1]),
+            zoom: view.camera_zoom,
+        };
+
         Self {
             graph,
             positions,
             layout_state,
-            camera: Camera2D::default(),
+            camera,
             selection: None,
-            edge_filter: EdgeKindFilter::default(),
+            edge_filter: EdgeKindFilter::from_saved(&view.edge_filters),
             search: String::new(),
             dragging: None,
             auto_fitted: false,
             frame_count: 0,
-            hide_externals: false,
+            file_tree,
+            hidden_symbols,
             render,
-            show_console: false,
+            show_console: view.show_console,
             indexing: false,
             log_buffer,
-            console_level_filter: Level::INFO,
+            console_level_filter: level_from_str(&view.console_level),
             progress_state: None,
             progress_rx: None,
             cancel_tx: None,
             pending_file_dialog: None,
             fps: FpsCounter::new(60),
+        }
+    }
+
+    /// Snapshot the current view state for serialization.
+    pub(crate) fn view_settings(&self) -> ViewSettings {
+        ViewSettings {
+            edge_filters: self.edge_filter.to_saved(),
+            camera_offset: [self.camera.offset.x, self.camera.offset.y],
+            camera_zoom: self.camera.zoom,
+            show_console: self.show_console,
+            console_level: format!("{}", self.console_level_filter),
+            dir_visibility: self.file_tree.visibility_map(),
         }
     }
 
@@ -143,6 +219,7 @@ impl SpaghettiApp {
             layout_state,
             log_buffer,
             crate::settings::RenderSettings::default(),
+            ViewSettings::default(),
         )
     }
 
@@ -287,8 +364,12 @@ impl SpaghettiApp {
                     graph,
                     layout_state,
                 } => {
+                    self.file_tree = FileTree::from_graph(&graph);
+                    self.hidden_symbols = self.file_tree.hidden_symbols();
                     self.graph = *graph;
                     self.layout_state = *layout_state;
+                    let hidden_vec: Vec<_> = self.hidden_symbols.iter().copied().collect();
+                    self.layout_state.set_hidden(&hidden_vec);
                     self.positions = self.layout_state.positions();
                     self.selection = None;
                     self.camera = Camera2D::default();
@@ -412,6 +493,7 @@ impl eframe::App for SpaghettiApp {
         let settings = crate::settings::AppSettings {
             force_params: self.layout_state.params().clone(),
             render: self.render.clone(),
+            view: self.view_settings(),
         };
         settings.save();
     }

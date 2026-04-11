@@ -14,6 +14,59 @@ pub struct AppSettings {
     /// Rendering parameters (colors, circle mode, etc.).
     #[serde(default)]
     pub render: RenderSettings,
+    /// View state (edge filters, camera, console, file tree visibility).
+    #[serde(default)]
+    pub view: ViewSettings,
+}
+
+/// Persisted view settings — UI state that should survive across sessions.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ViewSettings {
+    /// Edge filter toggles keyed by `EdgeKind` debug name.
+    /// Missing keys default to enabled.
+    #[serde(default = "default_edge_filters")]
+    pub edge_filters: HashMap<String, bool>,
+    /// Camera pan offset `[x, y]`.
+    #[serde(default)]
+    pub camera_offset: [f32; 2],
+    /// Camera zoom level.
+    #[serde(default = "default_zoom")]
+    pub camera_zoom: f32,
+    /// Whether the console panel is visible.
+    #[serde(default)]
+    pub show_console: bool,
+    /// Console log level filter (stored as string for forward compat).
+    #[serde(default = "default_console_level")]
+    pub console_level: String,
+    /// File-tree directory visibility overrides keyed by full directory path
+    /// (e.g. `"shapes"`, `"shapes/internals"`). Missing keys default to visible.
+    #[serde(default)]
+    pub dir_visibility: HashMap<String, bool>,
+}
+
+fn default_edge_filters() -> HashMap<String, bool> {
+    HashMap::new() // empty = all enabled (missing keys default to true)
+}
+
+fn default_zoom() -> f32 {
+    1.0
+}
+
+fn default_console_level() -> String {
+    "INFO".into()
+}
+
+impl Default for ViewSettings {
+    fn default() -> Self {
+        Self {
+            edge_filters: default_edge_filters(),
+            camera_offset: [0.0, 0.0],
+            camera_zoom: default_zoom(),
+            show_console: false,
+            console_level: default_console_level(),
+            dir_visibility: HashMap::new(),
+        }
+    }
 }
 
 /// An RGB color stored as `[r, g, b]` for serde compatibility.
