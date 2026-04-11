@@ -81,10 +81,22 @@ impl SpaghettiApp {
 
                 // If visibility changed, recompute hidden set and push to layout.
                 if visibility_changed {
-                    self.hidden_symbols = self.file_tree.hidden_symbols();
-                    let hidden_vec: Vec<_> = self.hidden_symbols.iter().copied().collect();
-                    self.layout_state.set_hidden(&hidden_vec);
+                    self.sync_hidden_symbols();
                 }
+
+                ui.separator();
+
+                // Collapse / Expand All buttons
+                ui.horizontal(|ui| {
+                    if ui.button("Collapse All").clicked() {
+                        self.layout_state.collapse_all();
+                        self.sync_hidden_symbols();
+                    }
+                    if ui.button("Expand All").clicked() {
+                        self.layout_state.expand_all();
+                        self.sync_hidden_symbols();
+                    }
+                });
             });
     }
 }

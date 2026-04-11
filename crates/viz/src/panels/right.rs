@@ -34,6 +34,26 @@ impl SpaghettiApp {
                                 ui.label(format!("Attrs: {:?}", sym.attrs));
                             }
 
+                            // Collapse/Expand button for container nodes.
+                            if self.layout_state.is_container(sel_id) {
+                                ui.separator();
+                                let children = self.layout_state.children_of(sel_id);
+                                let n = children.len();
+                                if self.layout_state.is_expanded(sel_id) {
+                                    ui.label(format!("Children: {n} (expanded)"));
+                                    if ui.button("Collapse").clicked() {
+                                        self.layout_state.collapse(sel_id);
+                                        self.sync_hidden_symbols();
+                                    }
+                                } else {
+                                    ui.label(format!("Children: {n} (collapsed)"));
+                                    if ui.button("Expand").clicked() {
+                                        self.layout_state.expand(sel_id);
+                                        self.sync_hidden_symbols();
+                                    }
+                                }
+                            }
+
                             // -- Edge summary by type --
                             ui.separator();
                             ui.heading("Connections");
@@ -248,6 +268,17 @@ impl SpaghettiApp {
                             }
                         });
                     }
+
+                    ui.add_space(8.0);
+                    ui.label("Containment");
+
+                    let params = self.layout_state.params_mut();
+                    changed |= ui
+                        .add(
+                            egui::Slider::new(&mut params.containment_strength, 0.0..=0.2)
+                                .text("Strength"),
+                        )
+                        .changed();
 
                     ui.add_space(8.0);
                     ui.label("Location Affinity");
