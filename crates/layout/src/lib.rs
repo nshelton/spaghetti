@@ -548,9 +548,10 @@ fn pack_components(positions: &mut IndexMap<SymbolId, Vec2>, graph: &Graph) {
         let offset_y = -bbox.min.y; // Align top edges at y=0
 
         for &id in comp {
-            let p = positions.get_mut(&id).expect("symbol in component");
-            p.x += offset_x;
-            p.y += offset_y;
+            if let Some(p) = positions.get_mut(&id) {
+                p.x += offset_x;
+                p.y += offset_y;
+            }
         }
 
         bbox.min.x += offset_x;
@@ -589,14 +590,18 @@ fn find_components(positions: &IndexMap<SymbolId, Vec2>, graph: &Graph) -> Vec<V
         let mut component = Vec::new();
         let mut queue = VecDeque::new();
         queue.push_back(id);
-        *visited.get_mut(&id).expect("visited entry") = true;
+        if let Some(v) = visited.get_mut(&id) {
+            *v = true;
+        }
 
         while let Some(current) = queue.pop_front() {
             component.push(current);
             if let Some(neighbors) = adj.get(&current) {
                 for &neighbor in neighbors {
                     if !visited[&neighbor] {
-                        *visited.get_mut(&neighbor).expect("visited entry") = true;
+                        if let Some(v) = visited.get_mut(&neighbor) {
+                            *v = true;
+                        }
                         queue.push_back(neighbor);
                     }
                 }

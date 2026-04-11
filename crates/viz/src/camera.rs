@@ -107,8 +107,8 @@ impl Camera2D {
 /// Identify which node (if any) is under `pointer_screen`.
 ///
 /// This is a **pure function** — it has no GUI dependencies beyond the position types.
-/// Node bounding boxes are axis-aligned rectangles of `NODE_WIDTH × NODE_HEIGHT` in world
-/// space.
+/// When `hit_radius` is `Some(r)`, nodes are treated as circles of radius `r` in
+/// world space. Otherwise the default `NODE_WIDTH × NODE_HEIGHT` rectangle is used.
 ///
 /// Returns `None` when `pointer_screen` is `None` or no node is hit.
 pub fn hit_test(
@@ -116,16 +116,27 @@ pub fn hit_test(
     positions: &Positions,
     pointer_screen: Option<egui::Pos2>,
     canvas_center: egui::Pos2,
+    hit_radius: Option<f32>,
 ) -> Option<SymbolId> {
     let pointer = pointer_screen?;
     let world = camera.screen_to_world(pointer, canvas_center);
 
-    let half_w = NODE_WIDTH / 2.0;
-    let half_h = NODE_HEIGHT / 2.0;
-
-    for (id, pos) in &positions.0 {
-        if (world.x - pos.x).abs() < half_w && (world.y - pos.y).abs() < half_h {
-            return Some(*id);
+    if let Some(r) = hit_radius {
+        let r_sq = r * r;
+        for (id, pos) in &positions.0 {
+            let dx = world.x - pos.x;
+            let dy = world.y - pos.y;
+            if dx * dx + dy * dy < r_sq {
+                return Some(*id);
+            }
+        }
+    } else {
+        let half_w = NODE_WIDTH / 2.0;
+        let half_h = NODE_HEIGHT / 2.0;
+        for (id, pos) in &positions.0 {
+            if (world.x - pos.x).abs() < half_w && (world.y - pos.y).abs() < half_h {
+                return Some(*id);
+            }
         }
     }
     None
@@ -202,7 +213,7 @@ mod tests {
         let positions = Positions(map);
 
         let screen = cam.world_to_screen(node_world, center());
-        let result = hit_test(&cam, &positions, Some(screen), center());
+        let result = hit_test(&cam, &positions, Some(screen), center(), None);
         assert_eq!(result, Some(id));
     }
 
@@ -219,7 +230,7 @@ mod tests {
 
         // Place pointer well outside node bounds (200 units away in world space)
         let far = cam.world_to_screen(GVec2::new(300.0, 50.0), center());
-        let result = hit_test(&cam, &positions, Some(far), center());
+        let result = hit_test(&cam, &positions, Some(far), center(), None);
         assert_eq!(result, None);
     }
 
@@ -240,13 +251,16 @@ mod tests {
         // Slightly inside the node boundary (half_w = 60, so 59 units in world space)
         let near_edge = cam.world_to_screen(GVec2::new(59.0, 14.0), center());
         assert_eq!(
-            hit_test(&cam, &positions, Some(near_edge), center()),
+            hit_test(&cam, &positions, Some(near_edge), center(), None),
             Some(id)
         );
 
         // Just outside (61 units in world space, past the 60-unit half-width)
         let outside = cam.world_to_screen(GVec2::new(61.0, 0.0), center());
-        assert_eq!(hit_test(&cam, &positions, Some(outside), center()), None);
+        assert_eq!(
+            hit_test(&cam, &positions, Some(outside), center(), None),
+            None
+        );
     }
 
     /// 7. Hit-test returns None when pointer is None.
@@ -254,7 +268,7 @@ mod tests {
     fn hit_test_none_pointer() {
         let cam = Camera2D::default();
         let positions = Positions(IndexMap::new());
-        assert_eq!(hit_test(&cam, &positions, None, center()), None);
+        assert_eq!(hit_test(&cam, &positions, None, center(), None), None);
     }
 
     /// 8. fit_to_bounds centers the graph and sets zoom so all nodes are visible.

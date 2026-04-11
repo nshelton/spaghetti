@@ -47,8 +47,7 @@ struct CompileCommand {
 
 /// Index a C++ project from its `compile_commands.json`, returning a unified [`Graph`].
 ///
-/// Parallelizes per translation unit using rayon. Each TU produces a partial
-/// graph that is merged at the end.
+/// Each TU produces a partial graph that is merged at the end.
 pub fn index_project(compile_commands: &Path) -> Result<Graph, ClangError> {
     let contents = std::fs::read_to_string(compile_commands)?;
     let commands: Vec<CompileCommand> = serde_json::from_str(&contents)?;
@@ -142,13 +141,18 @@ pub fn index_project(compile_commands: &Path) -> Result<Graph, ClangError> {
     Ok(graph)
 }
 
-/// Extract raw compiler arguments from a compile command.
+/// Extract raw compiler arguments from a compile command, skipping the compiler path.
 fn extract_args(cmd: &CompileCommand) -> Vec<String> {
     if let Some(arguments) = &cmd.arguments {
-        arguments[1..].to_vec() // skip the compiler path
+        arguments.get(1..).unwrap_or_default().to_vec()
     } else if let Some(command) = &cmd.command {
         let parts: Vec<&str> = command.split_whitespace().collect();
-        parts[1..].iter().map(|s| s.to_string()).collect()
+        parts
+            .get(1..)
+            .unwrap_or_default()
+            .iter()
+            .map(|s| s.to_string())
+            .collect()
     } else {
         vec![]
     }

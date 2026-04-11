@@ -1,6 +1,5 @@
 //! Central canvas panel: node and edge rendering, pan/zoom, dragging, selection.
 
-use core_ir::{EdgeKind, SymbolKind};
 use egui::{Color32, Rect, Stroke, StrokeKind, Vec2};
 use glam::Vec2 as GVec2;
 
@@ -105,12 +104,22 @@ impl SpaghettiApp {
             let vis_max = GVec2::new(vis_max.x + margin, vis_max.y + margin);
 
             // LOD thresholds based on zoom level.
-            let draw_labels = self.camera.zoom >= 0.4;
-            let draw_rects = self.camera.zoom >= 0.15;
+            let circle_mode = self.render.circle_mode;
+            let circle_radius = self.render.circle_radius;
+            let draw_labels = !circle_mode && self.camera.zoom >= 0.4;
+            let draw_rects = !circle_mode && self.camera.zoom >= 0.15;
+
+            // When hiding externals, skip edges touching external symbols.
+            let hide_ext = self.hide_externals;
 
             // Draw edges (skip if both endpoints are outside the viewport)
             for edge in &self.graph.edges {
                 if !active_kinds.contains(&edge.kind) {
+                    continue;
+                }
+                if hide_ext
+                    && (self.graph.is_external(edge.from) || self.graph.is_external(edge.to))
+                {
                     continue;
                 }
                 let from_pos = self.positions.0.get(&edge.from);
@@ -132,7 +141,8 @@ impl SpaghettiApp {
                     let screen_from = self.camera.world_to_screen(from, canvas_center);
                     let screen_to = self.camera.world_to_screen(to, canvas_center);
 
-                    let color = edge_color(edge.kind);
+                    let color =
+                        with_alpha(self.render.edge_color(edge.kind), self.render.edge_opacity);
                     painter.line_segment([screen_from, screen_to], Stroke::new(1.5, color));
                 }
             }
@@ -143,6 +153,10 @@ impl SpaghettiApp {
                 NODE_HEIGHT * self.camera.zoom,
             );
             for (id, sym) in &self.graph.symbols {
+                // Skip external symbols when filter is active.
+                if hide_ext && self.graph.is_external(*id) {
+                    continue;
+                }
                 if let Some(&world_pos) = self.positions.0.get(id) {
                     // Viewport culling: skip nodes entirely outside the visible area.
                     if world_pos.x < vis_min.x
@@ -154,12 +168,12 @@ impl SpaghettiApp {
                     }
 
                     let screen_pos = self.camera.world_to_screen(world_pos, canvas_center);
+                    let base =
+                        with_alpha(self.render.node_color(sym.kind), self.render.node_opacity);
 
                     if draw_rects {
                         let rect = Rect::from_center_size(screen_pos, node_size);
 
-                        // Background
-                        let base = node_color(sym.kind);
                         let bg = if self.selection == Some(*id) {
                             brighten(base, 2.0)
                         } else {
@@ -185,14 +199,18 @@ impl SpaghettiApp {
                             );
                         }
                     } else {
-                        // At very low zoom, draw a simple dot for each node.
-                        let base = node_color(sym.kind);
+                        // Circle mode or very low zoom: draw a filled circle.
                         let color = if self.selection == Some(*id) {
                             brighten(base, 2.0)
                         } else {
                             base
                         };
-                        painter.circle_filled(screen_pos, 2.0, color);
+                        let r = if circle_mode {
+                            circle_radius * self.camera.zoom
+                        } else {
+                            2.0
+                        };
+                        painter.circle_filled(screen_pos, r, color);
                     }
                 }
             }
@@ -204,19 +222,15 @@ impl SpaghettiApp {
     }
 }
 
-/// Color for a node based on its symbol kind.
-fn node_color(kind: SymbolKind) -> Color32 {
-    match kind {
-        SymbolKind::Class => Color32::from_rgb(30, 55, 80),
-        SymbolKind::Struct => Color32::from_rgb(25, 70, 50),
-        SymbolKind::Function => Color32::from_rgb(80, 45, 25),
-        SymbolKind::Method => Color32::from_rgb(60, 45, 80),
-        SymbolKind::Field => Color32::from_rgb(70, 70, 35),
-        SymbolKind::Namespace => Color32::from_rgb(45, 45, 45),
-        SymbolKind::TemplateInstantiation => Color32::from_rgb(80, 35, 60),
-        SymbolKind::TranslationUnit => Color32::from_rgb(35, 35, 35),
-        _ => Color32::from_rgb(50, 50, 50),
-    }
+/// Apply an opacity factor (0.0–1.0) to a color's alpha channel.
+fn with_alpha(color: Color32, opacity: f32) -> Color32 {
+    let a = (opacity.clamp(0.0, 1.0) * 255.0) as u8;
+    Color32::from_rgba_premultiplied(
+        (color.r() as u16 * a as u16 / 255) as u8,
+        (color.g() as u16 * a as u16 / 255) as u8,
+        (color.b() as u16 * a as u16 / 255) as u8,
+        a,
+    )
 }
 
 /// Brighten a color by a multiplier, clamping to 255.
@@ -226,20 +240,4 @@ fn brighten(color: Color32, factor: f32) -> Color32 {
         (color.g() as f32 * factor).min(255.0) as u8,
         (color.b() as f32 * factor).min(255.0) as u8,
     )
-}
-
-/// Color for an edge based on its kind.
-fn edge_color(kind: EdgeKind) -> Color32 {
-    match kind {
-        EdgeKind::Calls => Color32::from_rgb(220, 180, 80),
-        EdgeKind::Inherits => Color32::from_rgb(100, 200, 100),
-        EdgeKind::Contains => Color32::from_rgb(150, 150, 150),
-        EdgeKind::Overrides => Color32::from_rgb(180, 120, 220),
-        EdgeKind::ReadsField => Color32::from_rgb(100, 180, 220),
-        EdgeKind::WritesField => Color32::from_rgb(220, 100, 100),
-        EdgeKind::Includes => Color32::from_rgb(160, 160, 160),
-        EdgeKind::Instantiates => Color32::from_rgb(200, 140, 100),
-        EdgeKind::HasType => Color32::from_rgb(140, 140, 200),
-        _ => Color32::from_rgb(128, 128, 128),
-    }
 }

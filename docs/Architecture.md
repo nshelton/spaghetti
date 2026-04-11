@@ -87,3 +87,45 @@ The eframe desktop application (binary name: `spaghetti`).
 - **No frontend leakage**: frontends must not expose language-specific types in their public API.
 - **Workspace deps**: all shared dependencies live in root `[workspace.dependencies]`; member crates inherit with `workspace = true`.
 - **Error handling**: no `unwrap()`/`expect()` in library crates — use `thiserror` and `Result`. `anyhow` is allowed only in the `viz` binary.
+
+## Code Health Summary
+
+*Last audited: 2025-04-10*
+
+### Per-Crate Grades
+
+| Crate | Quality | Tests | Notes |
+|-------|---------|-------|-------|
+| core-ir | A | 25 tests | Exemplary API design, strong type safety, comprehensive golden-file tests |
+| frontend-clang | B | 1 integration test | Clean API boundary, but thin test coverage and a panic risk in `extract_args()` |
+| layout | A- | 17 tests | Solid physics simulation with deterministic seeding; 3 `expect()` calls violate convention |
+| query | A | 18 tests | Minimal, correct, panic-free; 100% public surface coverage |
+| viz | B+ | ~15 tests | Good camera tests, clean panel architecture; UI panels and settings untested |
+
+### Known Issues
+
+**High priority**
+
+- `frontend-clang/src/lib.rs:148,151` — `extract_args()` indexes `[1..]` without bounds check. An empty `arguments` array or single-word `command` string will panic. Fix: use `.get(1..)`.
+- `viz/src/app.rs:179,197,204` — channel send errors silently dropped (`let _ = tx.send(...)`). Should log on failure.
+
+**Medium priority**
+
+- `layout/src/lib.rs:551,592,599` — three `expect()` calls on infallible invariants. Safe in practice but violates the no-unwrap convention. Replace with `unwrap_or_else(|| unreachable!(...))` or restructure.
+- `frontend-clang/src/lib.rs:50-51` — doc comment claims "parallelizes per TU using rayon" but code uses sequential `.iter()`.
+- `viz/src/panels/left.rs:41-63` — O(n) symbol filtering runs every frame; will lag at 10k+ symbols. Cache results, invalidate on search change.
+- `viz/src/panels/right.rs:62-77` — iterates all edges per edge-kind per frame. Pre-group edges by kind.
+- `viz/src/camera.rs:114-143` — hit-test is O(n) over all nodes. Fine for <1k nodes, bottleneck at 10k+.
+
+**Low priority**
+
+- `frontend-clang/src/lib.rs:199` — non-UTF-8 file paths silently fall back to empty string.
+- `frontend-clang` cache invalidation uses only `compile_commands.json` mtime, not header mtimes.
+- `viz/src/settings.rs:17-21` — settings path derived from `current_exe()`, fragile on non-standard platforms.
+- Hardcoded constants in viz (zoom factor 0.002, 8ms budget, node dimensions) are undocumented.
+
+### Test Coverage Gaps
+
+- **frontend-clang**: only 1 integration test; no tests for malformed JSON, empty commands, cache corruption, or system-include discovery.
+- **viz panels**: canvas rendering, left-panel search, right-panel connections, console, FPS counter, and settings persistence are all untested.
+- **layout**: no large-graph (1k+) stress tests.

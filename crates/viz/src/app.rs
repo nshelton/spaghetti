@@ -53,7 +53,7 @@ impl EdgeKindFilter {
 
 /// Energy threshold below which the simulation is considered settled and
 /// repaints are no longer requested.
-pub(crate) const ENERGY_THRESHOLD: f32 = 0.5;
+pub(crate) const ENERGY_THRESHOLD: f32 = 0.01;
 
 /// Main application state.
 pub struct SpaghettiApp {
@@ -73,6 +73,11 @@ pub struct SpaghettiApp {
     pub(crate) auto_fitted: bool,
     /// Frame counter used to trigger auto-fit after a timeout.
     pub(crate) frame_count: u32,
+    /// When true, symbols without a location (external/stdlib) are hidden.
+    pub(crate) hide_externals: bool,
+
+    // -- Rendering settings (persisted) --
+    pub(crate) render: crate::settings::RenderSettings,
 
     // -- Menu / UI state --
     pub(crate) show_console: bool,
@@ -97,7 +102,12 @@ pub struct SpaghettiApp {
 impl SpaghettiApp {
     /// Create a new app with a live [`LayoutState`] that drives positions
     /// incrementally each frame.
-    pub fn new(graph: Graph, layout_state: LayoutState, log_buffer: Arc<Mutex<LogBuffer>>) -> Self {
+    pub fn new(
+        graph: Graph,
+        layout_state: LayoutState,
+        log_buffer: Arc<Mutex<LogBuffer>>,
+        render: crate::settings::RenderSettings,
+    ) -> Self {
         let positions = layout_state.positions();
         Self {
             graph,
@@ -110,6 +120,8 @@ impl SpaghettiApp {
             dragging: None,
             auto_fitted: false,
             frame_count: 0,
+            hide_externals: false,
+            render,
             show_console: false,
             indexing: false,
             log_buffer,
@@ -126,7 +138,12 @@ impl SpaghettiApp {
     pub fn empty(log_buffer: Arc<Mutex<LogBuffer>>) -> Self {
         let graph = Graph::new();
         let layout_state = LayoutState::new(&graph, 42, layout::ForceParams::default());
-        Self::new(graph, layout_state, log_buffer)
+        Self::new(
+            graph,
+            layout_state,
+            log_buffer,
+            crate::settings::RenderSettings::default(),
+        )
     }
 
     /// Draw the menu bar.
@@ -149,7 +166,9 @@ impl SpaghettiApp {
                 });
 
                 ui.menu_button("View", |ui| {
-                    if ui.checkbox(&mut self.show_console, "Console").changed() {
+                    if crate::widgets::toggle_button(ui, &mut self.show_console, "Console")
+                        .changed()
+                    {
                         ui.close();
                     }
                 });
@@ -183,37 +202,55 @@ impl SpaghettiApp {
         self.cancel_tx = Some(cancel_tx);
 
         std::thread::spawn(move || {
-            let _ = progress_tx.send(ProgressMessage::Status(format!(
+            if let Err(e) = progress_tx.send(ProgressMessage::Status(format!(
                 "Loading {}…",
                 path.display()
-            )));
+            ))) {
+                tracing::warn!("progress channel closed: {e}");
+                return;
+            }
 
             // Check for cancellation before starting
             if cancel_rx.try_recv().is_ok() {
-                let _ = progress_tx.send(ProgressMessage::Cancelled);
+                if let Err(e) = progress_tx.send(ProgressMessage::Cancelled) {
+                    tracing::warn!("progress channel closed: {e}");
+                }
                 return;
             }
 
             match frontend_clang::index_project(&path) {
                 Ok(graph) => {
-                    let _ = progress_tx.send(ProgressMessage::Log(format!(
+                    if let Err(e) = progress_tx.send(ProgressMessage::Log(format!(
                         "Indexed {} symbols, {} edges",
                         graph.symbol_count(),
                         graph.edge_count()
-                    )));
+                    ))) {
+                        tracing::warn!("progress channel closed: {e}");
+                        return;
+                    }
 
-                    let _ = progress_tx.send(ProgressMessage::Status("Computing layout…".into()));
+                    if let Err(e) =
+                        progress_tx.send(ProgressMessage::Status("Computing layout…".into()))
+                    {
+                        tracing::warn!("progress channel closed: {e}");
+                        return;
+                    }
 
                     let mut layout_state = layout::LayoutState::new(&graph, 42, params);
                     layout_state.step(200);
 
-                    let _ = progress_tx.send(ProgressMessage::Done {
+                    if let Err(e) = progress_tx.send(ProgressMessage::Done {
                         graph: Box::new(graph),
                         layout_state: Box::new(layout_state),
-                    });
+                    }) {
+                        tracing::warn!("progress channel closed: {e}");
+                    }
                 }
                 Err(e) => {
-                    let _ = progress_tx.send(ProgressMessage::Failed(format!("{e}")));
+                    if let Err(send_err) = progress_tx.send(ProgressMessage::Failed(format!("{e}")))
+                    {
+                        tracing::warn!("progress channel closed: {send_err}");
+                    }
                 }
             }
         });
@@ -287,7 +324,18 @@ impl SpaghettiApp {
         pointer: Option<egui::Pos2>,
         canvas_center: egui::Pos2,
     ) -> Option<SymbolId> {
-        camera::hit_test(&self.camera, &self.positions, pointer, canvas_center)
+        let radius = if self.render.circle_mode {
+            Some(self.render.circle_radius)
+        } else {
+            None
+        };
+        camera::hit_test(
+            &self.camera,
+            &self.positions,
+            pointer,
+            canvas_center,
+            radius,
+        )
     }
 
     /// Draw the progress overlay (modal).
@@ -363,6 +411,7 @@ impl eframe::App for SpaghettiApp {
     fn on_exit(&mut self) {
         let settings = crate::settings::AppSettings {
             force_params: self.layout_state.params().clone(),
+            render: self.render.clone(),
         };
         settings.save();
     }

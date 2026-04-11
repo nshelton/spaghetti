@@ -306,6 +306,26 @@ impl Graph {
         self.edges.push(edge);
     }
 
+    /// Returns `true` if the symbol appears to be external (stdlib / system
+    /// header).
+    ///
+    /// The clang frontend strips the project root from file paths, so
+    /// project-local files have relative paths while external files retain
+    /// their absolute paths. A symbol with no location at all is also
+    /// considered external.
+    pub fn is_external(&self, id: SymbolId) -> bool {
+        match self.symbols.get(&id) {
+            Some(sym) => match &sym.location {
+                Some(loc) => {
+                    let path = self.files.resolve(loc.file).unwrap_or("");
+                    path.starts_with('/')
+                }
+                None => true,
+            },
+            None => true,
+        }
+    }
+
     /// Iterate over neighbor symbol IDs connected to `id` via edges whose
     /// kind is in `kinds`. If `kinds` is empty, all edge kinds match.
     ///

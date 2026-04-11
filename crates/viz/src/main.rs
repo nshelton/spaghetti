@@ -11,6 +11,7 @@ mod log_capture;
 mod panels;
 mod progress;
 mod settings;
+mod widgets;
 
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
@@ -57,7 +58,7 @@ fn main() -> Result<()> {
         // Create incremental layout state with persisted force params.
         let layout_state = layout::LayoutState::new(&graph, 42, saved_settings.force_params);
 
-        app::SpaghettiApp::new(graph, layout_state, log_buffer)
+        app::SpaghettiApp::new(graph, layout_state, log_buffer, saved_settings.render)
     } else {
         info!("no file argument — starting with empty canvas");
         app::SpaghettiApp::empty(log_buffer)
