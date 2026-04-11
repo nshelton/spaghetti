@@ -13,7 +13,7 @@ use tracing::Level;
 
 use crate::file_tree::FileTree;
 
-use crate::camera::Camera2D;
+use crate::camera::{Camera2D, NodeSizes};
 use crate::fps::FpsCounter;
 use crate::log_capture::LogBuffer;
 use crate::progress::{ProgressMessage, ProgressState};
@@ -173,12 +173,17 @@ pub struct SpaghettiApp {
 
     // -- Interaction state --
     pub(crate) camera: Camera2D,
-    pub(crate) selection: Option<SymbolId>,
+    /// Currently selected nodes (shift-click to multi-select).
+    pub(crate) selection: HashSet<SymbolId>,
     pub(crate) edge_filter: EdgeKindFilter,
     pub(crate) node_filter: SymbolKindFilter,
     pub(crate) search: String,
-    /// The node currently being dragged, if any.
+    /// The anchor node currently being dragged, if any.
     pub(crate) dragging: Option<SymbolId>,
+    /// World-space offsets from the drag anchor for each selected node during group drag.
+    pub(crate) drag_offsets: HashMap<SymbolId, glam::Vec2>,
+    /// Per-node world-space sizes (recomputed when graph or collapse state changes).
+    pub(crate) node_sizes: NodeSizes,
     /// Whether the initial auto-fit has been performed.
     pub(crate) auto_fitted: bool,
     /// Frame counter used to trigger auto-fit after a timeout.
@@ -251,11 +256,13 @@ impl SpaghettiApp {
             positions,
             layout_state,
             camera,
-            selection: None,
+            selection: HashSet::new(),
             edge_filter: EdgeKindFilter::from_saved(&view.edge_filters),
             node_filter: SymbolKindFilter::from_saved(&view.node_filters),
             search: String::new(),
             dragging: None,
+            drag_offsets: HashMap::new(),
+            node_sizes: NodeSizes(indexmap::IndexMap::new()),
             auto_fitted: false,
             frame_count: 0,
             file_tree,
@@ -278,6 +285,7 @@ impl SpaghettiApp {
             container_rects: Vec::new(),
         };
         app.sync_hidden_to_layout();
+        app.compute_node_sizes();
         app
     }
 
@@ -343,6 +351,28 @@ impl SpaghettiApp {
         self.hidden_symbols = &file_hidden | &collapse_hidden.into_iter().collect();
         let hidden_vec: Vec<_> = file_hidden.into_iter().collect();
         self.layout_state.set_hidden(&hidden_vec);
+        self.compute_node_sizes();
+    }
+
+    /// Recompute per-node sizes based on container/collapse state.
+    pub(crate) fn compute_node_sizes(&mut self) {
+        use crate::camera::{NODE_HEIGHT, NODE_WIDTH};
+        use crate::panels::canvas::COLLAPSED_CONTAINER_SCALE;
+
+        let default_size = glam::Vec2::new(NODE_WIDTH, NODE_HEIGHT);
+        let collapsed_size = default_size * COLLAPSED_CONTAINER_SCALE;
+        let mut sizes = indexmap::IndexMap::new();
+        for id in self.graph.symbols.keys() {
+            let is_collapsed =
+                self.layout_state.is_container(*id) && !self.layout_state.is_expanded(*id);
+            let size = if is_collapsed {
+                collapsed_size
+            } else {
+                default_size
+            };
+            sizes.insert(*id, size);
+        }
+        self.node_sizes = NodeSizes(sizes);
     }
 
     /// Snapshot the current view state for serialization.
@@ -605,9 +635,11 @@ impl SpaghettiApp {
                     self.sync_hidden_symbols();
                     self.sync_hidden_to_layout();
                     self.positions = self.layout_state.positions();
-                    self.selection = None;
+                    self.selection.clear();
                     self.camera = Camera2D::default();
                     self.dragging = None;
+                    self.drag_offsets.clear();
+                    self.compute_node_sizes();
                     self.auto_fitted = false;
                     self.frame_count = 0;
                     self.container_rects.clear();
@@ -728,7 +760,7 @@ mod tests {
         assert_eq!(app.graph.edge_count(), 0);
         assert!(!app.indexing);
         assert!(!app.show_console);
-        assert!(app.selection.is_none());
+        assert!(app.selection.is_empty());
     }
 
     /// Menu items should report disabled when indexing is active.

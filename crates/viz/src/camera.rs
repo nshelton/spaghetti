@@ -6,12 +6,26 @@
 
 use core_ir::SymbolId;
 use glam::Vec2 as GVec2;
+use indexmap::IndexMap;
 use layout::Positions;
 
 /// Width of a node in world-space units.
 pub const NODE_WIDTH: f32 = 120.0;
 /// Height of a node in world-space units.
 pub const NODE_HEIGHT: f32 = 30.0;
+
+/// Per-node world-space sizes. Nodes missing from the map use [`NODE_WIDTH`] x [`NODE_HEIGHT`].
+pub struct NodeSizes(pub IndexMap<SymbolId, GVec2>);
+
+impl NodeSizes {
+    /// Look up a node's size, falling back to the default constants.
+    pub fn get(&self, id: &SymbolId) -> GVec2 {
+        self.0
+            .get(id)
+            .copied()
+            .unwrap_or(GVec2::new(NODE_WIDTH, NODE_HEIGHT))
+    }
+}
 
 /// Minimum allowed zoom level.
 const ZOOM_MIN: f32 = 0.1;
@@ -75,16 +89,22 @@ impl Camera2D {
     ///
     /// `viewport_size` is the pixel dimensions of the drawing area. Adds 10%
     /// padding on each side. Does nothing when `positions` is empty.
-    pub fn fit_to_bounds(&mut self, positions: &Positions, viewport_size: egui::Vec2) {
+    pub fn fit_to_bounds(
+        &mut self,
+        positions: &Positions,
+        sizes: &NodeSizes,
+        viewport_size: egui::Vec2,
+    ) {
         if positions.0.is_empty() {
             return;
         }
 
         let mut min = GVec2::splat(f32::INFINITY);
         let mut max = GVec2::splat(f32::NEG_INFINITY);
-        for pos in positions.0.values() {
-            min = min.min(*pos - GVec2::new(NODE_WIDTH / 2.0, NODE_HEIGHT / 2.0));
-            max = max.max(*pos + GVec2::new(NODE_WIDTH / 2.0, NODE_HEIGHT / 2.0));
+        for (id, pos) in &positions.0 {
+            let half = sizes.get(id) * 0.5;
+            min = min.min(*pos - half);
+            max = max.max(*pos + half);
         }
 
         let center = (min + max) * 0.5;
@@ -114,6 +134,7 @@ impl Camera2D {
 pub fn hit_test(
     camera: &Camera2D,
     positions: &Positions,
+    sizes: &NodeSizes,
     pointer_screen: Option<egui::Pos2>,
     canvas_center: egui::Pos2,
     hit_radius: Option<f32>,
@@ -131,9 +152,10 @@ pub fn hit_test(
             }
         }
     } else {
-        let half_w = NODE_WIDTH / 2.0;
-        let half_h = NODE_HEIGHT / 2.0;
         for (id, pos) in &positions.0 {
+            let size = sizes.get(id);
+            let half_w = size.x / 2.0;
+            let half_h = size.y / 2.0;
             if (world.x - pos.x).abs() < half_w && (world.y - pos.y).abs() < half_h {
                 return Some(*id);
             }
@@ -150,6 +172,11 @@ mod tests {
     /// Helper: canvas center at (400, 300).
     fn center() -> egui::Pos2 {
         egui::Pos2::new(400.0, 300.0)
+    }
+
+    /// Helper: empty node sizes (all nodes use default constants).
+    fn empty_sizes() -> NodeSizes {
+        NodeSizes(IndexMap::new())
     }
 
     /// 1. Roundtrip: world_to_screen then screen_to_world returns the original point.
@@ -213,7 +240,14 @@ mod tests {
         let positions = Positions(map);
 
         let screen = cam.world_to_screen(node_world, center());
-        let result = hit_test(&cam, &positions, Some(screen), center(), None);
+        let result = hit_test(
+            &cam,
+            &positions,
+            &empty_sizes(),
+            Some(screen),
+            center(),
+            None,
+        );
         assert_eq!(result, Some(id));
     }
 
@@ -230,7 +264,7 @@ mod tests {
 
         // Place pointer well outside node bounds (200 units away in world space)
         let far = cam.world_to_screen(GVec2::new(300.0, 50.0), center());
-        let result = hit_test(&cam, &positions, Some(far), center(), None);
+        let result = hit_test(&cam, &positions, &empty_sizes(), Some(far), center(), None);
         assert_eq!(result, None);
     }
 
@@ -251,14 +285,28 @@ mod tests {
         // Slightly inside the node boundary (half_w = 60, so 59 units in world space)
         let near_edge = cam.world_to_screen(GVec2::new(59.0, 14.0), center());
         assert_eq!(
-            hit_test(&cam, &positions, Some(near_edge), center(), None),
+            hit_test(
+                &cam,
+                &positions,
+                &empty_sizes(),
+                Some(near_edge),
+                center(),
+                None
+            ),
             Some(id)
         );
 
         // Just outside (61 units in world space, past the 60-unit half-width)
         let outside = cam.world_to_screen(GVec2::new(61.0, 0.0), center());
         assert_eq!(
-            hit_test(&cam, &positions, Some(outside), center(), None),
+            hit_test(
+                &cam,
+                &positions,
+                &empty_sizes(),
+                Some(outside),
+                center(),
+                None
+            ),
             None
         );
     }
@@ -268,7 +316,10 @@ mod tests {
     fn hit_test_none_pointer() {
         let cam = Camera2D::default();
         let positions = Positions(IndexMap::new());
-        assert_eq!(hit_test(&cam, &positions, None, center(), None), None);
+        assert_eq!(
+            hit_test(&cam, &positions, &empty_sizes(), None, center(), None),
+            None
+        );
     }
 
     /// 8. fit_to_bounds centers the graph and sets zoom so all nodes are visible.
@@ -281,7 +332,7 @@ mod tests {
         let positions = Positions(map);
 
         let viewport = egui::Vec2::new(800.0, 600.0);
-        cam.fit_to_bounds(&positions, viewport);
+        cam.fit_to_bounds(&positions, &empty_sizes(), viewport);
 
         // Center of AABB is (0,0), so offset should be ~(0,0).
         assert!(cam.offset.x.abs() < 1e-4, "offset.x = {}", cam.offset.x);
@@ -305,7 +356,7 @@ mod tests {
             zoom: 2.0,
         };
         let positions = Positions(IndexMap::new());
-        cam.fit_to_bounds(&positions, egui::Vec2::new(800.0, 600.0));
+        cam.fit_to_bounds(&positions, &empty_sizes(), egui::Vec2::new(800.0, 600.0));
         assert!((cam.zoom - 2.0).abs() < 1e-4);
         assert!((cam.offset.x - 5.0).abs() < 1e-4);
     }

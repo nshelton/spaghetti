@@ -1,5 +1,7 @@
 //! Left panel: search bar, edge filters, and file tree.
 
+use std::collections::HashSet;
+
 use crate::app::SpaghettiApp;
 use crate::file_tree::{self, DirNode, FileNode};
 
@@ -77,9 +79,11 @@ impl SpaghettiApp {
                                     }
                                 }
                                 let label = format!("{kind:?} {name}");
-                                let selected = self.selection == Some(sym_id);
+                                let selected =
+                                    self.selection.len() == 1 && self.selection.contains(&sym_id);
                                 if ui.selectable_label(selected, &label).clicked() {
-                                    self.selection = Some(sym_id);
+                                    self.selection.clear();
+                                    self.selection.insert(sym_id);
                                 }
                             }
                         });
@@ -114,7 +118,7 @@ impl SpaghettiApp {
 fn draw_dir_node(
     ui: &mut egui::Ui,
     dir: &mut DirNode,
-    selection: &mut Option<core_ir::SymbolId>,
+    selection: &mut HashSet<core_ir::SymbolId>,
     search: Option<&str>,
 ) -> bool {
     let mut changed = false;
@@ -146,7 +150,7 @@ fn draw_dir_node(
 fn draw_file_node(
     ui: &mut egui::Ui,
     file: &FileNode,
-    selection: &mut Option<core_ir::SymbolId>,
+    selection: &mut HashSet<core_ir::SymbolId>,
     search: Option<&str>,
 ) {
     let summary = file_tree::file_summary(file);
@@ -163,9 +167,10 @@ fn draw_file_node(
                     }
                 }
                 let label = format!("{kind:?} {name}");
-                let selected = *selection == Some(sym_id);
+                let selected = selection.len() == 1 && selection.contains(&sym_id);
                 if ui.selectable_label(selected, &label).clicked() {
-                    *selection = Some(sym_id);
+                    selection.clear();
+                    selection.insert(sym_id);
                 }
             }
         });

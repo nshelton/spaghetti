@@ -13,7 +13,9 @@ impl SpaghettiApp {
                     ui.heading("Details");
                     ui.separator();
 
-                    if let Some(sel_id) = self.selection {
+                    if self.selection.len() > 1 {
+                        ui.label(format!("{} nodes selected", self.selection.len()));
+                    } else if let Some(&sel_id) = self.selection.iter().next() {
                         if let Some(sym) = self.graph.symbols.get(&sel_id) {
                             ui.label(format!("Name: {}", sym.name));
                             ui.label(format!("Qualified: {}", sym.qualified_name));
@@ -204,20 +206,23 @@ impl SpaghettiApp {
                                 .edge_params
                                 .entry(kind)
                                 .or_insert(default_ep);
-                            ui.indent(format!("edge_sliders_{kind:?}"), |ui| {
-                                changed |= ui
+                            let resp = ui.indent(format!("edge_sliders_{kind:?}"), |ui| {
+                                let mut inner_changed = false;
+                                inner_changed |= ui
                                     .add(
                                         egui::Slider::new(&mut ep.target_distance, 1.0..=100.0)
                                             .text("Dist"),
                                     )
                                     .changed();
-                                changed |= ui
+                                inner_changed |= ui
                                     .add(
                                         egui::Slider::new(&mut ep.attraction, 0.0..=2.0)
                                             .text("Attract"),
                                     )
                                     .changed();
+                                inner_changed
                             });
+                            changed |= resp.inner;
                         }
                     }
 
@@ -260,46 +265,6 @@ impl SpaghettiApp {
                         .add(
                             egui::Slider::new(&mut params.max_velocity, 1.0..=200.0)
                                 .text("Max vel"),
-                        )
-                        .changed();
-
-                    ui.add_space(8.0);
-                    ui.label("Per-Edge Kind");
-
-                    let default_ep = layout::EdgeKindParams {
-                        target_distance: 150.0,
-                        attraction: 0.01,
-                    };
-
-                    for kind in &ALL_EDGE_KINDS {
-                        let label = format!("{kind:?}");
-                        ui.add_space(4.0);
-                        ui.label(&label);
-
-                        let params = self.layout_state.params_mut();
-                        let ep = params.edge_params.entry(*kind).or_insert(default_ep);
-                        changed |= ui
-                            .add(
-                                egui::Slider::new(&mut ep.target_distance, 1.0..=100.0)
-                                    .text("Target dist"),
-                            )
-                            .changed();
-
-                        changed |= ui
-                            .add(
-                                egui::Slider::new(&mut ep.attraction, 0.0..=1.0).text("Attraction"),
-                            )
-                            .changed();
-                    }
-
-                    ui.add_space(8.0);
-                    ui.label("Containment");
-
-                    let params = self.layout_state.params_mut();
-                    changed |= ui
-                        .add(
-                            egui::Slider::new(&mut params.containment_strength, 0.0..=0.2)
-                                .text("Strength"),
                         )
                         .changed();
 

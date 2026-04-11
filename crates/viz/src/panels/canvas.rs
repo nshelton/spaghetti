@@ -8,11 +8,11 @@ use glam::Vec2 as GVec2;
 use core_ir::SymbolId;
 
 use crate::app::{SpaghettiApp, ENERGY_THRESHOLD};
-use crate::camera::{NODE_HEIGHT, NODE_WIDTH};
+use crate::camera::NODE_WIDTH;
 use crate::fps::paint_fps_overlay;
 
 /// Scale factor for collapsed container nodes (slightly larger than normal).
-const COLLAPSED_CONTAINER_SCALE: f32 = 1.3;
+pub const COLLAPSED_CONTAINER_SCALE: f32 = 1.3;
 /// World-space padding around children for expanded container backgrounds.
 const CONTAINER_PADDING: f32 = 30.0;
 
@@ -33,28 +33,52 @@ impl SpaghettiApp {
             }
 
             // --- Drag / pan / click interaction ---
+            let shift_held = ui.input(|i| i.modifiers.shift);
 
-            // Drag started: determine whether we are dragging a node or panning.
+            // Drag started: begin dragging a node (selection changes happen
+            // in the clicked() handler to avoid conflicts).
             if response.drag_started_by(egui::PointerButton::Primary) {
                 if let Some(hit) =
                     self.hit_test_compound(response.interact_pointer_pos(), canvas_center)
                 {
-                    // Begin dragging a node.
+                    let already_selected = self.selection.contains(&hit);
+
+                    // If dragging an unselected node without shift, solo-select it
+                    // immediately so group-drag works on the right set of nodes.
+                    if !already_selected && !shift_held {
+                        self.selection.clear();
+                        self.selection.insert(hit);
+                    } else if !already_selected && shift_held {
+                        // Shift-drag on unselected: add to selection for group drag.
+                        self.selection.insert(hit);
+                    }
+
+                    // Pin all selected nodes and compute offsets from anchor.
                     self.dragging = Some(hit);
-                    self.selection = Some(hit);
-                    if let Some(&world) = self.positions.0.get(&hit) {
-                        self.layout_state.pin(hit, world);
+                    let anchor_pos = self.positions.0.get(&hit).copied().unwrap_or(GVec2::ZERO);
+                    self.drag_offsets.clear();
+                    for &sel_id in &self.selection {
+                        if let Some(&pos) = self.positions.0.get(&sel_id) {
+                            self.layout_state.pin(sel_id, pos);
+                            self.drag_offsets.insert(sel_id, pos - anchor_pos);
+                        }
                     }
                 }
             }
 
             // Ongoing drag.
             if response.dragged_by(egui::PointerButton::Primary) {
-                if let Some(dragged_id) = self.dragging {
-                    // Move the pinned node to follow the cursor.
+                if let Some(anchor_id) = self.dragging {
+                    // Move all selected nodes, maintaining relative offsets.
                     if let Some(pointer) = response.interact_pointer_pos() {
-                        let world = self.camera.screen_to_world(pointer, canvas_center);
-                        self.layout_state.set_position(dragged_id, world);
+                        let anchor_world = self.camera.screen_to_world(pointer, canvas_center);
+                        self.layout_state.set_position(anchor_id, anchor_world);
+                        for (&sel_id, &offset) in &self.drag_offsets {
+                            if sel_id != anchor_id {
+                                self.layout_state
+                                    .set_position(sel_id, anchor_world + offset);
+                            }
+                        }
                     }
                 } else {
                     // No node drag — pan the camera.
@@ -64,17 +88,35 @@ impl SpaghettiApp {
                 }
             }
 
-            // Drag released: unpin the node.
-            if response.drag_stopped_by(egui::PointerButton::Primary) {
-                if let Some(dragged_id) = self.dragging.take() {
-                    self.layout_state.unpin(dragged_id);
+            // Drag released: unpin all selected nodes.
+            if response.drag_stopped_by(egui::PointerButton::Primary)
+                && self.dragging.take().is_some()
+            {
+                for &sel_id in &self.selection {
+                    self.layout_state.unpin(sel_id);
                 }
+                self.drag_offsets.clear();
             }
 
-            // Handle click (select) — only when not dragging.
+            // Handle click (select) — only fires for short clicks, not drags.
             if response.clicked() {
                 if let Some(pointer) = response.interact_pointer_pos() {
-                    self.selection = self.hit_test_compound(Some(pointer), canvas_center);
+                    let hit = self.hit_test_compound(Some(pointer), canvas_center);
+                    if let Some(id) = hit {
+                        if shift_held {
+                            // Shift-click: toggle in/out of selection.
+                            if !self.selection.remove(&id) {
+                                self.selection.insert(id);
+                            }
+                        } else {
+                            // Plain click: solo select.
+                            self.selection.clear();
+                            self.selection.insert(id);
+                        }
+                    } else if !shift_held {
+                        // Clicked empty space: clear selection.
+                        self.selection.clear();
+                    }
                 }
             }
 
@@ -111,14 +153,14 @@ impl SpaghettiApp {
             let auto_fit_timeout = self.frame_count >= 120; // ~2s at 60fps
             if !self.auto_fitted && (energy < ENERGY_THRESHOLD || auto_fit_timeout) {
                 self.camera
-                    .fit_to_bounds(&self.positions, response.rect.size());
+                    .fit_to_bounds(&self.positions, &self.node_sizes, response.rect.size());
                 self.auto_fitted = true;
             }
 
             // Press F to re-frame the view.
             if ui.input(|i| i.key_pressed(egui::Key::F)) && !ui.memory(|m| m.focused().is_some()) {
                 self.camera
-                    .fit_to_bounds(&self.positions, response.rect.size());
+                    .fit_to_bounds(&self.positions, &self.node_sizes, response.rect.size());
             }
 
             // Press R to randomize the layout.
@@ -176,8 +218,9 @@ impl SpaghettiApp {
                         continue;
                     }
                     if let Some(&pos) = self.positions.0.get(&child_id) {
-                        min_w = min_w.min(pos - GVec2::new(NODE_WIDTH / 2.0, NODE_HEIGHT / 2.0));
-                        max_w = max_w.max(pos + GVec2::new(NODE_WIDTH / 2.0, NODE_HEIGHT / 2.0));
+                        let half = self.node_sizes.get(&child_id) * 0.5;
+                        min_w = min_w.min(pos - half);
+                        max_w = max_w.max(pos + half);
                         has_visible = true;
                     }
                 }
@@ -187,8 +230,9 @@ impl SpaghettiApp {
 
                 // Also include the container node itself in the bounds.
                 if let Some(&parent_pos) = self.positions.0.get(id) {
-                    min_w = min_w.min(parent_pos - GVec2::new(NODE_WIDTH / 2.0, NODE_HEIGHT / 2.0));
-                    max_w = max_w.max(parent_pos + GVec2::new(NODE_WIDTH / 2.0, NODE_HEIGHT / 2.0));
+                    let half = self.node_sizes.get(id) * 0.5;
+                    min_w = min_w.min(parent_pos - half);
+                    max_w = max_w.max(parent_pos + half);
                 }
 
                 // Add padding and leave space for the title at the top.
@@ -344,12 +388,6 @@ impl SpaghettiApp {
                 } else {
                     None
                 };
-            let node_size = Vec2::new(
-                NODE_WIDTH * self.camera.zoom,
-                NODE_HEIGHT * self.camera.zoom,
-            );
-            let container_node_size = node_size * COLLAPSED_CONTAINER_SCALE;
-
             for (id, sym) in &self.graph.symbols {
                 if self.hidden_symbols.contains(id) {
                     continue;
@@ -378,16 +416,17 @@ impl SpaghettiApp {
 
                     let is_container = self.layout_state.is_container(*id);
                     let is_collapsed = is_container && !self.layout_state.is_expanded(*id);
+                    let is_selected = self.selection.contains(id);
 
                     if draw_rects {
-                        let size = if is_collapsed {
-                            container_node_size
-                        } else {
-                            node_size
-                        };
-                        let rect = Rect::from_center_size(screen_pos, size);
+                        let world_size = self.node_sizes.get(id);
+                        let screen_size = Vec2::new(
+                            world_size.x * self.camera.zoom,
+                            world_size.y * self.camera.zoom,
+                        );
+                        let rect = Rect::from_center_size(screen_pos, screen_size);
 
-                        let bg = if self.selection == Some(*id) {
+                        let bg = if is_selected {
                             brighten(base, 2.0)
                         } else {
                             base
@@ -422,7 +461,7 @@ impl SpaghettiApp {
                         }
                     } else {
                         // Circle mode or very low zoom: draw a filled circle.
-                        let color = if self.selection == Some(*id) {
+                        let color = if is_selected {
                             brighten(base, 2.0)
                         } else {
                             base
@@ -480,6 +519,7 @@ impl SpaghettiApp {
         if let Some(hit) = crate::camera::hit_test(
             &self.camera,
             &self.positions,
+            &self.node_sizes,
             pointer,
             canvas_center,
             radius,
