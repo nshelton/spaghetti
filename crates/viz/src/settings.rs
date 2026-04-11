@@ -26,6 +26,10 @@ pub struct ViewSettings {
     /// Missing keys default to enabled.
     #[serde(default = "default_edge_filters")]
     pub edge_filters: HashMap<String, bool>,
+    /// Node filter toggles keyed by `SymbolKind` debug name.
+    /// Missing keys default to enabled.
+    #[serde(default = "default_node_filters")]
+    pub node_filters: HashMap<String, bool>,
     /// Camera pan offset `[x, y]`.
     #[serde(default)]
     pub camera_offset: [f32; 2],
@@ -48,6 +52,10 @@ fn default_edge_filters() -> HashMap<String, bool> {
     HashMap::new() // empty = all enabled (missing keys default to true)
 }
 
+fn default_node_filters() -> HashMap<String, bool> {
+    HashMap::new() // empty = all enabled (missing keys default to true)
+}
+
 fn default_zoom() -> f32 {
     1.0
 }
@@ -60,6 +68,7 @@ impl Default for ViewSettings {
     fn default() -> Self {
         Self {
             edge_filters: default_edge_filters(),
+            node_filters: default_node_filters(),
             camera_offset: [0.0, 0.0],
             camera_zoom: default_zoom(),
             show_console: false,

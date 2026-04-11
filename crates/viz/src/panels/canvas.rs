@@ -90,12 +90,19 @@ impl SpaghettiApp {
                 }
             }
 
+            // Press P to toggle pause on the layout simulation.
+            if ui.input(|i| i.key_pressed(egui::Key::P)) && !ui.memory(|m| m.focused().is_some()) {
+                self.paused = !self.paused;
+            }
+
             // --- Run incremental simulation ---
             // Use a time budget so large graphs don't block the frame.
             let active_kinds = self.edge_filter.active_kinds();
             self.layout_state.set_visible_edge_kinds(&active_kinds);
-            self.layout_state
-                .step_budgeted(std::time::Duration::from_millis(8));
+            if !self.paused {
+                self.layout_state
+                    .step_budgeted(std::time::Duration::from_millis(8));
+            }
             self.positions = self.layout_state.positions();
 
             // Auto-fit camera once the layout settles or after a timeout.
@@ -248,6 +255,21 @@ impl SpaghettiApp {
                     continue;
                 }
 
+                // Skip edges where either endpoint's symbol kind is filtered out.
+                let from_visible_kind = self
+                    .graph
+                    .symbols
+                    .get(&edge.from)
+                    .is_some_and(|s| self.node_filter.is_enabled(s.kind));
+                let to_visible_kind = self
+                    .graph
+                    .symbols
+                    .get(&edge.to)
+                    .is_some_and(|s| self.node_filter.is_enabled(s.kind));
+                if !from_visible_kind || !to_visible_kind {
+                    continue;
+                }
+
                 // Dedup aggregated edges: if this is a rerouted edge, only draw
                 // one line per (from_container, to_container, kind) triple.
                 let is_rerouted =
@@ -294,6 +316,9 @@ impl SpaghettiApp {
 
             for (id, sym) in &self.graph.symbols {
                 if self.hidden_symbols.contains(id) {
+                    continue;
+                }
+                if !self.node_filter.is_enabled(sym.kind) {
                     continue;
                 }
                 if let Some(&world_pos) = self.positions.0.get(id) {

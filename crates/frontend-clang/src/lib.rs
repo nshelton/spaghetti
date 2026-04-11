@@ -50,6 +50,18 @@ struct CompileCommand {
 ///
 /// Each TU produces a partial graph that is merged at the end.
 pub fn index_project(compile_commands: &Path) -> Result<Graph, ClangError> {
+    index_project_with_progress(compile_commands, |_, _, _| true)
+}
+
+/// Index a C++ project with per-TU progress reporting.
+///
+/// The `on_progress` callback is called before each translation unit with
+/// `(current_index, total_count, file_name)`. Return `true` to continue
+/// indexing or `false` to cancel.
+pub fn index_project_with_progress(
+    compile_commands: &Path,
+    mut on_progress: impl FnMut(usize, usize, &str) -> bool,
+) -> Result<Graph, ClangError> {
     let contents = std::fs::read_to_string(compile_commands)?;
     let commands: Vec<CompileCommand> = serde_json::from_str(&contents)?;
 
@@ -58,12 +70,16 @@ pub fn index_project(compile_commands: &Path) -> Result<Graph, ClangError> {
     // is the working directory of the compile command. In CMake output it is
     // always absolute; for hand-written files it may be relative to the
     // project root. We resolve relative to compile_commands.json's parent.
-    let cc_parent = compile_commands.parent().unwrap_or_else(|| Path::new("."));
+    let cc_parent_raw = compile_commands.parent().unwrap_or_else(|| Path::new("."));
+    let cc_parent = &cc_parent_raw
+        .canonicalize()
+        .unwrap_or_else(|_| cc_parent_raw.to_path_buf());
 
     let project_root = compute_project_root(&commands, cc_parent);
 
+    let total = commands.len();
     info!(
-        entries = commands.len(),
+        entries = total,
         project_root = %project_root.display(),
         "indexing project from compile_commands.json"
     );
@@ -79,52 +95,56 @@ pub fn index_project(compile_commands: &Path) -> Result<Graph, ClangError> {
     let index = clang::Index::new(&clang, false, true);
 
     let mut cache_hits = 0u32;
-    let partial_graphs: Vec<Graph> = commands
-        .iter()
-        .filter_map(|cmd| {
-            // Per the spec, `directory` is the working directory for the
-            // compile command. CMake always writes absolute paths. For
-            // relative paths, resolve against the compile_commands.json
-            // parent directory.
-            let dir_path = Path::new(&cmd.directory);
-            let work_dir = if dir_path.is_absolute() {
-                dir_path.to_path_buf()
-            } else {
-                cc_parent.join(dir_path)
-            };
-            let file_path = work_dir.join(&cmd.file);
+    let mut partial_graphs = Vec::with_capacity(total);
 
-            // Extract args early so we can compute the cache key.
-            let args = extract_args(cmd);
+    for (i, cmd) in commands.iter().enumerate() {
+        if !on_progress(i, total, &cmd.file) {
+            info!("indexing cancelled at TU {}/{}", i, total);
+            break;
+        }
 
-            let key = cache::cache_key(&file_path, &args, cc_mtime);
+        // Per the spec, `directory` is the working directory for the
+        // compile command. CMake always writes absolute paths. For
+        // relative paths, resolve against the compile_commands.json
+        // parent directory.
+        let dir_path = Path::new(&cmd.directory);
+        let work_dir = if dir_path.is_absolute() {
+            dir_path.to_path_buf()
+        } else {
+            cc_parent.join(dir_path)
+        };
+        let file_path = work_dir.join(&cmd.file);
 
-            // Try the cache first.
-            if let Some(cached) = cache::load(&cache_dir, key) {
-                debug!(file = %file_path.display(), symbols = cached.symbol_count(), "cached TU");
-                cache_hits += 1;
-                return Some(cached);
-            }
+        // Extract args early so we can compute the cache key.
+        let args = extract_args(cmd);
 
-            match index_translation_unit(cmd, &work_dir, &project_root, &index, &args) {
-                Ok(g) => {
-                    debug!(file = %file_path.display(), symbols = g.symbol_count(), "indexed TU");
-                    // Only cache non-empty results — an empty graph likely means
-                    // indexing failed silently and we don't want to persist that.
-                    if g.symbol_count() > 0 {
-                        cache::store(&cache_dir, key, &g);
-                    }
-                    Some(g)
+        let key = cache::cache_key(&file_path, &args, cc_mtime);
+
+        // Try the cache first.
+        if let Some(cached) = cache::load(&cache_dir, key) {
+            debug!(file = %file_path.display(), symbols = cached.symbol_count(), "cached TU");
+            cache_hits += 1;
+            partial_graphs.push(cached);
+            continue;
+        }
+
+        match index_translation_unit(cmd, &work_dir, &project_root, &index, &args) {
+            Ok(g) => {
+                debug!(file = %file_path.display(), symbols = g.symbol_count(), "indexed TU");
+                // Only cache non-empty results — an empty graph likely means
+                // indexing failed silently and we don't want to persist that.
+                if g.symbol_count() > 0 {
+                    cache::store(&cache_dir, key, &g);
                 }
-                Err(e) => {
-                    warn!(file = %file_path.display(), error = %e, "failed to index TU");
-                    None
-                }
+                partial_graphs.push(g);
             }
-        })
-        .collect();
+            Err(e) => {
+                warn!(file = %file_path.display(), error = %e, "failed to index TU");
+            }
+        }
+    }
 
-    info!(cache_hits, total = commands.len(), "TU cache summary");
+    info!(cache_hits, total, "TU cache summary");
 
     let mut graph = Graph::new();
     for g in partial_graphs {
@@ -952,7 +972,15 @@ fn compute_project_root(commands: &[CompileCommand], cc_parent: &Path) -> PathBu
     if prefix.is_file() {
         prefix = prefix.parent().unwrap_or(cc_parent).to_path_buf();
     }
-    prefix
+    // The project root should never be deeper than the compile_commands.json
+    // directory.  Source files may all live under a `src/` subdirectory while
+    // headers live under `include/`, so the common ancestor of sources alone
+    // can be too narrow.  compile_commands.json is conventionally placed at the
+    // project root, so clamp to that.
+    let cc_abs = cc_parent
+        .canonicalize()
+        .unwrap_or_else(|_| cc_parent.to_path_buf());
+    common_ancestor(&prefix, &cc_abs)
 }
 
 /// Find the longest common ancestor path of two paths.

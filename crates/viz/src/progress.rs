@@ -8,7 +8,6 @@ pub enum ProgressMessage {
     /// Update the status text.
     Status(String),
     /// Update the progress bar (current out of total).
-    #[allow(dead_code)]
     Progress { current: usize, total: usize },
     /// Append a log line to the progress overlay.
     Log(String),

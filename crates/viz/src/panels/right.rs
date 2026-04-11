@@ -1,6 +1,6 @@
 //! Right panel: details of the selected symbol + layout controls.
 
-use crate::app::{SpaghettiApp, ALL_EDGE_KINDS};
+use crate::app::{SpaghettiApp, ALL_EDGE_KINDS, ALL_SYMBOL_KINDS};
 
 impl SpaghettiApp {
     /// Draw the right panel: details of selected symbol + layout controls.
@@ -156,30 +156,15 @@ impl SpaghettiApp {
 
                     ui.add_space(8.0);
 
-                    // Node colors
-                    let nid = ui.make_persistent_id("render_node_colors");
-                    egui::collapsing_header::CollapsingState::load_with_default_open(
-                        ui.ctx(),
-                        nid,
-                        false,
-                    )
-                    .show_header(ui, |ui| {
-                        ui.label("Node Colors");
-                    })
-                    .body(|ui| {
-                        for kind_name in &[
-                            "Class",
-                            "Struct",
-                            "Function",
-                            "Method",
-                            "Field",
-                            "Namespace",
-                            "TemplateInstantiation",
-                            "TranslationUnit",
-                        ] {
-                            color_swatch_row(ui, &mut self.render.node_colors, kind_name);
+                    // Node types: toggleable color swatches that also control filtering.
+                    ui.label("Node Types");
+                    for &kind in &ALL_SYMBOL_KINDS {
+                        let kind_name = format!("{kind:?}");
+                        let enabled = self.node_filter.is_enabled(kind);
+                        if toggle_swatch(ui, &mut self.render.node_colors, &kind_name, enabled) {
+                            self.node_filter.toggle(kind);
                         }
-                    });
+                    }
 
                     // Edge types: toggleable color swatches that also control filtering.
                     ui.add_space(4.0);
@@ -187,8 +172,7 @@ impl SpaghettiApp {
                     for &kind in &ALL_EDGE_KINDS {
                         let kind_name = format!("{kind:?}");
                         let enabled = self.edge_filter.is_enabled(kind);
-                        if edge_toggle_swatch(ui, &mut self.render.edge_colors, &kind_name, enabled)
-                        {
+                        if toggle_swatch(ui, &mut self.render.edge_colors, &kind_name, enabled) {
                             self.edge_filter.toggle(kind);
                         }
                     }
@@ -237,36 +221,30 @@ impl SpaghettiApp {
                     ui.add_space(8.0);
                     ui.label("Per-Edge Kind");
 
+                    let default_ep = layout::EdgeKindParams {
+                        target_distance: 150.0,
+                        attraction: 0.01,
+                    };
+
                     for kind in &ALL_EDGE_KINDS {
                         let label = format!("{kind:?}");
-                        let id = ui.make_persistent_id(format!("edge_kind_{label}"));
-                        egui::collapsing_header::CollapsingState::load_with_default_open(
-                            ui.ctx(),
-                            id,
-                            false,
-                        )
-                        .show_header(ui, |ui| {
-                            ui.label(&label);
-                        })
-                        .body(|ui| {
-                            let params = self.layout_state.params_mut();
-                            if let Some(ep) = params.edge_params.get_mut(kind) {
-                                changed |= ui
-                                    .add(
-                                        egui::Slider::new(&mut ep.target_distance, 10.0..=500.0)
-                                            .text("Target dist"),
-                                    )
-                                    .changed();
+                        ui.add_space(4.0);
+                        ui.label(&label);
 
-                                changed |= ui
-                                    .add(
-                                        egui::Slider::new(&mut ep.attraction, 0.001..=0.5)
-                                            .logarithmic(true)
-                                            .text("Attraction"),
-                                    )
-                                    .changed();
-                            }
-                        });
+                        let params = self.layout_state.params_mut();
+                        let ep = params.edge_params.entry(*kind).or_insert(default_ep);
+                        changed |= ui
+                            .add(
+                                egui::Slider::new(&mut ep.target_distance, 1.0..=100.0)
+                                    .text("Target dist"),
+                            )
+                            .changed();
+
+                        changed |= ui
+                            .add(
+                                egui::Slider::new(&mut ep.attraction, 0.0..=1.0).text("Attraction"),
+                            )
+                            .changed();
                     }
 
                     ui.add_space(8.0);
@@ -312,6 +290,19 @@ impl SpaghettiApp {
                         self.layout_state.randomize();
                     }
 
+                    let pause_label = if self.paused {
+                        "Resume (P)"
+                    } else {
+                        "Pause (P)"
+                    };
+                    if ui
+                        .button(pause_label)
+                        .on_hover_text("Pause or resume the force-directed simulation")
+                        .clicked()
+                    {
+                        self.paused = !self.paused;
+                    }
+
                     if changed {
                         self.layout_state.reheat();
                     }
@@ -320,45 +311,10 @@ impl SpaghettiApp {
     }
 }
 
-/// Draw a single color swatch row: a wide colored rectangle with the label
-/// inside it, clicking opens a color picker.
-fn color_swatch_row(
-    ui: &mut egui::Ui,
-    colors: &mut std::collections::HashMap<String, crate::settings::Rgb>,
-    name: &str,
-) {
-    let rgb = colors.entry(name.to_string()).or_insert([80, 80, 80]);
-    let mut color = egui::Color32::from_rgb(rgb[0], rgb[1], rgb[2]);
-
-    // Draw a colored button that fills the available width.
-    let available = ui.available_width();
-    let size = egui::vec2(available, 20.0);
-    let (rect, response) = ui.allocate_exact_size(size, egui::Sense::click());
-
-    // Paint the swatch background.
-    ui.painter().rect_filled(rect, 3.0, color);
-
-    // Paint the label text on top.
-    ui.painter().text(
-        rect.center(),
-        egui::Align2::CENTER_CENTER,
-        name,
-        egui::FontId::proportional(12.0),
-        egui::Color32::WHITE,
-    );
-
-    // Open a color popup on click.
-    egui::Popup::from_toggle_button_response(&response).show(|ui: &mut egui::Ui| {
-        ui.set_min_width(200.0);
-        egui::color_picker::color_picker_color32(ui, &mut color, egui::color_picker::Alpha::Opaque);
-        *rgb = [color.r(), color.g(), color.b()];
-    });
-}
-
-/// Draw an edge toggle swatch: a wide colored rectangle with the label inside.
-/// Left-click toggles the edge type on/off. Right-click opens the color picker.
+/// Draw a toggle swatch: a wide colored rectangle with the label inside.
+/// Left-click toggles the type on/off. Right-click opens the color picker.
 /// Returns `true` if the toggle state changed.
-fn edge_toggle_swatch(
+fn toggle_swatch(
     ui: &mut egui::Ui,
     colors: &mut std::collections::HashMap<String, crate::settings::Rgb>,
     name: &str,

@@ -7,7 +7,7 @@ use std::sync::{Arc, Mutex};
 
 use std::collections::HashMap;
 
-use core_ir::{EdgeKind, Graph, SymbolId};
+use core_ir::{EdgeKind, Graph, SymbolId, SymbolKind};
 use layout::{LayoutState, Positions};
 use tracing::Level;
 
@@ -18,6 +18,18 @@ use crate::fps::FpsCounter;
 use crate::log_capture::LogBuffer;
 use crate::progress::{ProgressMessage, ProgressState};
 use crate::settings::ViewSettings;
+
+/// All symbol kinds in the system.
+pub(crate) const ALL_SYMBOL_KINDS: [SymbolKind; 8] = [
+    SymbolKind::Class,
+    SymbolKind::Struct,
+    SymbolKind::Function,
+    SymbolKind::Method,
+    SymbolKind::Field,
+    SymbolKind::Namespace,
+    SymbolKind::TemplateInstantiation,
+    SymbolKind::TranslationUnit,
+];
 
 /// All edge kinds in the system.
 pub(crate) const ALL_EDGE_KINDS: [EdgeKind; 9] = [
@@ -87,6 +99,56 @@ impl EdgeKindFilter {
     }
 }
 
+/// Symbol kind filter state — tracks which node kinds are visible.
+pub(crate) struct SymbolKindFilter {
+    enabled: HashSet<SymbolKind>,
+}
+
+impl Default for SymbolKindFilter {
+    fn default() -> Self {
+        Self {
+            enabled: ALL_SYMBOL_KINDS.iter().copied().collect(),
+        }
+    }
+}
+
+impl SymbolKindFilter {
+    /// Restore from saved node filter map. Missing keys default to enabled.
+    pub(crate) fn from_saved(saved: &HashMap<String, bool>) -> Self {
+        let mut enabled = HashSet::new();
+        for &kind in &ALL_SYMBOL_KINDS {
+            let key = format!("{kind:?}");
+            let is_enabled = saved.get(&key).copied().unwrap_or(true);
+            if is_enabled {
+                enabled.insert(kind);
+            }
+        }
+        Self { enabled }
+    }
+
+    /// Export current state as a string-keyed map for serialization.
+    pub(crate) fn to_saved(&self) -> HashMap<String, bool> {
+        ALL_SYMBOL_KINDS
+            .iter()
+            .map(|&kind| (format!("{kind:?}"), self.enabled.contains(&kind)))
+            .collect()
+    }
+
+    /// Check whether a specific symbol kind is enabled.
+    pub(crate) fn is_enabled(&self, kind: SymbolKind) -> bool {
+        self.enabled.contains(&kind)
+    }
+
+    /// Toggle a specific symbol kind on or off.
+    pub(crate) fn toggle(&mut self, kind: SymbolKind) {
+        if self.enabled.contains(&kind) {
+            self.enabled.remove(&kind);
+        } else {
+            self.enabled.insert(kind);
+        }
+    }
+}
+
 /// Parse a tracing level from a string, defaulting to INFO.
 fn level_from_str(s: &str) -> Level {
     match s {
@@ -113,6 +175,7 @@ pub struct SpaghettiApp {
     pub(crate) camera: Camera2D,
     pub(crate) selection: Option<SymbolId>,
     pub(crate) edge_filter: EdgeKindFilter,
+    pub(crate) node_filter: SymbolKindFilter,
     pub(crate) search: String,
     /// The node currently being dragged, if any.
     pub(crate) dragging: Option<SymbolId>,
@@ -124,6 +187,10 @@ pub struct SpaghettiApp {
     pub(crate) file_tree: FileTree,
     /// Symbols currently hidden by file-tree visibility toggles.
     pub(crate) hidden_symbols: HashSet<SymbolId>,
+    /// Whether the layout simulation is paused.
+    pub(crate) paused: bool,
+    /// Saved directory visibility (applied after indexing completes).
+    pub(crate) pending_dir_visibility: HashMap<String, bool>,
 
     // -- Rendering settings (persisted) --
     pub(crate) render: crate::settings::RenderSettings,
@@ -184,12 +251,15 @@ impl SpaghettiApp {
             camera,
             selection: None,
             edge_filter: EdgeKindFilter::from_saved(&view.edge_filters),
+            node_filter: SymbolKindFilter::from_saved(&view.node_filters),
             search: String::new(),
             dragging: None,
             auto_fitted: false,
             frame_count: 0,
             file_tree,
             hidden_symbols,
+            paused: false,
+            pending_dir_visibility: view.dir_visibility.clone(),
             render,
             show_console: view.show_console,
             indexing: false,
@@ -218,6 +288,7 @@ impl SpaghettiApp {
     pub(crate) fn view_settings(&self) -> ViewSettings {
         ViewSettings {
             edge_filters: self.edge_filter.to_saved(),
+            node_filters: self.node_filter.to_saved(),
             camera_offset: [self.camera.offset.x, self.camera.offset.y],
             camera_zoom: self.camera.zoom,
             show_console: self.show_console,
@@ -303,47 +374,49 @@ impl SpaghettiApp {
                 return;
             }
 
-            // Check for cancellation before starting
-            if cancel_rx.try_recv().is_ok() {
-                if let Err(e) = progress_tx.send(ProgressMessage::Cancelled) {
-                    tracing::warn!("progress channel closed: {e}");
-                }
-                return;
-            }
+            let tx = progress_tx.clone();
+            let result =
+                frontend_clang::index_project_with_progress(&path, move |current, total, file| {
+                    // Check for cancellation
+                    if cancel_rx.try_recv().is_ok() {
+                        return false;
+                    }
+                    let _ = tx.send(ProgressMessage::Progress { current, total });
+                    let _ = tx.send(ProgressMessage::Status(format!(
+                        "Indexing TU {}/{}: {}",
+                        current + 1,
+                        total,
+                        file,
+                    )));
+                    true
+                });
 
-            match frontend_clang::index_project(&path) {
+            match result {
                 Ok(graph) => {
-                    if let Err(e) = progress_tx.send(ProgressMessage::Log(format!(
+                    if graph.symbol_count() == 0 && graph.edge_count() == 0 {
+                        // Cancelled mid-indexing, nothing useful produced
+                        let _ = progress_tx.send(ProgressMessage::Cancelled);
+                        return;
+                    }
+
+                    let _ = progress_tx.send(ProgressMessage::Log(format!(
                         "Indexed {} symbols, {} edges",
                         graph.symbol_count(),
                         graph.edge_count()
-                    ))) {
-                        tracing::warn!("progress channel closed: {e}");
-                        return;
-                    }
+                    )));
 
-                    if let Err(e) =
-                        progress_tx.send(ProgressMessage::Status("Computing layout…".into()))
-                    {
-                        tracing::warn!("progress channel closed: {e}");
-                        return;
-                    }
+                    let _ = progress_tx.send(ProgressMessage::Status("Computing layout…".into()));
 
                     let mut layout_state = layout::LayoutState::new(&graph, 42, params);
                     layout_state.step(200);
 
-                    if let Err(e) = progress_tx.send(ProgressMessage::Done {
+                    let _ = progress_tx.send(ProgressMessage::Done {
                         graph: Box::new(graph),
                         layout_state: Box::new(layout_state),
-                    }) {
-                        tracing::warn!("progress channel closed: {e}");
-                    }
+                    });
                 }
                 Err(e) => {
-                    if let Err(send_err) = progress_tx.send(ProgressMessage::Failed(format!("{e}")))
-                    {
-                        tracing::warn!("progress channel closed: {send_err}");
-                    }
+                    let _ = progress_tx.send(ProgressMessage::Failed(format!("{e}")));
                 }
             }
         });
@@ -380,7 +453,12 @@ impl SpaghettiApp {
                     graph,
                     layout_state,
                 } => {
+                    // Preserve directory visibility: merge pending (from
+                    // settings on disk) with current tree state.
+                    let mut vis = self.pending_dir_visibility.clone();
+                    vis.extend(self.file_tree.visibility_map());
                     self.file_tree = FileTree::from_graph(&graph);
+                    self.file_tree.apply_visibility(&vis);
                     self.graph = *graph;
                     self.layout_state = *layout_state;
                     self.sync_hidden_symbols();
