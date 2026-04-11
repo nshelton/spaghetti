@@ -2,6 +2,7 @@
 
 use core_ir::{EdgeKind, SymbolKind};
 use egui::{Color32, Rect, Stroke, StrokeKind, Vec2};
+use glam::Vec2 as GVec2;
 
 use crate::app::{SpaghettiApp, ENERGY_THRESHOLD};
 use crate::camera::{NODE_HEIGHT, NODE_WIDTH};
@@ -75,9 +76,11 @@ impl SpaghettiApp {
                 .step_budgeted(std::time::Duration::from_millis(8));
             self.positions = self.layout_state.positions();
 
-            // Auto-fit camera once the layout settles for the first time.
+            // Auto-fit camera once the layout settles or after a timeout.
             let energy = self.layout_state.energy();
-            if !self.auto_fitted && energy < ENERGY_THRESHOLD {
+            self.frame_count = self.frame_count.saturating_add(1);
+            let auto_fit_timeout = self.frame_count >= 120; // ~2s at 60fps
+            if !self.auto_fitted && (energy < ENERGY_THRESHOLD || auto_fit_timeout) {
                 self.camera
                     .fit_to_bounds(&self.positions, response.rect.size());
                 self.auto_fitted = true;
@@ -94,7 +97,18 @@ impl SpaghettiApp {
                 ui.ctx().request_repaint();
             }
 
-            // Draw edges
+            // Viewport culling: compute the visible world-space rectangle
+            // with a margin so partially-visible nodes/edges aren't clipped.
+            let margin = NODE_WIDTH; // world-space margin
+            let (vis_min, vis_max) = self.camera.visible_world_rect(response.rect);
+            let vis_min = GVec2::new(vis_min.x - margin, vis_min.y - margin);
+            let vis_max = GVec2::new(vis_max.x + margin, vis_max.y + margin);
+
+            // LOD thresholds based on zoom level.
+            let draw_labels = self.camera.zoom >= 0.4;
+            let draw_rects = self.camera.zoom >= 0.15;
+
+            // Draw edges (skip if both endpoints are outside the viewport)
             for edge in &self.graph.edges {
                 if !active_kinds.contains(&edge.kind) {
                     continue;
@@ -102,6 +116,19 @@ impl SpaghettiApp {
                 let from_pos = self.positions.0.get(&edge.from);
                 let to_pos = self.positions.0.get(&edge.to);
                 if let (Some(&from), Some(&to)) = (from_pos, to_pos) {
+                    // Cull: skip edge if both endpoints are outside the viewport.
+                    let from_visible = from.x >= vis_min.x
+                        && from.x <= vis_max.x
+                        && from.y >= vis_min.y
+                        && from.y <= vis_max.y;
+                    let to_visible = to.x >= vis_min.x
+                        && to.x <= vis_max.x
+                        && to.y >= vis_min.y
+                        && to.y <= vis_max.y;
+                    if !from_visible && !to_visible {
+                        continue;
+                    }
+
                     let screen_from = self.camera.world_to_screen(from, canvas_center);
                     let screen_to = self.camera.world_to_screen(to, canvas_center);
 
@@ -117,34 +144,56 @@ impl SpaghettiApp {
             );
             for (id, sym) in &self.graph.symbols {
                 if let Some(&world_pos) = self.positions.0.get(id) {
+                    // Viewport culling: skip nodes entirely outside the visible area.
+                    if world_pos.x < vis_min.x
+                        || world_pos.x > vis_max.x
+                        || world_pos.y < vis_min.y
+                        || world_pos.y > vis_max.y
+                    {
+                        continue;
+                    }
+
                     let screen_pos = self.camera.world_to_screen(world_pos, canvas_center);
-                    let rect = Rect::from_center_size(screen_pos, node_size);
 
-                    // Background
-                    let base = node_color(sym.kind);
-                    let bg = if self.selection == Some(*id) {
-                        brighten(base, 2.0)
+                    if draw_rects {
+                        let rect = Rect::from_center_size(screen_pos, node_size);
+
+                        // Background
+                        let base = node_color(sym.kind);
+                        let bg = if self.selection == Some(*id) {
+                            brighten(base, 2.0)
+                        } else {
+                            base
+                        };
+                        painter.rect_filled(rect, 4.0, bg);
+                        painter.rect_stroke(
+                            rect,
+                            4.0,
+                            Stroke::new(1.0, Color32::from_gray(60)),
+                            StrokeKind::Outside,
+                        );
+
+                        // Label (only when zoomed in enough)
+                        if draw_labels {
+                            let font = egui::FontId::proportional(12.0 * self.camera.zoom);
+                            painter.text(
+                                screen_pos,
+                                egui::Align2::CENTER_CENTER,
+                                &sym.name,
+                                font,
+                                Color32::WHITE,
+                            );
+                        }
                     } else {
-                        base
-                    };
-                    painter.rect_filled(rect, 4.0, bg);
-                    painter.rect_stroke(
-                        rect,
-                        4.0,
-                        Stroke::new(1.0, Color32::from_gray(60)),
-                        StrokeKind::Outside,
-                    );
-
-                    // Label
-                    let font = egui::FontId::proportional(12.0 * self.camera.zoom);
-                    let text_color = Color32::WHITE;
-                    painter.text(
-                        screen_pos,
-                        egui::Align2::CENTER_CENTER,
-                        &sym.name,
-                        font,
-                        text_color,
-                    );
+                        // At very low zoom, draw a simple dot for each node.
+                        let base = node_color(sym.kind);
+                        let color = if self.selection == Some(*id) {
+                            brighten(base, 2.0)
+                        } else {
+                            base
+                        };
+                        painter.circle_filled(screen_pos, 2.0, color);
+                    }
                 }
             }
 

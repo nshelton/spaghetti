@@ -7,9 +7,8 @@ edition = "2021"
 core-ir = { workspace = true }
 glam = { workspace = true }
 indexmap = { workspace = true }
-thiserror = { workspace = true }
-tracing = { workspace = true }
-
-[dev-dependencies]
+rayon = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
+thiserror = { workspace = true }
+tracing = { workspace = true }

@@ -14,6 +14,7 @@ layout = { workspace = true }
 query = { workspace = true }
 eframe = { workspace = true }
 egui = { workspace = true }
+serde = { workspace = true }
 serde_json = { workspace = true }
 anyhow = { workspace = true }
 tracing = { workspace = true }

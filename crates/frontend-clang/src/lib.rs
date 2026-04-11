@@ -109,7 +109,11 @@ pub fn index_project(compile_commands: &Path) -> Result<Graph, ClangError> {
             match index_translation_unit(cmd, &work_dir, &project_root, &index, &args) {
                 Ok(g) => {
                     debug!(file = %file_path.display(), symbols = g.symbol_count(), "indexed TU");
-                    cache::store(&cache_dir, key, &g);
+                    // Only cache non-empty results — an empty graph likely means
+                    // indexing failed silently and we don't want to persist that.
+                    if g.symbol_count() > 0 {
+                        cache::store(&cache_dir, key, &g);
+                    }
                     Some(g)
                 }
                 Err(e) => {

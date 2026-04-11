@@ -71,6 +71,8 @@ pub struct SpaghettiApp {
     pub(crate) dragging: Option<SymbolId>,
     /// Whether the initial auto-fit has been performed.
     pub(crate) auto_fitted: bool,
+    /// Frame counter used to trigger auto-fit after a timeout.
+    pub(crate) frame_count: u32,
 
     // -- Menu / UI state --
     pub(crate) show_console: bool,
@@ -107,6 +109,7 @@ impl SpaghettiApp {
             search: String::new(),
             dragging: None,
             auto_fitted: false,
+            frame_count: 0,
             show_console: false,
             indexing: false,
             log_buffer,
@@ -170,6 +173,7 @@ impl SpaghettiApp {
     /// Start indexing a file in a background thread.
     fn start_indexing(&mut self, path: PathBuf) {
         self.indexing = true;
+        let params = self.layout_state.params().clone();
 
         let (progress_tx, progress_rx) = std::sync::mpsc::channel();
         let (cancel_tx, cancel_rx) = std::sync::mpsc::channel::<()>();
@@ -200,8 +204,7 @@ impl SpaghettiApp {
 
                     let _ = progress_tx.send(ProgressMessage::Status("Computing layout…".into()));
 
-                    let mut layout_state =
-                        layout::LayoutState::new(&graph, 42, layout::ForceParams::default());
+                    let mut layout_state = layout::LayoutState::new(&graph, 42, params);
                     layout_state.step(200);
 
                     let _ = progress_tx.send(ProgressMessage::Done {
@@ -254,6 +257,7 @@ impl SpaghettiApp {
                     self.camera = Camera2D::default();
                     self.dragging = None;
                     self.auto_fitted = false;
+                    self.frame_count = 0;
                     self.finish_indexing();
                 }
                 ProgressMessage::Failed(ref err) => {
@@ -354,6 +358,13 @@ impl eframe::App for SpaghettiApp {
         self.right_panel(ui);
         self.central_panel(ui);
         self.progress_overlay(ui);
+    }
+
+    fn on_exit(&mut self) {
+        let settings = crate::settings::AppSettings {
+            force_params: self.layout_state.params().clone(),
+        };
+        settings.save();
     }
 }
 

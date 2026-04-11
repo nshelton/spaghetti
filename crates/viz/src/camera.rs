@@ -59,6 +59,18 @@ impl Camera2D {
         self.zoom = (self.zoom * factor).clamp(ZOOM_MIN, ZOOM_MAX);
     }
 
+    /// Compute the world-space axis-aligned bounding box visible in the
+    /// viewport.
+    ///
+    /// `canvas_rect` is the pixel rectangle of the drawing area. Returns
+    /// `(min, max)` corners in world coordinates.
+    pub fn visible_world_rect(&self, canvas_rect: egui::Rect) -> (GVec2, GVec2) {
+        let center = canvas_rect.center();
+        let min = self.screen_to_world(canvas_rect.left_top(), center);
+        let max = self.screen_to_world(canvas_rect.right_bottom(), center);
+        (min, max)
+    }
+
     /// Set offset and zoom so all node positions fit within the viewport.
     ///
     /// `viewport_size` is the pixel dimensions of the drawing area. Adds 10%
@@ -86,7 +98,8 @@ impl Camera2D {
             1.0
         };
 
-        self.zoom = zoom.clamp(ZOOM_MIN, ZOOM_MAX);
+        // Cap auto-fit zoom at 2.0 so small graphs don't appear enormous.
+        self.zoom = zoom.clamp(ZOOM_MIN, 2.0);
         self.offset = egui::Vec2::new(-center.x, -center.y);
     }
 }

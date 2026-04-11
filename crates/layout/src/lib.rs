@@ -10,9 +10,10 @@
 use core_ir::{EdgeKind, Graph, SymbolId};
 use glam::Vec2;
 use indexmap::IndexMap;
+use rayon::prelude::*;
+use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, VecDeque};
 use std::time::{Duration, Instant};
-use tracing::info;
 
 /// Mapping from symbol IDs to 2D positions.
 ///
@@ -26,16 +27,28 @@ pub trait Layout {
     fn compute(&self, graph: &Graph) -> Positions;
 }
 
+/// Per-edge-kind tuneable parameters.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
+pub struct EdgeKindParams {
+    /// Rest length of springs for this edge kind.
+    pub target_distance: f32,
+    /// Spring attraction coefficient for this edge kind.
+    pub attraction: f32,
+}
+
 /// Tuneable constants for the force-directed simulation.
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ForceParams {
     /// Coulomb-like repulsion strength (all pairs).
     pub repulsion: f32,
-    /// Spring attraction coefficient (edges only).
+    /// Global spring attraction coefficient (fallback for edge kinds not in
+    /// [`edge_params`](Self::edge_params)).
     pub attraction: f32,
-    /// Velocity damping factor applied each step.
+    /// Velocity damping factor applied each step (lower = more damping).
     pub damping: f32,
-    /// Rest length of edge springs.
+    /// Maximum velocity magnitude per node per step. Prevents wild overshooting.
+    pub max_velocity: f32,
+    /// Global rest length of edge springs (fallback).
     pub ideal_length: f32,
     /// Minimum distance clamped to avoid division by near-zero.
     pub min_dist: f32,
@@ -43,17 +56,55 @@ pub struct ForceParams {
     /// skip the expensive per-pair calculation. Set to `f32::INFINITY` to
     /// disable the optimisation and fall back to all-pairs.
     pub repulsion_cutoff: f32,
+    /// Gentle pull toward the centroid of all nodes. Keeps disconnected
+    /// components from drifting to infinity. Set to `0.0` to disable.
+    pub gravity: f32,
+    /// Per-edge-kind overrides for attraction and target distance.
+    pub edge_params: HashMap<EdgeKind, EdgeKindParams>,
 }
 
 impl Default for ForceParams {
     fn default() -> Self {
+        let mut edge_params = HashMap::new();
+        edge_params.insert(
+            EdgeKind::Contains,
+            EdgeKindParams {
+                target_distance: 80.0,
+                attraction: 0.015,
+            },
+        );
+        edge_params.insert(
+            EdgeKind::Calls,
+            EdgeKindParams {
+                target_distance: 150.0,
+                attraction: 0.01,
+            },
+        );
+        edge_params.insert(
+            EdgeKind::Inherits,
+            EdgeKindParams {
+                target_distance: 200.0,
+                attraction: 0.008,
+            },
+        );
+        edge_params.insert(
+            EdgeKind::Overrides,
+            EdgeKindParams {
+                target_distance: 120.0,
+                attraction: 0.012,
+            },
+        );
+
         Self {
             repulsion: 5000.0,
             attraction: 0.01,
-            damping: 0.9,
+            damping: 0.75,
             ideal_length: 150.0,
+            max_velocity: 50.0,
             min_dist: 1.0,
             repulsion_cutoff: 500.0,
+            gravity: 0.5,
+            edge_params,
         }
     }
 }
@@ -73,6 +124,8 @@ pub struct LayoutState {
     id_to_idx: IndexMap<SymbolId, usize>,
     pins: IndexMap<SymbolId, Vec2>,
     params: ForceParams,
+    /// Total steps run so far, used for adaptive cooling.
+    total_steps: u32,
 }
 
 impl LayoutState {
@@ -132,6 +185,7 @@ impl LayoutState {
             id_to_idx,
             pins: IndexMap::new(),
             params,
+            total_steps: 0,
         }
     }
 
@@ -161,84 +215,116 @@ impl LayoutState {
     fn step_inner(&mut self, n: u32, early_stop: bool) {
         /// Energy threshold below which batch layout stops early.
         const EARLY_STOP_ENERGY: f32 = 0.5;
+        /// Threshold below which we use serial computation (rayon overhead not
+        /// worth it for small graphs).
+        const PARALLEL_THRESHOLD: usize = 500;
 
         let len = self.positions.len();
+        if len == 0 {
+            return;
+        }
         let p = &self.params;
 
         for _ in 0..n {
             if early_stop && self.energy() < EARLY_STOP_ENERGY {
                 break;
             }
-            let mut forces = vec![Vec2::ZERO; len];
 
-            // Repulsive forces — grid-based cutoff for ~O(n) instead of O(n²).
-            // Nodes are bucketed into cells of size `cutoff`. Only pairs in the
-            // same or adjacent cells (3×3 neighbourhood) are evaluated.
+            // --- Repulsive forces via grid-based cutoff ---
             let cutoff = p.repulsion_cutoff;
             let cutoff_sq = cutoff * cutoff;
             let inv_cutoff = 1.0 / cutoff;
+            let repulsion = p.repulsion;
+            let min_dist = p.min_dist;
 
-            // Build spatial grid
-            let mut grid: HashMap<(i32, i32), Vec<usize>> = HashMap::new();
-            for i in 0..len {
-                let cx = (self.positions[i].x * inv_cutoff).floor() as i32;
-                let cy = (self.positions[i].y * inv_cutoff).floor() as i32;
-                grid.entry((cx, cy)).or_default().push(i);
+            // Build spatial grid: assign each node to a cell.
+            let cell_keys: Vec<(i32, i32)> = self
+                .positions
+                .iter()
+                .map(|pos| {
+                    let cx = (pos.x * inv_cutoff).floor() as i32;
+                    let cy = (pos.y * inv_cutoff).floor() as i32;
+                    (cx, cy)
+                })
+                .collect();
+
+            let mut grid: HashMap<(i32, i32), Vec<usize>> = HashMap::with_capacity(len / 4 + 1);
+            for (i, &key) in cell_keys.iter().enumerate() {
+                grid.entry(key).or_default().push(i);
             }
 
-            // Iterate over each cell and its neighbours
-            let offsets: [(i32, i32); 5] = [(0, 0), (1, 0), (0, 1), (1, 1), (-1, 1)];
-            for (&(cx, cy), cell) in &grid {
-                // Pairs within the same cell
-                for a in 0..cell.len() {
-                    for b in (a + 1)..cell.len() {
-                        let i = cell[a];
-                        let j = cell[b];
-                        let delta = self.positions[i] - self.positions[j];
-                        let dist_sq = delta.length_squared();
-                        if dist_sq > cutoff_sq {
-                            continue;
-                        }
-                        let dist = dist_sq.sqrt().max(p.min_dist);
-                        let force = delta.normalize_or_zero() * (p.repulsion / (dist * dist));
-                        forces[i] += force;
-                        forces[j] -= force;
-                    }
-                }
+            // Compute repulsive forces per-node in parallel.
+            // Each node accumulates its own force by scanning its 3×3
+            // neighbourhood, avoiding the need for atomic writes.
+            let positions_ref = &self.positions;
+            let grid_ref = &grid;
 
-                // Pairs with neighbouring cells (avoid double-counting via
-                // half-neighbourhood offsets, skipping (0,0) which is handled above)
-                for &(dx, dy) in &offsets[1..] {
-                    if let Some(neighbor_cell) = grid.get(&(cx + dx, cy + dy)) {
-                        for &i in cell {
-                            for &j in neighbor_cell {
-                                let delta = self.positions[i] - self.positions[j];
-                                let dist_sq = delta.length_squared();
-                                if dist_sq > cutoff_sq {
-                                    continue;
-                                }
-                                let dist = dist_sq.sqrt().max(p.min_dist);
-                                let force =
-                                    delta.normalize_or_zero() * (p.repulsion / (dist * dist));
-                                forces[i] += force;
-                                forces[j] -= force;
-                            }
-                        }
-                    }
-                }
-            }
+            let repulsive_forces: Vec<Vec2> = if len >= PARALLEL_THRESHOLD {
+                (0..len)
+                    .into_par_iter()
+                    .map(|i| {
+                        compute_repulsion_for_node(
+                            i,
+                            positions_ref,
+                            grid_ref,
+                            &cell_keys,
+                            cutoff_sq,
+                            inv_cutoff,
+                            repulsion,
+                            min_dist,
+                        )
+                    })
+                    .collect()
+            } else {
+                (0..len)
+                    .map(|i| {
+                        compute_repulsion_for_node(
+                            i,
+                            positions_ref,
+                            grid_ref,
+                            &cell_keys,
+                            cutoff_sq,
+                            inv_cutoff,
+                            repulsion,
+                            min_dist,
+                        )
+                    })
+                    .collect()
+            };
 
-            // Attractive forces along visible edges only
+            let mut forces = repulsive_forces;
+
+            // Attractive forces along visible edges only (per-edge-kind params)
             for &(from, to, kind) in &self.edge_pairs {
                 if !self.visible_edge_kinds.contains(&kind) {
                     continue;
                 }
+                let (attr, rest_len) = if let Some(ep) = p.edge_params.get(&kind) {
+                    (ep.attraction, ep.target_distance)
+                } else {
+                    (p.attraction, p.ideal_length)
+                };
                 let delta = self.positions[to] - self.positions[from];
                 let dist = delta.length().max(p.min_dist);
-                let force = delta.normalize_or_zero() * p.attraction * (dist - p.ideal_length);
+                let force = delta.normalize_or_zero() * attr * (dist - rest_len);
                 forces[from] += force;
                 forces[to] -= force;
             }
+
+            // Gravity: gentle pull toward the centroid
+            if p.gravity > 0.0 {
+                let centroid = self.positions.iter().copied().sum::<Vec2>() / len as f32;
+                for (force, pos) in forces.iter_mut().zip(self.positions.iter()) {
+                    *force += (centroid - *pos) * p.gravity;
+                }
+            }
+
+            // Adaptive cooling: damping decreases over time so the layout
+            // progressively freezes into place.
+            let cooling = (1.0 - (self.total_steps as f32 / 300.0).min(0.95)).max(0.05);
+            let effective_damping = p.damping * cooling;
+            let max_vel = p.max_velocity * cooling;
+            self.total_steps += 1;
 
             // Update velocities and positions (skip pinned nodes)
             let iter = self
@@ -253,7 +339,12 @@ impl LayoutState {
                     *pos = pin_pos;
                     *vel = Vec2::ZERO;
                 } else {
-                    *vel = (*vel + *force) * p.damping;
+                    *vel = (*vel + *force) * effective_damping;
+                    // Clamp velocity to prevent overshooting.
+                    let speed = vel.length();
+                    if speed > max_vel {
+                        *vel *= max_vel / speed;
+                    }
                     *pos += *vel;
                 }
             }
@@ -282,8 +373,13 @@ impl LayoutState {
     }
 
     /// Release a previously pinned node so it resumes normal simulation.
+    ///
+    /// Partially resets the cooling schedule so neighbours can re-settle
+    /// around the new position.
     pub fn unpin(&mut self, id: SymbolId) {
         self.pins.shift_remove(&id);
+        // Roll back cooling partially so the layout can re-settle.
+        self.total_steps = self.total_steps.saturating_sub(60);
     }
 
     /// Directly set a node's position (useful for updating a pin target
@@ -316,6 +412,66 @@ impl LayoutState {
     pub fn energy(&self) -> f32 {
         self.velocities.iter().map(|v| v.length_squared()).sum()
     }
+
+    /// Shared reference to the current force parameters.
+    pub fn params(&self) -> &ForceParams {
+        &self.params
+    }
+
+    /// Mutable reference to the force parameters for live-tweaking.
+    pub fn params_mut(&mut self) -> &mut ForceParams {
+        &mut self.params
+    }
+
+    /// Partially reset the cooling schedule so parameter changes take visible
+    /// effect. Call after modifying [`ForceParams`] via [`params_mut`](Self::params_mut).
+    pub fn reheat(&mut self) {
+        self.total_steps = self.total_steps.saturating_sub(100);
+    }
+}
+
+/// Compute repulsive force on node `i` from its 3×3 grid neighbourhood.
+///
+/// This is a per-node computation suitable for parallel execution — each
+/// call reads shared positions but writes only to its own output.
+#[allow(clippy::too_many_arguments)]
+fn compute_repulsion_for_node(
+    i: usize,
+    positions: &[Vec2],
+    grid: &HashMap<(i32, i32), Vec<usize>>,
+    cell_keys: &[(i32, i32)],
+    cutoff_sq: f32,
+    inv_cutoff: f32,
+    repulsion: f32,
+    min_dist: f32,
+) -> Vec2 {
+    let _ = inv_cutoff; // used for grid key computation at call site
+    let pos_i = positions[i];
+    let (cx, cy) = cell_keys[i];
+    let mut force = Vec2::ZERO;
+
+    // Scan 3×3 neighbourhood (including own cell)
+    for dx in -1..=1i32 {
+        for dy in -1..=1i32 {
+            let nx = cx.wrapping_add(dx);
+            let ny = cy.wrapping_add(dy);
+            if let Some(cell) = grid.get(&(nx, ny)) {
+                for &j in cell {
+                    if j == i {
+                        continue;
+                    }
+                    let delta = pos_i - positions[j];
+                    let dist_sq = delta.length_squared();
+                    if dist_sq > cutoff_sq || dist_sq < 1e-10 {
+                        continue;
+                    }
+                    let dist = dist_sq.sqrt().max(min_dist);
+                    force += delta.normalize_or_zero() * (repulsion / (dist * dist));
+                }
+            }
+        }
+    }
+    force
 }
 
 /// Force-directed layout with grid-based repulsion approximation.

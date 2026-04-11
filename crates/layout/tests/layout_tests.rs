@@ -504,7 +504,7 @@ fn test_incremental_matches_batch() {
     let params = ForceParams::default();
 
     // Batch: 100 steps in one call.
-    let mut batch = LayoutState::new(&g, 42, params);
+    let mut batch = LayoutState::new(&g, 42, params.clone());
     batch.step(100);
 
     // Incremental: 100 individual step(1) calls.
@@ -545,6 +545,45 @@ fn test_layout_state_empty_graph() {
     let positions = state.positions();
     assert!(positions.0.is_empty());
     assert_eq!(state.energy(), 0.0);
+}
+
+/// Extreme positions must not panic due to grid-cell coordinate overflow.
+///
+/// When nodes are placed at very large coordinates the spatial-grid bucketing
+/// computes cell indices near `i32::MAX`. Neighbour lookups (cell + offset)
+/// must not overflow. Regression test for the `attempt to add with overflow`
+/// panic on large graphs.
+#[test]
+fn test_extreme_positions_no_overflow() {
+    let mut g = Graph::new();
+    // Two nodes placed so that their grid-cell coordinates are near i32::MAX.
+    let a = make_symbol("Far1", SymbolKind::Class);
+    let b = make_symbol("Far2", SymbolKind::Class);
+    let a_id = a.id;
+    let b_id = b.id;
+    g.add_symbol(a);
+    g.add_symbol(b);
+    g.add_edge(Edge {
+        from: a_id,
+        to: b_id,
+        kind: EdgeKind::Calls,
+        location: None,
+    });
+
+    let mut state = LayoutState::new(&g, 42, ForceParams::default());
+
+    // Teleport nodes to extreme coordinates that push grid cells to i32 limits.
+    state.set_position(a_id, Vec2::new(1e15, 1e15));
+    state.set_position(b_id, Vec2::new(-1e15, -1e15));
+
+    // This must not panic.
+    state.step(10);
+
+    let positions = state.positions();
+    for (id, pos) in &positions.0 {
+        assert!(pos.x.is_finite(), "NaN/Inf x for {id:?}");
+        assert!(pos.y.is_finite(), "NaN/Inf y for {id:?}");
+    }
 }
 
 /// Multiple simultaneous pins must all hold their positions.

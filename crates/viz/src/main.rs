@@ -10,6 +10,7 @@ mod fps;
 mod log_capture;
 mod panels;
 mod progress;
+mod settings;
 
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
@@ -18,6 +19,7 @@ use anyhow::Result;
 use tracing::info;
 use tracing_subscriber::layer::SubscriberExt;
 use tracing_subscriber::util::SubscriberInitExt;
+use tracing_subscriber::EnvFilter;
 
 use log_capture::{LogBuffer, LogCaptureLayer};
 
@@ -27,9 +29,13 @@ fn main() -> Result<()> {
     let capture_layer = LogCaptureLayer::new(Arc::clone(&log_buffer));
 
     tracing_subscriber::registry()
+        .with(EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info")))
         .with(tracing_subscriber::fmt::layer())
         .with(capture_layer)
         .init();
+
+    // Load persisted settings (or defaults if no file yet).
+    let saved_settings = settings::AppSettings::load();
 
     // Optional CLI argument: path to compile_commands.json or graph.json.
     let path = std::env::args().nth(1).map(PathBuf::from);
@@ -48,8 +54,8 @@ fn main() -> Result<()> {
             "indexed project"
         );
 
-        // Create incremental layout state (the viz drives it frame-by-frame)
-        let layout_state = layout::LayoutState::new(&graph, 42, layout::ForceParams::default());
+        // Create incremental layout state with persisted force params.
+        let layout_state = layout::LayoutState::new(&graph, 42, saved_settings.force_params);
 
         app::SpaghettiApp::new(graph, layout_state, log_buffer)
     } else {
