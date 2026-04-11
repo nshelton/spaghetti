@@ -1,7 +1,5 @@
 //! Central canvas panel: node and edge rendering, pan/zoom, dragging, selection.
 
-use std::collections::{HashMap, HashSet};
-
 use egui::{Color32, Rect, Stroke, StrokeKind, Vec2};
 use glam::Vec2 as GVec2;
 
@@ -11,10 +9,11 @@ use crate::app::{SpaghettiApp, ENERGY_THRESHOLD};
 use crate::camera::{NODE_HEIGHT, NODE_WIDTH};
 use crate::fps::paint_fps_overlay;
 
-/// Scale factor for collapsed container nodes (slightly larger than normal).
-const COLLAPSED_CONTAINER_SCALE: f32 = 1.3;
 /// World-space padding around children for expanded container backgrounds.
 const CONTAINER_PADDING: f32 = 30.0;
+/// Fixed world-space half-size for collapsed container boxes.
+/// Must match `COLLAPSED_HALF_SIZE` in the layout crate.
+const COLLAPSED_BOX_HALF: GVec2 = GVec2::new(80.0, 50.0);
 
 impl SpaghettiApp {
     /// Draw the central canvas: nodes and edges with interactive dragging.
@@ -197,50 +196,57 @@ impl SpaghettiApp {
             let draw_labels = !circle_mode && self.render.camera.zoom >= 0.4;
             let draw_rects = !circle_mode && self.render.camera.zoom >= 0.15;
 
-            // --- Build edge rerouting map for collapsed containers ---
-            let reroute = self.build_edge_reroute_map();
-
-            // --- 1. Draw expanded container backgrounds ---
+            // --- 1. Draw container backgrounds (expanded = dynamic bbox, collapsed = fixed box) ---
             self.simulation.container_rects.clear();
             for (id, sym) in &self.graph.graph.symbols {
-                if !self.simulation.layout_state.is_container(*id)
-                    || !self.simulation.layout_state.is_expanded(*id)
-                {
+                if !self.simulation.layout_state.is_container(*id) {
                     continue;
                 }
                 if self.filters.hidden_symbols.contains(id) {
                     continue;
                 }
-                let children = self.simulation.layout_state.children_of(*id);
-                if children.is_empty() {
-                    continue;
-                }
+                let is_expanded = self.simulation.layout_state.is_expanded(*id);
 
-                let mut min_w = GVec2::splat(f32::INFINITY);
-                let mut max_w = GVec2::splat(f32::NEG_INFINITY);
-                let mut has_visible = false;
-                for &child_id in &children {
-                    if self.filters.hidden_symbols.contains(&child_id) {
+                let Some(&parent_pos) = self.simulation.positions.0.get(id) else {
+                    continue;
+                };
+
+                let (min_w, max_w) = if is_expanded {
+                    // Dynamic bounding box from children positions.
+                    let children = self.simulation.layout_state.children_of(*id);
+                    if children.is_empty() {
                         continue;
                     }
-                    if let Some(&pos) = self.simulation.positions.0.get(&child_id) {
-                        min_w = min_w.min(pos - GVec2::new(NODE_WIDTH / 2.0, NODE_HEIGHT / 2.0));
-                        max_w = max_w.max(pos + GVec2::new(NODE_WIDTH / 2.0, NODE_HEIGHT / 2.0));
-                        has_visible = true;
+                    let mut mn = GVec2::splat(f32::INFINITY);
+                    let mut mx = GVec2::splat(f32::NEG_INFINITY);
+                    let mut has_visible = false;
+                    for &child_id in &children {
+                        if self.filters.hidden_symbols.contains(&child_id) {
+                            continue;
+                        }
+                        if let Some(&pos) = self.simulation.positions.0.get(&child_id) {
+                            mn = mn.min(pos - GVec2::new(NODE_WIDTH / 2.0, NODE_HEIGHT / 2.0));
+                            mx = mx.max(pos + GVec2::new(NODE_WIDTH / 2.0, NODE_HEIGHT / 2.0));
+                            has_visible = true;
+                        }
                     }
-                }
-                if !has_visible {
-                    continue;
-                }
-
-                if let Some(&parent_pos) = self.simulation.positions.0.get(id) {
-                    min_w = min_w.min(parent_pos - GVec2::new(NODE_WIDTH / 2.0, NODE_HEIGHT / 2.0));
-                    max_w = max_w.max(parent_pos + GVec2::new(NODE_WIDTH / 2.0, NODE_HEIGHT / 2.0));
-                }
-
-                let title_height = 20.0;
-                min_w -= GVec2::new(CONTAINER_PADDING, CONTAINER_PADDING + title_height);
-                max_w += GVec2::new(CONTAINER_PADDING, CONTAINER_PADDING);
+                    if !has_visible {
+                        continue;
+                    }
+                    mn = mn.min(parent_pos - GVec2::new(NODE_WIDTH / 2.0, NODE_HEIGHT / 2.0));
+                    mx = mx.max(parent_pos + GVec2::new(NODE_WIDTH / 2.0, NODE_HEIGHT / 2.0));
+                    let title_height = 20.0;
+                    mn -= GVec2::new(CONTAINER_PADDING, CONTAINER_PADDING + title_height);
+                    mx += GVec2::new(CONTAINER_PADDING, CONTAINER_PADDING);
+                    (mn, mx)
+                } else {
+                    // Fixed-size box for collapsed containers.
+                    let title_height = 10.0;
+                    (
+                        parent_pos - COLLAPSED_BOX_HALF - GVec2::new(0.0, title_height),
+                        parent_pos + COLLAPSED_BOX_HALF,
+                    )
+                };
 
                 if max_w.x < vis_min.x
                     || min_w.x > vis_max.x
@@ -257,16 +263,18 @@ impl SpaghettiApp {
                 self.simulation.container_rects.push((*id, container_rect));
 
                 let base_color = self.render.render.node_color(sym.kind);
-                let bg = with_alpha(base_color, 0.15);
+                let bg_alpha = if is_expanded { 0.15 } else { 0.25 };
+                let bg = with_alpha(base_color, bg_alpha);
                 painter.rect_filled(container_rect, 8.0, bg);
+                let border_w = if is_expanded { 1.0 } else { 2.0 };
                 painter.rect_stroke(
                     container_rect,
                     8.0,
-                    Stroke::new(1.0, with_alpha(base_color, 0.4)),
+                    Stroke::new(border_w, with_alpha(base_color, 0.5)),
                     StrokeKind::Outside,
                 );
 
-                // Always draw container titles regardless of circle mode.
+                // Draw container title.
                 if self.render.camera.zoom >= 0.15 {
                     let title_pos =
                         egui::Pos2::new(container_rect.left() + 6.0, container_rect.top() + 2.0);
@@ -281,23 +289,14 @@ impl SpaghettiApp {
                 }
             }
 
-            // --- 2. Draw edges (with rerouting for collapsed containers) ---
-            let mut drawn_aggregated: HashSet<(SymbolId, SymbolId, u8)> = HashSet::new();
-
+            // --- 2. Draw edges (direct, no rerouting) ---
             for edge in &self.graph.graph.edges {
                 if !active_kinds.contains(&edge.kind) {
                     continue;
                 }
 
-                let from_id = reroute.get(&edge.from).copied().unwrap_or(edge.from);
-                let to_id = reroute.get(&edge.to).copied().unwrap_or(edge.to);
-
-                if from_id == to_id {
-                    continue;
-                }
-
-                if self.filters.hidden_symbols.contains(&from_id)
-                    || self.filters.hidden_symbols.contains(&to_id)
+                if self.filters.hidden_symbols.contains(&edge.from)
+                    || self.filters.hidden_symbols.contains(&edge.to)
                 {
                     continue;
                 }
@@ -318,17 +317,8 @@ impl SpaghettiApp {
                     continue;
                 }
 
-                let is_rerouted =
-                    reroute.contains_key(&edge.from) || reroute.contains_key(&edge.to);
-                if is_rerouted {
-                    let kind_disc = edge.kind as u8;
-                    if !drawn_aggregated.insert((from_id, to_id, kind_disc)) {
-                        continue;
-                    }
-                }
-
-                let from_pos = self.simulation.positions.0.get(&from_id);
-                let to_pos = self.simulation.positions.0.get(&to_id);
+                let from_pos = self.simulation.positions.0.get(&edge.from);
+                let to_pos = self.simulation.positions.0.get(&edge.to);
                 if let (Some(&from), Some(&to)) = (from_pos, to_pos) {
                     let from_visible = from.x >= vis_min.x
                         && from.x <= vis_max.x
@@ -349,8 +339,7 @@ impl SpaghettiApp {
                         self.render.render.edge_color(edge.kind),
                         self.render.render.edge_opacity,
                     );
-                    let thickness = if is_rerouted { 2.5 } else { 1.5 };
-                    painter.line_segment([screen_from, screen_to], Stroke::new(thickness, color));
+                    painter.line_segment([screen_from, screen_to], Stroke::new(1.5, color));
                 }
             }
 
@@ -389,8 +378,6 @@ impl SpaghettiApp {
                 NODE_WIDTH * self.render.camera.zoom,
                 NODE_HEIGHT * self.render.camera.zoom,
             );
-            let container_node_size = node_size * COLLAPSED_CONTAINER_SCALE;
-
             for (id, sym) in &self.graph.graph.symbols {
                 if self.filters.hidden_symbols.contains(id) {
                     continue;
@@ -418,17 +405,14 @@ impl SpaghettiApp {
                         self.render.render.node_opacity,
                     );
 
-                    let is_container = self.simulation.layout_state.is_container(*id);
-                    let is_collapsed =
-                        is_container && !self.simulation.layout_state.is_expanded(*id);
+                    // Skip rendering container nodes as individual rects —
+                    // their box is drawn in the container background pass.
+                    if self.simulation.layout_state.is_container(*id) {
+                        continue;
+                    }
 
                     if draw_rects {
-                        let size = if is_collapsed {
-                            container_node_size
-                        } else {
-                            node_size
-                        };
-                        let rect = Rect::from_center_size(screen_pos, size);
+                        let rect = Rect::from_center_size(screen_pos, node_size);
 
                         let bg = if self.interaction.selection == Some(*id) {
                             brighten(base, 2.0)
@@ -436,27 +420,19 @@ impl SpaghettiApp {
                             base
                         };
                         painter.rect_filled(rect, 4.0, bg);
-
-                        let border_width = if is_collapsed { 2.0 } else { 1.0 };
                         painter.rect_stroke(
                             rect,
                             4.0,
-                            Stroke::new(border_width, Color32::from_gray(60)),
+                            Stroke::new(1.0, Color32::from_gray(60)),
                             StrokeKind::Outside,
                         );
 
                         if draw_labels {
                             let font = egui::FontId::proportional(12.0 * self.render.camera.zoom);
-                            let label = if is_collapsed {
-                                let n = self.simulation.layout_state.children_of(*id).len();
-                                format!("{} (+{})", sym.name, n)
-                            } else {
-                                sym.name.clone()
-                            };
                             painter.text(
                                 screen_pos,
                                 egui::Align2::CENTER_CENTER,
-                                &label,
+                                &sym.name,
                                 font,
                                 Color32::WHITE,
                             );
@@ -468,12 +444,7 @@ impl SpaghettiApp {
                             base
                         };
                         let r = if circle_mode {
-                            let base_r = circle_radius * self.render.camera.zoom;
-                            if is_collapsed {
-                                base_r * COLLAPSED_CONTAINER_SCALE
-                            } else {
-                                base_r
-                            }
+                            circle_radius * self.render.camera.zoom
                         } else {
                             2.0
                         };
@@ -486,22 +457,6 @@ impl SpaghettiApp {
             self.render.fps.tick();
             paint_fps_overlay(ui, response.rect, self.render.fps.fps());
         });
-    }
-
-    /// Build a map from child symbol ID -> collapsed parent symbol ID
-    /// for edge rerouting.
-    fn build_edge_reroute_map(&self) -> HashMap<SymbolId, SymbolId> {
-        let mut reroute = HashMap::new();
-        for (id, _sym) in &self.graph.graph.symbols {
-            if self.simulation.layout_state.is_container(*id)
-                && !self.simulation.layout_state.is_expanded(*id)
-            {
-                for child_id in self.simulation.layout_state.children_of(*id) {
-                    reroute.insert(child_id, *id);
-                }
-            }
-        }
-        reroute
     }
 
     /// Hit-test that accounts for expanded container backgrounds.

@@ -15,6 +15,10 @@ use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::time::{Duration, Instant};
 
+/// Half-size of collapsed container box for position clamping.
+/// Children are constrained within this box around the container center.
+const COLLAPSED_HALF_SIZE: Vec2 = Vec2::new(80.0, 50.0);
+
 /// Mapping from symbol IDs to 2D positions.
 ///
 /// Uses [`IndexMap`] to guarantee deterministic iteration order.
@@ -322,17 +326,12 @@ impl LayoutState {
             }
         }
 
-        // Default: all containers collapsed. Hide their children.
+        // Default: all containers collapsed. Children remain in the
+        // simulation (visible, participate in forces) but are clamped
+        // inside the collapsed container box each step.
         let expanded = HashSet::new();
-        let mut collapse_hidden = HashSet::new();
-        for &c in &containers {
-            for &child in &children_of[c] {
-                collapse_hidden.insert(child);
-            }
-        }
-
-        // Combine collapse-hidden into the main hidden set.
-        let hidden = collapse_hidden.clone();
+        let collapse_hidden = HashSet::new();
+        let hidden = HashSet::new();
 
         Self {
             ids,
@@ -499,11 +498,12 @@ impl LayoutState {
                 }
             }
 
-            // Containment force: for expanded containers, pull children
-            // toward their siblings' centroid so they stay clustered.
+            // Containment force: pull children of containers toward their
+            // siblings' centroid so they stay clustered. Applies to both
+            // expanded and collapsed containers.
             if p.containment_enabled && p.containment_strength > 0.0 {
                 for &c in &self.containers {
-                    if !self.expanded.contains(&c) {
+                    if self.hidden.contains(&c) {
                         continue;
                     }
                     let children = &self.children_of[c];
@@ -602,7 +602,10 @@ impl LayoutState {
                 let cr = p.container_repulsion;
                 let min_d = p.min_dist;
                 for &c in &self.containers {
-                    if self.hidden.contains(&c) {
+                    // Only apply gap-based repulsion to expanded containers;
+                    // collapsed ones are rendered as small dots and handled by
+                    // regular point-based Coulomb repulsion.
+                    if self.hidden.contains(&c) || !self.expanded.contains(&c) {
                         continue;
                     }
                     let pos_c = self.positions[c];
@@ -657,6 +660,29 @@ impl LayoutState {
                         *vel *= max_vel / speed;
                     }
                     *pos += *vel;
+                }
+            }
+
+            // Clamp children of collapsed containers inside a fixed box
+            // around the parent position.
+            for &c in &self.containers {
+                if self.expanded.contains(&c) || self.hidden.contains(&c) {
+                    continue;
+                }
+                let center = self.positions[c];
+                for &child in &self.children_of[c] {
+                    if self.hidden.contains(&child) {
+                        continue;
+                    }
+                    let pos = &mut self.positions[child];
+                    pos.x = pos.x.clamp(
+                        center.x - COLLAPSED_HALF_SIZE.x,
+                        center.x + COLLAPSED_HALF_SIZE.x,
+                    );
+                    pos.y = pos.y.clamp(
+                        center.y - COLLAPSED_HALF_SIZE.y,
+                        center.y + COLLAPSED_HALF_SIZE.y,
+                    );
                 }
             }
         }
@@ -804,10 +830,8 @@ impl LayoutState {
         self.hidden = &self.collapse_hidden | &self.external_hidden;
     }
 
-    /// Collapse a container node: hide all its children.
-    ///
-    /// Children's positions are moved to the parent's position so they
-    /// animate outward on subsequent expand.
+    /// Collapse a container node: children stay in the simulation but
+    /// are clamped inside a fixed-size box around the parent each step.
     pub fn collapse(&mut self, id: SymbolId) {
         let Some(&idx) = self.id_to_idx.get(&id) else {
             return;
@@ -816,20 +840,20 @@ impl LayoutState {
             return;
         }
         self.expanded.remove(&idx);
+        // Gather children close to parent so they animate into the box.
         let parent_pos = self.positions[idx];
-        for &child in &self.children_of[idx] {
-            self.collapse_hidden.insert(child);
-            self.positions[child] = parent_pos;
+        let children = self.children_of[idx].clone();
+        for (i, &child) in children.iter().enumerate() {
+            let angle = (i as f32) * std::f32::consts::TAU / children.len().max(1) as f32;
+            let offset = Vec2::new(angle.cos(), angle.sin()) * 20.0;
+            self.positions[child] = parent_pos + offset;
             self.velocities[child] = Vec2::ZERO;
         }
-        self.rebuild_hidden();
         self.reheat();
     }
 
-    /// Expand a container node: show all its children.
-    ///
-    /// Children are scattered in a small radius around the parent so they
-    /// animate into place.
+    /// Expand a container node: children are scattered outward and the
+    /// dynamic bounding-box rendering takes over.
     pub fn expand(&mut self, id: SymbolId) {
         let Some(&idx) = self.id_to_idx.get(&id) else {
             return;
@@ -841,14 +865,12 @@ impl LayoutState {
         let parent_pos = self.positions[idx];
         let children = self.children_of[idx].clone();
         for (i, &child) in children.iter().enumerate() {
-            self.collapse_hidden.remove(&child);
             // Scatter children in a circle around the parent.
             let angle = (i as f32) * std::f32::consts::TAU / children.len().max(1) as f32;
             let offset = Vec2::new(angle.cos(), angle.sin()) * 50.0;
             self.positions[child] = parent_pos + offset;
             self.velocities[child] = Vec2::ZERO;
         }
-        self.rebuild_hidden();
         self.reheat();
     }
 
@@ -922,11 +944,11 @@ impl LayoutState {
     }
 
     /// Return all symbol IDs that are currently hidden due to collapsed containers.
+    ///
+    /// With the new collapse model (children stay visible, clamped inside
+    /// a fixed box), this always returns an empty list.
     pub fn collapsed_hidden_ids(&self) -> Vec<SymbolId> {
-        self.collapse_hidden
-            .iter()
-            .map(|&idx| self.ids[idx])
-            .collect()
+        Vec::new()
     }
 }
 

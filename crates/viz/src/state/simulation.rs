@@ -6,8 +6,8 @@ use layout::{LayoutState, Positions};
 
 use crate::camera::{NodeSizes, NODE_HEIGHT, NODE_WIDTH};
 
-/// Scale factor for collapsed container nodes (slightly larger than normal).
-const COLLAPSED_CONTAINER_SCALE: f32 = 1.3;
+/// Size of collapsed container box (must match layout crate's COLLAPSED_HALF_SIZE * 2).
+const COLLAPSED_BOX_SIZE: GVec2 = GVec2::new(160.0, 100.0);
 
 /// Force-directed layout simulation state.
 pub struct SimulationState {
@@ -29,7 +29,7 @@ impl SimulationState {
     /// the layout engine for size-aware repulsion.
     pub fn update_node_sizes(&mut self, graph: &Graph) {
         let default_size = GVec2::new(NODE_WIDTH, NODE_HEIGHT);
-        let collapsed_size = default_size * COLLAPSED_CONTAINER_SCALE;
+        let collapsed_size = COLLAPSED_BOX_SIZE;
 
         let mut sizes: Vec<(SymbolId, GVec2)> = Vec::new();
         for &id in graph.symbols.keys() {

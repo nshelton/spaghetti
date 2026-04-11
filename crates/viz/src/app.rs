@@ -161,9 +161,17 @@ impl SpaghettiApp {
                                 .and_then(|f| f.to_str())
                                 .map(|name| {
                                     path.parent()
-                                        .and_then(|p| p.file_name())
-                                        .and_then(|d| d.to_str())
-                                        .map(|dir| format!("{dir}/{name}"))
+                                        .and_then(|p| {
+                                            let dir = p.file_name()?.to_str()?;
+                                            let grandparent = p
+                                                .parent()
+                                                .and_then(|gp| gp.file_name())
+                                                .and_then(|g| g.to_str());
+                                            match grandparent {
+                                                Some(gp) => Some(format!("{gp}/{dir}/{name}")),
+                                                None => Some(format!("{dir}/{name}")),
+                                            }
+                                        })
                                         .unwrap_or_else(|| name.to_string())
                                 })
                                 .unwrap_or_else(|| path.display().to_string());
