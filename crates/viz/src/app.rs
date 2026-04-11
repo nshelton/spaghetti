@@ -107,6 +107,7 @@ impl SpaghettiApp {
         };
         app.filters
             .sync_hidden_to_layout(&app.graph, &mut app.simulation);
+        app.simulation.update_node_sizes(&app.graph.graph);
         app
     }
 

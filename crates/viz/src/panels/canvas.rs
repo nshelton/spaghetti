@@ -44,6 +44,17 @@ impl SpaghettiApp {
                     if let Some(&world) = self.simulation.positions.0.get(&hit) {
                         self.simulation.layout_state.pin(hit, world);
                     }
+                    // Pin children of expanded containers so they move rigidly.
+                    if self.simulation.layout_state.is_container(hit)
+                        && self.simulation.layout_state.is_expanded(hit)
+                    {
+                        let children = self.simulation.layout_state.children_of(hit);
+                        for child in children {
+                            if let Some(&pos) = self.simulation.positions.0.get(&child) {
+                                self.simulation.layout_state.pin(child, pos);
+                            }
+                        }
+                    }
                 }
             }
 
@@ -52,7 +63,29 @@ impl SpaghettiApp {
                 if let Some(dragged_id) = self.interaction.dragging {
                     if let Some(pointer) = response.interact_pointer_pos() {
                         let world = self.render.camera.screen_to_world(pointer, canvas_center);
+                        // Compute delta so we can move children by the same amount.
+                        let old_pos = self
+                            .simulation
+                            .positions
+                            .0
+                            .get(&dragged_id)
+                            .copied()
+                            .unwrap_or(world);
+                        let delta = world - old_pos;
                         self.simulation.layout_state.set_position(dragged_id, world);
+                        // Move children of expanded containers along with the parent.
+                        if self.simulation.layout_state.is_container(dragged_id)
+                            && self.simulation.layout_state.is_expanded(dragged_id)
+                        {
+                            let children = self.simulation.layout_state.children_of(dragged_id);
+                            for child in children {
+                                if let Some(&child_pos) = self.simulation.positions.0.get(&child) {
+                                    self.simulation
+                                        .layout_state
+                                        .set_position(child, child_pos + delta);
+                                }
+                            }
+                        }
                     }
                 } else {
                     let delta = response.drag_delta();
@@ -61,9 +94,18 @@ impl SpaghettiApp {
                 }
             }
 
-            // Drag released: unpin the node.
+            // Drag released: unpin the node and its children.
             if response.drag_stopped_by(egui::PointerButton::Primary) {
                 if let Some(dragged_id) = self.interaction.dragging.take() {
+                    // Unpin children first if this was an expanded container.
+                    if self.simulation.layout_state.is_container(dragged_id)
+                        && self.simulation.layout_state.is_expanded(dragged_id)
+                    {
+                        let children = self.simulation.layout_state.children_of(dragged_id);
+                        for child in children {
+                            self.simulation.layout_state.unpin(child);
+                        }
+                    }
                     self.simulation.layout_state.unpin(dragged_id);
                 }
             }
@@ -224,7 +266,8 @@ impl SpaghettiApp {
                     StrokeKind::Outside,
                 );
 
-                if draw_labels {
+                // Always draw container titles regardless of circle mode.
+                if self.render.camera.zoom >= 0.15 {
                     let title_pos =
                         egui::Pos2::new(container_rect.left() + 6.0, container_rect.top() + 2.0);
                     let font = egui::FontId::proportional(13.0 * self.render.camera.zoom);

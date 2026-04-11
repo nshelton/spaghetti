@@ -58,7 +58,30 @@ fn main() -> Result<()> {
     eframe::run_native(
         "spaghetti",
         native_options,
-        Box::new(move |_cc| Ok(Box::new(app))),
+        Box::new(move |cc| {
+            // Load IBM Plex Mono as the app-wide font.
+            let mut fonts = egui::FontDefinitions::default();
+            fonts.font_data.insert(
+                "IBMPlexMono".to_owned(),
+                std::sync::Arc::new(egui::FontData::from_static(include_bytes!(
+                    "../../../assets/fonts/IBMPlexMono-Regular.ttf"
+                ))),
+            );
+            // Use as primary for both proportional and monospace families.
+            fonts
+                .families
+                .entry(egui::FontFamily::Proportional)
+                .or_default()
+                .insert(0, "IBMPlexMono".to_owned());
+            fonts
+                .families
+                .entry(egui::FontFamily::Monospace)
+                .or_default()
+                .insert(0, "IBMPlexMono".to_owned());
+            cc.egui_ctx.set_fonts(fonts);
+
+            Ok(Box::new(app))
+        }),
     )
     .map_err(|e| anyhow::anyhow!("eframe error: {e}"))?;
 

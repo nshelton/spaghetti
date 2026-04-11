@@ -215,5 +215,6 @@ impl FilterState {
         self.hidden_symbols = &file_hidden | &collapse_hidden.into_iter().collect();
         let hidden_vec: Vec<_> = file_hidden.into_iter().collect();
         sim.layout_state.set_hidden(&hidden_vec);
+        sim.update_node_sizes(&graph.graph);
     }
 }

@@ -73,6 +73,35 @@ pub struct ForceParams {
     /// container toward their siblings' centroid. `0.0` disables.
     #[serde(default = "default_containment_strength")]
     pub containment_strength: f32,
+    /// Whether repulsion forces are enabled.
+    #[serde(default = "default_true")]
+    pub repulsion_enabled: bool,
+    /// Whether edge spring attraction forces are enabled.
+    #[serde(default = "default_true")]
+    pub attraction_enabled: bool,
+    /// Whether gravity (pull toward centroid) is enabled.
+    #[serde(default = "default_true")]
+    pub gravity_enabled: bool,
+    /// Whether location-affinity forces are enabled.
+    #[serde(default = "default_true")]
+    pub location_enabled: bool,
+    /// Whether containment forces are enabled.
+    #[serde(default = "default_true")]
+    pub containment_enabled: bool,
+    /// Whether container overlap (gap-based) repulsion is enabled.
+    #[serde(default = "default_true")]
+    pub container_repulsion_enabled: bool,
+    /// Strength of gap-based repulsion between container nodes.
+    #[serde(default = "default_container_repulsion")]
+    pub container_repulsion: f32,
+}
+
+fn default_container_repulsion() -> f32 {
+    300.0
+}
+
+fn default_true() -> bool {
+    true
 }
 
 fn default_location_strength() -> f32 {
@@ -167,6 +196,13 @@ impl Default for ForceParams {
             location_strength: default_location_strength(),
             location_falloff: default_location_falloff(),
             containment_strength: default_containment_strength(),
+            repulsion_enabled: true,
+            attraction_enabled: true,
+            gravity_enabled: true,
+            location_enabled: true,
+            containment_enabled: true,
+            container_repulsion_enabled: true,
+            container_repulsion: default_container_repulsion(),
         }
     }
 }
@@ -211,6 +247,9 @@ pub struct LayoutState {
     collapse_hidden: HashSet<usize>,
     /// Nodes hidden by external callers (file-tree visibility).
     external_hidden: HashSet<usize>,
+    /// Per-node bounding box sizes in world units. Used for size-aware
+    /// repulsion (edge-to-edge distance instead of center-to-center).
+    sizes: Vec<Vec2>,
 }
 
 impl LayoutState {
@@ -315,6 +354,7 @@ impl LayoutState {
             expanded,
             collapse_hidden,
             external_hidden: HashSet::new(),
+            sizes: vec![Vec2::new(120.0, 30.0); n],
         }
     }
 
@@ -360,107 +400,108 @@ impl LayoutState {
             }
 
             // --- Repulsive forces via grid-based cutoff ---
-            let cutoff = p.repulsion_cutoff;
-            let cutoff_sq = cutoff * cutoff;
-            let inv_cutoff = 1.0 / cutoff;
-            let repulsion = p.repulsion;
-            let min_dist = p.min_dist;
+            let mut forces = if p.repulsion_enabled {
+                let cutoff = p.repulsion_cutoff;
+                let cutoff_sq = cutoff * cutoff;
+                let inv_cutoff = 1.0 / cutoff;
+                let repulsion = p.repulsion;
+                let min_dist = p.min_dist;
 
-            // Build spatial grid: assign each node to a cell (skip hidden).
-            let cell_keys: Vec<(i32, i32)> = self
-                .positions
-                .iter()
-                .map(|pos| {
-                    let cx = (pos.x * inv_cutoff).floor() as i32;
-                    let cy = (pos.y * inv_cutoff).floor() as i32;
-                    (cx, cy)
-                })
-                .collect();
+                // Build spatial grid: assign each node to a cell (skip hidden).
+                let cell_keys: Vec<(i32, i32)> = self
+                    .positions
+                    .iter()
+                    .map(|pos| {
+                        let cx = (pos.x * inv_cutoff).floor() as i32;
+                        let cy = (pos.y * inv_cutoff).floor() as i32;
+                        (cx, cy)
+                    })
+                    .collect();
 
-            let mut grid: HashMap<(i32, i32), Vec<usize>> = HashMap::with_capacity(len / 4 + 1);
-            for (i, &key) in cell_keys.iter().enumerate() {
-                if !self.hidden.contains(&i) {
-                    grid.entry(key).or_default().push(i);
+                let mut grid: HashMap<(i32, i32), Vec<usize>> = HashMap::with_capacity(len / 4 + 1);
+                for (i, &key) in cell_keys.iter().enumerate() {
+                    if !self.hidden.contains(&i) {
+                        grid.entry(key).or_default().push(i);
+                    }
                 }
-            }
 
-            // Compute repulsive forces per-node in parallel.
-            // Each node accumulates its own force by scanning its 3×3
-            // neighbourhood, avoiding the need for atomic writes.
-            let positions_ref = &self.positions;
-            let grid_ref = &grid;
+                let positions_ref = &self.positions;
+                let grid_ref = &grid;
+                let hidden_ref = &self.hidden;
 
-            let hidden_ref = &self.hidden;
-            let repulsive_forces: Vec<Vec2> = if len >= PARALLEL_THRESHOLD {
-                (0..len)
-                    .into_par_iter()
-                    .map(|i| {
-                        if hidden_ref.contains(&i) {
-                            return Vec2::ZERO;
-                        }
-                        compute_repulsion_for_node(
-                            i,
-                            positions_ref,
-                            grid_ref,
-                            &cell_keys,
-                            cutoff_sq,
-                            inv_cutoff,
-                            repulsion,
-                            min_dist,
-                        )
-                    })
-                    .collect()
+                if len >= PARALLEL_THRESHOLD {
+                    (0..len)
+                        .into_par_iter()
+                        .map(|i| {
+                            if hidden_ref.contains(&i) {
+                                return Vec2::ZERO;
+                            }
+                            compute_repulsion_for_node(
+                                i,
+                                positions_ref,
+                                grid_ref,
+                                &cell_keys,
+                                cutoff_sq,
+                                inv_cutoff,
+                                repulsion,
+                                min_dist,
+                            )
+                        })
+                        .collect()
+                } else {
+                    (0..len)
+                        .map(|i| {
+                            if hidden_ref.contains(&i) {
+                                return Vec2::ZERO;
+                            }
+                            compute_repulsion_for_node(
+                                i,
+                                positions_ref,
+                                grid_ref,
+                                &cell_keys,
+                                cutoff_sq,
+                                inv_cutoff,
+                                repulsion,
+                                min_dist,
+                            )
+                        })
+                        .collect()
+                }
             } else {
-                (0..len)
-                    .map(|i| {
-                        if hidden_ref.contains(&i) {
-                            return Vec2::ZERO;
-                        }
-                        compute_repulsion_for_node(
-                            i,
-                            positions_ref,
-                            grid_ref,
-                            &cell_keys,
-                            cutoff_sq,
-                            inv_cutoff,
-                            repulsion,
-                            min_dist,
-                        )
-                    })
-                    .collect()
+                vec![Vec2::ZERO; len]
             };
-
-            let mut forces = repulsive_forces;
 
             // Attractive forces along visible edges only (per-edge-kind params).
             //
             // Linear spring, but each endpoint's force is divided by
             // sqrt(degree) so hub nodes (many connections) don't get
             // yanked across the canvas by the sum of all their edges.
-            for &(from, to, kind) in &self.edge_pairs {
-                if !self.visible_edge_kinds.contains(&kind) {
-                    continue;
+            if p.attraction_enabled {
+                for &(from, to, kind) in &self.edge_pairs {
+                    if !self.visible_edge_kinds.contains(&kind) {
+                        continue;
+                    }
+                    if self.hidden.contains(&from) || self.hidden.contains(&to) {
+                        continue;
+                    }
+                    let (attr, rest_len) = if let Some(ep) = p.edge_params.get(&kind) {
+                        (ep.attraction, ep.target_distance)
+                    } else {
+                        (p.attraction, p.ideal_length)
+                    };
+                    let delta = self.positions[to] - self.positions[from];
+                    let dist = delta.length().max(p.min_dist);
+                    let displacement = attr * (dist - rest_len);
+                    let dir = delta.normalize_or_zero();
+                    // Scale by 1/sqrt(degree) at each endpoint so hubs stay calm.
+                    forces[from] += dir * displacement / self.degrees[from].sqrt();
+                    forces[to] -= dir * displacement / self.degrees[to].sqrt();
                 }
-                if self.hidden.contains(&from) || self.hidden.contains(&to) {
-                    continue;
-                }
-                let (attr, rest_len) = if let Some(ep) = p.edge_params.get(&kind) {
-                    (ep.attraction, ep.target_distance)
-                } else {
-                    (p.attraction, p.ideal_length)
-                };
-                let delta = self.positions[to] - self.positions[from];
-                let dist = delta.length().max(p.min_dist);
-                let displacement = attr * (dist - rest_len);
-                let dir = delta.normalize_or_zero();
-                // Scale by 1/sqrt(degree) at each endpoint so hubs stay calm.
-                forces[from] += dir * displacement / self.degrees[from].sqrt();
-                forces[to] -= dir * displacement / self.degrees[to].sqrt();
             }
 
             // Containment force: for expanded containers, pull children
             // toward their siblings' centroid so they stay clustered.
-            if p.containment_strength > 0.0 {
+            if p.containment_enabled && p.containment_strength > 0.0 {
                 for &c in &self.containers {
                     if !self.expanded.contains(&c) {
                         continue;
@@ -494,7 +535,7 @@ impl LayoutState {
 
             // Location-affinity force: pull nodes toward their directory
             // group centroids at each depth level.
-            if p.location_strength > 0.0 && !self.dir_groups.is_empty() {
+            if p.location_enabled && p.location_strength > 0.0 && !self.dir_groups.is_empty() {
                 let max_d = self.max_dir_depth;
                 for (depth, groups_at_depth) in self.dir_groups.iter().enumerate() {
                     // Deeper = more specific = stronger. Scale so the deepest
@@ -534,7 +575,7 @@ impl LayoutState {
             }
 
             // Gravity: gentle pull toward the centroid (skip hidden)
-            if p.gravity > 0.0 {
+            if p.gravity_enabled && p.gravity > 0.0 {
                 let mut centroid = Vec2::ZERO;
                 let mut visible_count = 0u32;
                 for (i, pos) in self.positions.iter().enumerate() {
@@ -551,6 +592,37 @@ impl LayoutState {
                         if !self.hidden.contains(&i) {
                             *force += (centroid - *pos) * p.gravity;
                         }
+                    }
+                }
+            }
+
+            // Container repulsion: gap-based repulsion between pairs where
+            // at least one node is a container. Prevents overlap of larger nodes.
+            if p.container_repulsion_enabled && p.container_repulsion > 0.0 {
+                let cr = p.container_repulsion;
+                let min_d = p.min_dist;
+                for &c in &self.containers {
+                    if self.hidden.contains(&c) {
+                        continue;
+                    }
+                    let pos_c = self.positions[c];
+                    let half_c = self.sizes[c] * 0.5;
+                    for j in 0..len {
+                        if j == c || self.hidden.contains(&j) {
+                            continue;
+                        }
+                        let delta = pos_c - self.positions[j];
+                        let dist_sq = delta.length_squared();
+                        if dist_sq < 1e-10 {
+                            continue;
+                        }
+                        let half_j = self.sizes[j] * 0.5;
+                        let gap_x = delta.x.abs() - (half_c.x + half_j.x);
+                        let gap_y = delta.y.abs() - (half_c.y + half_j.y);
+                        let gap = gap_x.max(gap_y).max(min_d);
+                        let f = delta.normalize_or_zero() * (cr / (gap * gap));
+                        forces[c] += f;
+                        forces[j] -= f;
                     }
                 }
             }
@@ -840,6 +912,15 @@ impl LayoutState {
         }
     }
 
+    /// Update per-node bounding box sizes for size-aware repulsion.
+    pub fn set_sizes(&mut self, sizes: &[(SymbolId, Vec2)]) {
+        for &(id, size) in sizes {
+            if let Some(&idx) = self.id_to_idx.get(&id) {
+                self.sizes[idx] = size;
+            }
+        }
+    }
+
     /// Return all symbol IDs that are currently hidden due to collapsed containers.
     pub fn collapsed_hidden_ids(&self) -> Vec<SymbolId> {
         self.collapse_hidden
@@ -849,10 +930,8 @@ impl LayoutState {
     }
 }
 
-/// Compute repulsive force on node `i` from its 3×3 grid neighbourhood.
-///
-/// This is a per-node computation suitable for parallel execution — each
-/// call reads shared positions but writes only to its own output.
+/// Compute point-based Coulomb repulsive force on node `i` from its 3×3
+/// grid neighbourhood. Center-to-center distance, no size awareness.
 #[allow(clippy::too_many_arguments)]
 fn compute_repulsion_for_node(
     i: usize,

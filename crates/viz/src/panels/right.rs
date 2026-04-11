@@ -262,92 +262,215 @@ impl SpaghettiApp {
 
                     ui.add_space(16.0);
 
-                    // -- Layout controls section --
-                    ui.heading("Layout Controls");
+                    // -- Layout Forces section --
+                    ui.heading("Layout Forces");
                     ui.separator();
 
-                    let params = self.simulation.layout_state.params_mut();
-
-                    changed |= ui
-                        .add(
-                            egui::Slider::new(&mut params.repulsion, 100.0..=1_000_000.0)
-                                .logarithmic(true)
-                                .text("Repulsion"),
-                        )
-                        .changed();
-
-                    changed |= ui
-                        .add(egui::Slider::new(&mut params.damping, 0.01..=0.99).text("Damping"))
-                        .changed();
-
-                    changed |= ui
-                        .add(egui::Slider::new(&mut params.gravity, 0.0..=0.1).text("Gravity"))
-                        .changed();
-
-                    changed |= ui
-                        .add(
-                            egui::Slider::new(&mut params.max_velocity, 1.0..=200.0)
-                                .text("Max vel"),
-                        )
-                        .changed();
-
-                    ui.add_space(8.0);
-                    ui.label("Per-Edge Kind");
-
-                    let default_ep = layout::EdgeKindParams {
-                        target_distance: 150.0,
-                        attraction: 0.01,
-                    };
-
-                    for kind in &ALL_EDGE_KINDS {
-                        let label = format!("{kind:?}");
-                        ui.add_space(4.0);
-                        ui.label(&label);
-
+                    // Repulsion
+                    {
                         let params = self.simulation.layout_state.params_mut();
-                        let ep = params.edge_params.entry(*kind).or_insert(default_ep);
+                        let mut enabled = params.repulsion_enabled;
+                        let id = ui.make_persistent_id("force_repulsion");
+                        egui::collapsing_header::CollapsingState::load_with_default_open(
+                            ui.ctx(),
+                            id,
+                            false,
+                        )
+                        .show_header(ui, |ui| {
+                            if ui.checkbox(&mut enabled, "Repulsion").changed() {
+                                changed = true;
+                            }
+                        })
+                        .body(|ui| {
+                            if !enabled {
+                                ui.disable();
+                            }
+                            let p = self.simulation.layout_state.params_mut();
+                            changed |= ui
+                                .add(
+                                    egui::Slider::new(&mut p.repulsion, 100.0..=1_000_000.0)
+                                        .logarithmic(true)
+                                        .text("Strength"),
+                                )
+                                .changed();
+                        });
+                        self.simulation.layout_state.params_mut().repulsion_enabled = enabled;
+                    }
+
+                    // Edge Springs (attraction)
+                    {
+                        let params = self.simulation.layout_state.params_mut();
+                        let mut enabled = params.attraction_enabled;
+                        let id = ui.make_persistent_id("force_attraction");
+                        egui::collapsing_header::CollapsingState::load_with_default_open(
+                            ui.ctx(),
+                            id,
+                            false,
+                        )
+                        .show_header(ui, |ui| {
+                            if ui.checkbox(&mut enabled, "Edge Springs").changed() {
+                                changed = true;
+                            }
+                        })
+                        .body(|ui| {
+                            if !enabled {
+                                ui.disable();
+                            }
+                            ui.label("Per-edge-kind sliders are above in Edge Types.");
+                        });
+                        self.simulation.layout_state.params_mut().attraction_enabled = enabled;
+                    }
+
+                    // Gravity
+                    {
+                        let params = self.simulation.layout_state.params_mut();
+                        let mut enabled = params.gravity_enabled;
+                        let id = ui.make_persistent_id("force_gravity");
+                        egui::collapsing_header::CollapsingState::load_with_default_open(
+                            ui.ctx(),
+                            id,
+                            false,
+                        )
+                        .show_header(ui, |ui| {
+                            if ui.checkbox(&mut enabled, "Gravity").changed() {
+                                changed = true;
+                            }
+                        })
+                        .body(|ui| {
+                            if !enabled {
+                                ui.disable();
+                            }
+                            let p = self.simulation.layout_state.params_mut();
+                            changed |= ui
+                                .add(egui::Slider::new(&mut p.gravity, 0.0..=0.1).text("Strength"))
+                                .changed();
+                        });
+                        self.simulation.layout_state.params_mut().gravity_enabled = enabled;
+                    }
+
+                    // Location Affinity
+                    {
+                        let params = self.simulation.layout_state.params_mut();
+                        let mut enabled = params.location_enabled;
+                        let id = ui.make_persistent_id("force_location");
+                        egui::collapsing_header::CollapsingState::load_with_default_open(
+                            ui.ctx(),
+                            id,
+                            false,
+                        )
+                        .show_header(ui, |ui| {
+                            if ui.checkbox(&mut enabled, "Location Affinity").changed() {
+                                changed = true;
+                            }
+                        })
+                        .body(|ui| {
+                            if !enabled {
+                                ui.disable();
+                            }
+                            let p = self.simulation.layout_state.params_mut();
+                            changed |= ui
+                                .add(
+                                    egui::Slider::new(&mut p.location_strength, 0.0..=2.0)
+                                        .text("Strength"),
+                                )
+                                .changed();
+                            changed |= ui
+                                .add(
+                                    egui::Slider::new(&mut p.location_falloff, 0.0..=1.0)
+                                        .text("Falloff"),
+                                )
+                                .changed();
+                        });
+                        self.simulation.layout_state.params_mut().location_enabled = enabled;
+                    }
+
+                    // Containment
+                    {
+                        let params = self.simulation.layout_state.params_mut();
+                        let mut enabled = params.containment_enabled;
+                        let id = ui.make_persistent_id("force_containment");
+                        egui::collapsing_header::CollapsingState::load_with_default_open(
+                            ui.ctx(),
+                            id,
+                            false,
+                        )
+                        .show_header(ui, |ui| {
+                            if ui.checkbox(&mut enabled, "Containment").changed() {
+                                changed = true;
+                            }
+                        })
+                        .body(|ui| {
+                            if !enabled {
+                                ui.disable();
+                            }
+                            let p = self.simulation.layout_state.params_mut();
+                            changed |= ui
+                                .add(
+                                    egui::Slider::new(&mut p.containment_strength, 0.0..=2.0)
+                                        .text("Strength"),
+                                )
+                                .changed();
+                        });
+                        self.simulation
+                            .layout_state
+                            .params_mut()
+                            .containment_enabled = enabled;
+                    }
+
+                    // Container Repulsion (gap-based)
+                    {
+                        let params = self.simulation.layout_state.params_mut();
+                        let mut enabled = params.container_repulsion_enabled;
+                        let id = ui.make_persistent_id("force_container_repulsion");
+                        egui::collapsing_header::CollapsingState::load_with_default_open(
+                            ui.ctx(),
+                            id,
+                            false,
+                        )
+                        .show_header(ui, |ui| {
+                            if ui.checkbox(&mut enabled, "Container Repulsion").changed() {
+                                changed = true;
+                            }
+                        })
+                        .body(|ui| {
+                            if !enabled {
+                                ui.disable();
+                            }
+                            let p = self.simulation.layout_state.params_mut();
+                            changed |= ui
+                                .add(
+                                    egui::Slider::new(&mut p.container_repulsion, 10.0..=100_000.0)
+                                        .logarithmic(true)
+                                        .text("Strength"),
+                                )
+                                .changed();
+                        });
+                        self.simulation
+                            .layout_state
+                            .params_mut()
+                            .container_repulsion_enabled = enabled;
+                    }
+
+                    ui.add_space(16.0);
+
+                    // -- Simulation controls --
+                    ui.heading("Simulation");
+                    ui.separator();
+
+                    {
+                        let params = self.simulation.layout_state.params_mut();
                         changed |= ui
                             .add(
-                                egui::Slider::new(&mut ep.target_distance, 1.0..=100.0)
-                                    .text("Target dist"),
+                                egui::Slider::new(&mut params.damping, 0.01..=0.99).text("Damping"),
                             )
                             .changed();
-
                         changed |= ui
                             .add(
-                                egui::Slider::new(&mut ep.attraction, 0.0..=1.0).text("Attraction"),
+                                egui::Slider::new(&mut params.max_velocity, 1.0..=200.0)
+                                    .text("Max vel"),
                             )
                             .changed();
                     }
-
-                    ui.add_space(8.0);
-                    ui.label("Containment");
-
-                    let params = self.simulation.layout_state.params_mut();
-                    changed |= ui
-                        .add(
-                            egui::Slider::new(&mut params.containment_strength, 0.0..=0.2)
-                                .text("Strength"),
-                        )
-                        .changed();
-
-                    ui.add_space(8.0);
-                    ui.label("Location Affinity");
-
-                    let params = self.simulation.layout_state.params_mut();
-                    changed |= ui
-                        .add(
-                            egui::Slider::new(&mut params.location_strength, 0.0..=2.0)
-                                .text("Strength"),
-                        )
-                        .changed();
-
-                    changed |= ui
-                        .add(
-                            egui::Slider::new(&mut params.location_falloff, 0.0..=1.0)
-                                .text("Falloff"),
-                        )
-                        .changed();
 
                     ui.add_space(4.0);
                     if ui.button("Reset to defaults").clicked() {
