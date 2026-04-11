@@ -12,7 +12,7 @@ use core_ir::Graph;
 use tracing::{debug, warn};
 
 /// Location of the cache directory, derived from compile_commands.json's parent.
-pub(crate) fn cache_dir(compile_commands: &Path) -> PathBuf {
+pub fn cache_dir(compile_commands: &Path) -> PathBuf {
     compile_commands
         .parent()
         .unwrap_or_else(|| Path::new("."))

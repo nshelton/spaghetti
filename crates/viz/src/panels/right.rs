@@ -158,23 +158,71 @@ impl SpaghettiApp {
 
                     // Node types: toggleable color swatches that also control filtering.
                     ui.label("Node Types");
+                    let mut node_filter_changed = false;
                     for &kind in &ALL_SYMBOL_KINDS {
                         let kind_name = format!("{kind:?}");
                         let enabled = self.node_filter.is_enabled(kind);
                         if toggle_swatch(ui, &mut self.render.node_colors, &kind_name, enabled) {
                             self.node_filter.toggle(kind);
+                            node_filter_changed = true;
                         }
                     }
+                    if node_filter_changed {
+                        self.sync_hidden_to_layout();
+                    }
+                    if ui
+                        .checkbox(&mut self.hide_edgeless, "Hide edgeless nodes")
+                        .changed()
+                    {
+                        self.sync_hidden_to_layout();
+                    }
 
-                    // Edge types: toggleable color swatches that also control filtering.
+                    // Edge types: toggleable color swatches with per-kind force sliders.
                     ui.add_space(4.0);
                     ui.label("Edge Types");
+
+                    let mut changed = false;
+                    ui.spacing_mut().slider_width = 120.0;
+
+                    let default_ep = layout::EdgeKindParams {
+                        target_distance: 150.0,
+                        attraction: 0.01,
+                    };
+
+                    let mut edge_filter_changed = false;
                     for &kind in &ALL_EDGE_KINDS {
                         let kind_name = format!("{kind:?}");
                         let enabled = self.edge_filter.is_enabled(kind);
                         if toggle_swatch(ui, &mut self.render.edge_colors, &kind_name, enabled) {
                             self.edge_filter.toggle(kind);
+                            edge_filter_changed = true;
                         }
+                        if enabled {
+                            let ep = self
+                                .layout_state
+                                .params_mut()
+                                .edge_params
+                                .entry(kind)
+                                .or_insert(default_ep);
+                            ui.indent(format!("edge_sliders_{kind:?}"), |ui| {
+                                changed |= ui
+                                    .add(
+                                        egui::Slider::new(&mut ep.target_distance, 1.0..=100.0)
+                                            .text("Dist"),
+                                    )
+                                    .changed();
+                                changed |= ui
+                                    .add(
+                                        egui::Slider::new(&mut ep.attraction, 0.0..=2.0)
+                                            .text("Attract"),
+                                    )
+                                    .changed();
+                            });
+                        }
+                    }
+
+                    if edge_filter_changed && self.hide_edgeless {
+                        self.sync_hidden_to_layout();
                     }
 
                     ui.add_space(4.0);
@@ -189,9 +237,6 @@ impl SpaghettiApp {
                     // -- Layout controls section --
                     ui.heading("Layout Controls");
                     ui.separator();
-
-                    let mut changed = false;
-                    ui.spacing_mut().slider_width = 120.0;
 
                     let params = self.layout_state.params_mut();
 
@@ -288,6 +333,14 @@ impl SpaghettiApp {
                         .clicked()
                     {
                         self.layout_state.randomize();
+                    }
+
+                    if ui
+                        .button("Juggle (J)")
+                        .on_hover_text("Slightly nudge all nodes — press repeatedly for more")
+                        .clicked()
+                    {
+                        self.layout_state.juggle();
                     }
 
                     let pause_label = if self.paused {

@@ -17,6 +17,9 @@ pub struct AppSettings {
     /// View state (edge filters, camera, console, file tree visibility).
     #[serde(default)]
     pub view: ViewSettings,
+    /// Most-recently-opened compile_commands.json paths (newest first).
+    #[serde(default)]
+    pub recent_projects: Vec<PathBuf>,
 }
 
 /// Persisted view settings — UI state that should survive across sessions.
@@ -42,6 +45,9 @@ pub struct ViewSettings {
     /// Console log level filter (stored as string for forward compat).
     #[serde(default = "default_console_level")]
     pub console_level: String,
+    /// Whether to hide nodes with no edges.
+    #[serde(default)]
+    pub hide_edgeless: bool,
     /// File-tree directory visibility overrides keyed by full directory path
     /// (e.g. `"shapes"`, `"shapes/internals"`). Missing keys default to visible.
     #[serde(default)]
@@ -73,6 +79,7 @@ impl Default for ViewSettings {
             camera_zoom: default_zoom(),
             show_console: false,
             console_level: default_console_level(),
+            hide_edgeless: false,
             dir_visibility: HashMap::new(),
         }
     }

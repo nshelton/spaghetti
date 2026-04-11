@@ -689,6 +689,24 @@ impl LayoutState {
         let _ = n;
     }
 
+    /// Slightly perturb all node positions by a small random offset, then reheat.
+    /// Unlike [`randomize`](Self::randomize), this preserves the overall layout
+    /// shape — useful for nudging the simulation out of a local minimum.
+    pub fn juggle(&mut self) {
+        let seed = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos() as u64)
+            .unwrap_or(12345);
+        let amount = 30.0_f32;
+        for (i, pos) in self.positions.iter_mut().enumerate() {
+            let hash = seed.wrapping_mul(i as u64 + 1).wrapping_add(0x9E37_79B9);
+            let dx = ((hash & 0xFFFF) as f32 / 65535.0 - 0.5) * amount;
+            let dy = (((hash >> 16) & 0xFFFF) as f32 / 65535.0 - 0.5) * amount;
+            *pos += Vec2::new(dx, dy);
+        }
+        self.total_steps = self.total_steps.saturating_sub(100);
+    }
+
     /// Set which symbols are hidden from the simulation (by external callers,
     /// e.g. file-tree visibility toggles).
     ///

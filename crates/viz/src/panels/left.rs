@@ -9,7 +9,14 @@ impl SpaghettiApp {
         egui::Panel::left("left_panel")
             .default_size(260.0)
             .show_inside(ui, |ui| {
-                ui.heading("spaghetti");
+                let project_name = self
+                    .compile_commands_path
+                    .as_ref()
+                    .and_then(|p| p.parent())
+                    .and_then(|p| p.file_name())
+                    .and_then(|n| n.to_str())
+                    .unwrap_or("spaghetti");
+                ui.heading(project_name);
                 ui.label(format!(
                     "{} nodes, {} edges",
                     self.graph.symbol_count(),
@@ -82,6 +89,7 @@ impl SpaghettiApp {
                 // If visibility changed, recompute hidden set and push to layout.
                 if visibility_changed {
                     self.sync_hidden_symbols();
+                    self.sync_hidden_to_layout();
                 }
 
                 ui.separator();

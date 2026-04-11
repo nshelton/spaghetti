@@ -49,32 +49,13 @@
       "group": "test"
     },
     {
-      "label": "cargo run (viz)",
+      "label": "cargo run",
       "type": "cargo",
       "command": "run",
-      "args": [
-        "-p",
-        "viz",
-        "--",
-        "/Users/nshelton/flatbuffers/compile_commands.json"
-      ],
-      "problemMatcher": [
-        "$rustc"
-      ]
-    },
-    {
-      "label": "cargo run (example)",
-      "type": "cargo",
-      "command": "run",
-      "args": [
-        "-p",
-        "viz",
-        "--",
-        "/Users/nshelton/spaghetti/examples/tiny-cpp/compile_commands.json"
-      ],
       "problemMatcher": [
         "$rustc"
       ]
     }
+
   ]
 }

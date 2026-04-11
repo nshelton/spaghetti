@@ -20,6 +20,7 @@ use thiserror::Error;
 use tracing::{debug, info, warn};
 
 mod cache;
+pub use cache::cache_dir;
 
 /// Errors from the clang frontend.
 #[derive(Debug, Error)]
@@ -305,21 +306,8 @@ fn visit_cursor(cursor: &clang::Entity, graph: &mut Graph, base_dir: &Path) {
                         }
                     }
 
-                    // Emit Contains edge: namespace → this class/struct
-                    if let Some(parent) = cursor.get_semantic_parent() {
-                        if parent.get_kind() == EntityKind::Namespace && parent.get_name().is_some()
-                        {
-                            let parent_qualified = qualified_name(&parent);
-                            let parent_id =
-                                SymbolId::from_parts(&parent_qualified, SymbolKind::Namespace);
-                            graph.add_edge(Edge {
-                                from: parent_id,
-                                to: id,
-                                kind: EdgeKind::Contains,
-                                location: None,
-                            });
-                        }
-                    }
+                    // Emit Contains edge: parent (namespace or TU) → this class/struct
+                    emit_contains_from_parent(cursor, id, graph, base_dir);
                 }
             }
         }
@@ -343,6 +331,9 @@ fn visit_cursor(cursor: &clang::Entity, graph: &mut Graph, base_dir: &Path) {
                             module: None,
                             attrs: Default::default(),
                         });
+
+                        // Emit Contains edge: parent (namespace or TU) → this namespace
+                        emit_contains_from_parent(cursor, id, graph, base_dir);
                     }
                 }
             }
@@ -368,6 +359,9 @@ fn visit_cursor(cursor: &clang::Entity, graph: &mut Graph, base_dir: &Path) {
                         module: None,
                         attrs: Default::default(),
                     });
+
+                    // Emit Contains edge: parent (namespace or TU) → this class template
+                    emit_contains_from_parent(cursor, id, graph, base_dir);
                 }
             }
         }
@@ -454,24 +448,11 @@ fn visit_cursor(cursor: &clang::Entity, graph: &mut Graph, base_dir: &Path) {
                     }
                 }
 
-                // Emit Contains edge: namespace → this function
+                // Emit Contains edge: parent (namespace or TU) → this function
                 if cursor.get_kind() == EntityKind::FunctionDecl
                     || cursor.get_kind() == EntityKind::FunctionTemplate
                 {
-                    if let Some(parent) = cursor.get_semantic_parent() {
-                        if parent.get_kind() == EntityKind::Namespace && parent.get_name().is_some()
-                        {
-                            let parent_qualified = qualified_name(&parent);
-                            let parent_id =
-                                SymbolId::from_parts(&parent_qualified, SymbolKind::Namespace);
-                            graph.add_edge(Edge {
-                                from: parent_id,
-                                to: id,
-                                kind: EdgeKind::Contains,
-                                location: None,
-                            });
-                        }
-                    }
+                    emit_contains_from_parent(cursor, id, graph, base_dir);
                 }
 
                 // Check for call expressions within this function/method.
@@ -875,6 +856,57 @@ fn class_or_struct_kind(cursor: &clang::Entity) -> SymbolKind {
     match cursor.get_kind() {
         EntityKind::StructDecl => SymbolKind::Struct,
         _ => SymbolKind::Class,
+    }
+}
+
+/// Emit a `Contains` edge from the appropriate parent (namespace or
+/// translation unit) to `child_id`. If the parent is a namespace, the edge
+/// goes namespace → child. If the parent is a translation unit (i.e. the
+/// symbol is at file scope), the edge goes TU → child.
+fn emit_contains_from_parent(
+    cursor: &clang::Entity,
+    child_id: SymbolId,
+    graph: &mut Graph,
+    base_dir: &Path,
+) {
+    use clang::EntityKind;
+    if let Some(parent) = cursor.get_semantic_parent() {
+        match parent.get_kind() {
+            EntityKind::Namespace => {
+                if parent.get_name().is_some() {
+                    let parent_qualified = qualified_name(&parent);
+                    let parent_id = SymbolId::from_parts(&parent_qualified, SymbolKind::Namespace);
+                    graph.add_edge(Edge {
+                        from: parent_id,
+                        to: child_id,
+                        kind: EdgeKind::Contains,
+                        location: None,
+                    });
+                }
+            }
+            EntityKind::TranslationUnit => {
+                // File-scope symbol: emit Contains from the TU.
+                if let Some(loc) = cursor.get_location() {
+                    let file_loc = loc.get_file_location();
+                    if let Some(f) = file_loc.file {
+                        let path = f.get_path();
+                        let rel = path
+                            .strip_prefix(base_dir)
+                            .unwrap_or(&path)
+                            .to_string_lossy();
+                        let tu_id = SymbolId::from_parts(&rel, SymbolKind::TranslationUnit);
+                        ensure_tu_symbol(graph, tu_id, &rel);
+                        graph.add_edge(Edge {
+                            from: tu_id,
+                            to: child_id,
+                            kind: EdgeKind::Contains,
+                            location: None,
+                        });
+                    }
+                }
+            }
+            _ => {}
+        }
     }
 }
 

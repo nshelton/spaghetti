@@ -1,8 +1,7 @@
 //! spaghetti — interactive code structure visualizer.
 //!
-//! Usage:
-//! - `spaghetti <path>` — open a `compile_commands.json` or `graph.json`
-//! - `spaghetti` — start with an empty canvas (use File > Open)
+//! Starts with an empty canvas. If a previous project was opened, it is
+//! automatically reloaded on launch. Use File > Open to pick a new project.
 
 mod app;
 mod camera;
@@ -14,11 +13,9 @@ mod progress;
 mod settings;
 mod widgets;
 
-use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 
 use anyhow::Result;
-use tracing::info;
 use tracing_subscriber::layer::SubscriberExt;
 use tracing_subscriber::util::SubscriberInitExt;
 use tracing_subscriber::EnvFilter;
@@ -38,38 +35,19 @@ fn main() -> Result<()> {
 
     // Load persisted settings (or defaults if no file yet).
     let saved_settings = settings::AppSettings::load();
+    let recent_projects = saved_settings.recent_projects.clone();
 
-    // Optional CLI argument: path to compile_commands.json or graph.json.
-    let path = std::env::args().nth(1).map(PathBuf::from);
+    // Start with an empty canvas; auto-load last project if available.
+    let mut app = app::SpaghettiApp::empty(log_buffer);
+    app.recent_projects = recent_projects;
+    app.apply_saved_settings(&saved_settings);
 
-    let app = if let Some(ref path) = path {
-        if !path.exists() {
-            anyhow::bail!("File not found: {}", path.display());
+    // If a recent project exists, queue it for background loading.
+    if let Some(last_project) = app.recent_projects.first().cloned() {
+        if last_project.exists() {
+            app.start_indexing(last_project);
         }
-
-        let graph = frontend_clang::index_project(path)
-            .map_err(|e| anyhow::anyhow!("clang indexing failed: {e}"))?;
-
-        info!(
-            symbols = graph.symbol_count(),
-            edges = graph.edge_count(),
-            "indexed project"
-        );
-
-        // Create incremental layout state with persisted force params.
-        let layout_state = layout::LayoutState::new(&graph, 42, saved_settings.force_params);
-
-        app::SpaghettiApp::new(
-            graph,
-            layout_state,
-            log_buffer,
-            saved_settings.render,
-            saved_settings.view,
-        )
-    } else {
-        info!("no file argument — starting with empty canvas");
-        app::SpaghettiApp::empty(log_buffer)
-    };
+    }
 
     let native_options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default().with_inner_size([1280.0, 800.0]),

@@ -126,6 +126,11 @@ impl SpaghettiApp {
                 self.layout_state.randomize();
             }
 
+            // Press J to juggle (slightly perturb) the layout.
+            if ui.input(|i| i.key_pressed(egui::Key::J)) && !ui.memory(|m| m.focused().is_some()) {
+                self.layout_state.juggle();
+            }
+
             // Request repaint while the layout is still settling.
             if energy > ENERGY_THRESHOLD || self.dragging.is_some() {
                 ui.ctx().request_repaint();
@@ -308,6 +313,37 @@ impl SpaghettiApp {
             }
 
             // --- 3. Draw nodes ---
+            // When hide_edgeless is on, only show nodes that have at least one
+            // visible edge (edge kind enabled, both endpoints' node kinds enabled
+            // and not file-tree-hidden).
+            let nodes_with_edges: Option<std::collections::HashSet<core_ir::SymbolId>> =
+                if self.hide_edgeless {
+                    let mut set = std::collections::HashSet::new();
+                    for edge in &self.graph.edges {
+                        if !active_kinds.contains(&edge.kind) {
+                            continue;
+                        }
+                        let from_ok = !self.hidden_symbols.contains(&edge.from)
+                            && self
+                                .graph
+                                .symbols
+                                .get(&edge.from)
+                                .is_some_and(|s| self.node_filter.is_enabled(s.kind));
+                        let to_ok = !self.hidden_symbols.contains(&edge.to)
+                            && self
+                                .graph
+                                .symbols
+                                .get(&edge.to)
+                                .is_some_and(|s| self.node_filter.is_enabled(s.kind));
+                        if from_ok && to_ok {
+                            set.insert(edge.from);
+                            set.insert(edge.to);
+                        }
+                    }
+                    Some(set)
+                } else {
+                    None
+                };
             let node_size = Vec2::new(
                 NODE_WIDTH * self.camera.zoom,
                 NODE_HEIGHT * self.camera.zoom,
@@ -320,6 +356,11 @@ impl SpaghettiApp {
                 }
                 if !self.node_filter.is_enabled(sym.kind) {
                     continue;
+                }
+                if let Some(ref with_edges) = nodes_with_edges {
+                    if !with_edges.contains(id) {
+                        continue;
+                    }
                 }
                 if let Some(&world_pos) = self.positions.0.get(id) {
                     // Viewport culling: skip nodes entirely outside the visible area.

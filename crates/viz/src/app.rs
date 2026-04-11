@@ -187,6 +187,8 @@ pub struct SpaghettiApp {
     pub(crate) file_tree: FileTree,
     /// Symbols currently hidden by file-tree visibility toggles.
     pub(crate) hidden_symbols: HashSet<SymbolId>,
+    /// Whether to hide nodes that have no edges.
+    pub(crate) hide_edgeless: bool,
     /// Whether the layout simulation is paused.
     pub(crate) paused: bool,
     /// Saved directory visibility (applied after indexing completes).
@@ -198,6 +200,10 @@ pub struct SpaghettiApp {
     // -- Menu / UI state --
     pub(crate) show_console: bool,
     pub(crate) indexing: bool,
+    /// Path to the last opened compile_commands.json (for cache clearing).
+    pub(crate) compile_commands_path: Option<PathBuf>,
+    /// Most-recently-opened project paths (newest first, max 5).
+    pub(crate) recent_projects: Vec<PathBuf>,
 
     // -- Log capture --
     pub(crate) log_buffer: Arc<Mutex<LogBuffer>>,
@@ -225,7 +231,7 @@ impl SpaghettiApp {
     /// incrementally each frame.
     pub fn new(
         graph: Graph,
-        mut layout_state: LayoutState,
+        layout_state: LayoutState,
         log_buffer: Arc<Mutex<LogBuffer>>,
         render: crate::settings::RenderSettings,
         view: ViewSettings,
@@ -235,16 +241,12 @@ impl SpaghettiApp {
         // Apply saved directory visibility (gracefully ignores stale paths).
         file_tree.apply_visibility(&view.dir_visibility);
         let hidden_symbols = file_tree.hidden_symbols();
-        // Push initial hidden set to the layout engine.
-        let hidden_vec: Vec<_> = hidden_symbols.iter().copied().collect();
-        layout_state.set_hidden(&hidden_vec);
-
         let camera = Camera2D {
             offset: egui::Vec2::new(view.camera_offset[0], view.camera_offset[1]),
             zoom: view.camera_zoom,
         };
 
-        Self {
+        let mut app = Self {
             graph,
             positions,
             layout_state,
@@ -258,11 +260,14 @@ impl SpaghettiApp {
             frame_count: 0,
             file_tree,
             hidden_symbols,
+            hide_edgeless: view.hide_edgeless,
             paused: false,
             pending_dir_visibility: view.dir_visibility.clone(),
             render,
             show_console: view.show_console,
             indexing: false,
+            compile_commands_path: None,
+            recent_projects: Vec::new(),
             log_buffer,
             console_level_filter: level_from_str(&view.console_level),
             progress_state: None,
@@ -271,7 +276,63 @@ impl SpaghettiApp {
             pending_file_dialog: None,
             fps: FpsCounter::new(60),
             container_rects: Vec::new(),
+        };
+        app.sync_hidden_to_layout();
+        app
+    }
+
+    /// Recompute the combined hidden set (file-tree visibility + node-kind
+    /// filter + edgeless filter) and push it to the layout engine.
+    pub(crate) fn sync_hidden_to_layout(&mut self) {
+        let mut hidden: Vec<SymbolId> = self.hidden_symbols.iter().copied().collect();
+
+        // Collect nodes that have at least one *visible* edge (if the edgeless
+        // filter is on). An edge is visible when its kind is enabled and both
+        // endpoints have visible node kinds and aren't file-tree-hidden.
+        let nodes_with_edges: Option<HashSet<SymbolId>> = if self.hide_edgeless {
+            let active_kinds = self.edge_filter.active_kinds();
+            let mut set = HashSet::new();
+            for edge in &self.graph.edges {
+                if !active_kinds.contains(&edge.kind) {
+                    continue;
+                }
+                let from_ok = !self.hidden_symbols.contains(&edge.from)
+                    && self
+                        .graph
+                        .symbols
+                        .get(&edge.from)
+                        .is_some_and(|s| self.node_filter.is_enabled(s.kind));
+                let to_ok = !self.hidden_symbols.contains(&edge.to)
+                    && self
+                        .graph
+                        .symbols
+                        .get(&edge.to)
+                        .is_some_and(|s| self.node_filter.is_enabled(s.kind));
+                if from_ok && to_ok {
+                    set.insert(edge.from);
+                    set.insert(edge.to);
+                }
+            }
+            Some(set)
+        } else {
+            None
+        };
+
+        for (id, sym) in &self.graph.symbols {
+            if self.hidden_symbols.contains(id) {
+                continue;
+            }
+            if !self.node_filter.is_enabled(sym.kind) {
+                hidden.push(*id);
+                continue;
+            }
+            if let Some(ref with_edges) = nodes_with_edges {
+                if !with_edges.contains(id) {
+                    hidden.push(*id);
+                }
+            }
         }
+        self.layout_state.set_hidden(&hidden);
     }
 
     /// Recompute the effective hidden-symbols set by merging file-tree
@@ -293,6 +354,7 @@ impl SpaghettiApp {
             camera_zoom: self.camera.zoom,
             show_console: self.show_console,
             console_level: format!("{}", self.console_level_filter),
+            hide_edgeless: self.hide_edgeless,
             dir_visibility: self.file_tree.visibility_map(),
         }
     }
@@ -314,6 +376,7 @@ impl SpaghettiApp {
     fn menu_bar(&mut self, ui: &mut egui::Ui) {
         egui::Panel::top("menu_bar").show_inside(ui, |ui| {
             egui::MenuBar::new().ui(ui, |ui| {
+                let mut open_recent: Option<PathBuf> = None;
                 ui.menu_button("File", |ui| {
                     let enabled = !self.indexing;
                     if ui
@@ -323,16 +386,72 @@ impl SpaghettiApp {
                         ui.close();
                         self.open_file_dialog();
                     }
+                    if !self.recent_projects.is_empty() {
+                        ui.separator();
+                        ui.label("Recent Projects");
+                        for path in &self.recent_projects {
+                            let label = path
+                                .file_name()
+                                .and_then(|f| f.to_str())
+                                .map(|name| {
+                                    // Show parent dir for context
+                                    path.parent()
+                                        .and_then(|p| p.file_name())
+                                        .and_then(|d| d.to_str())
+                                        .map(|dir| format!("{dir}/{name}"))
+                                        .unwrap_or_else(|| name.to_string())
+                                })
+                                .unwrap_or_else(|| path.display().to_string());
+                            if ui.add_enabled(enabled, egui::Button::new(&label)).clicked() {
+                                open_recent = Some(path.clone());
+                                ui.close();
+                            }
+                        }
+                    }
                     ui.separator();
                     if ui.button("Quit").clicked() {
                         ui.ctx().send_viewport_cmd(egui::ViewportCommand::Close);
                     }
                 });
+                if let Some(path) = open_recent {
+                    self.start_indexing(path);
+                }
 
                 ui.menu_button("View", |ui| {
                     if crate::widgets::toggle_button(ui, &mut self.show_console, "Console")
                         .changed()
                     {
+                        ui.close();
+                    }
+                });
+
+                ui.menu_button("Settings", |ui| {
+                    let can_reload = self.compile_commands_path.is_some() && !self.indexing;
+                    if ui
+                        .add_enabled(can_reload, egui::Button::new("Clear Cache & Reload"))
+                        .clicked()
+                    {
+                        if let Some(cc_path) = self.compile_commands_path.clone() {
+                            let cache_dir = frontend_clang::cache_dir(&cc_path);
+                            match std::fs::remove_dir_all(&cache_dir) {
+                                Ok(()) => {
+                                    tracing::info!(
+                                        path = %cache_dir.display(),
+                                        "cleared TU cache"
+                                    );
+                                }
+                                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                                    tracing::info!("no cache to clear");
+                                }
+                                Err(e) => {
+                                    tracing::warn!(
+                                        error = %e,
+                                        "failed to clear cache"
+                                    );
+                                }
+                            }
+                            self.start_indexing(cc_path);
+                        }
                         ui.close();
                     }
                 });
@@ -353,9 +472,33 @@ impl SpaghettiApp {
         self.pending_file_dialog = Some(rx);
     }
 
+    /// Apply persisted settings (render, view, force params) to the app.
+    pub fn apply_saved_settings(&mut self, settings: &crate::settings::AppSettings) {
+        self.render = settings.render.clone();
+        self.edge_filter = EdgeKindFilter::from_saved(&settings.view.edge_filters);
+        self.node_filter = SymbolKindFilter::from_saved(&settings.view.node_filters);
+        self.show_console = settings.view.show_console;
+        self.console_level_filter = level_from_str(&settings.view.console_level);
+        self.hide_edgeless = settings.view.hide_edgeless;
+        self.camera = Camera2D {
+            offset: egui::Vec2::new(
+                settings.view.camera_offset[0],
+                settings.view.camera_offset[1],
+            ),
+            zoom: settings.view.camera_zoom,
+        };
+        *self.layout_state.params_mut() = settings.force_params.clone();
+        self.pending_dir_visibility = settings.view.dir_visibility.clone();
+    }
+
     /// Start indexing a file in a background thread.
-    fn start_indexing(&mut self, path: PathBuf) {
+    pub fn start_indexing(&mut self, path: PathBuf) {
         self.indexing = true;
+        self.compile_commands_path = Some(path.clone());
+        // Track in recent projects list.
+        self.recent_projects.retain(|p| p != &path);
+        self.recent_projects.insert(0, path.clone());
+        self.recent_projects.truncate(5);
         let params = self.layout_state.params().clone();
 
         let (progress_tx, progress_rx) = std::sync::mpsc::channel();
@@ -405,10 +548,7 @@ impl SpaghettiApp {
                         graph.edge_count()
                     )));
 
-                    let _ = progress_tx.send(ProgressMessage::Status("Computing layout…".into()));
-
-                    let mut layout_state = layout::LayoutState::new(&graph, 42, params);
-                    layout_state.step(200);
+                    let layout_state = layout::LayoutState::new(&graph, 42, params);
 
                     let _ = progress_tx.send(ProgressMessage::Done {
                         graph: Box::new(graph),
@@ -454,7 +594,8 @@ impl SpaghettiApp {
                     layout_state,
                 } => {
                     // Preserve directory visibility: merge pending (from
-                    // settings on disk) with current tree state.
+                    // settings on disk) with current tree state so both
+                    // startup and re-index restore the user's toggles.
                     let mut vis = self.pending_dir_visibility.clone();
                     vis.extend(self.file_tree.visibility_map());
                     self.file_tree = FileTree::from_graph(&graph);
@@ -462,6 +603,7 @@ impl SpaghettiApp {
                     self.graph = *graph;
                     self.layout_state = *layout_state;
                     self.sync_hidden_symbols();
+                    self.sync_hidden_to_layout();
                     self.positions = self.layout_state.positions();
                     self.selection = None;
                     self.camera = Camera2D::default();
@@ -507,7 +649,7 @@ impl SpaghettiApp {
             .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
             .show(ui.ctx(), |ui| {
                 egui::Frame::popup(ui.style()).show(ui, |ui| {
-                    ui.set_min_width(400.0);
+                    ui.set_min_width(800.0);
                     ui.vertical(|ui| {
                         ui.heading(&state.status);
                         ui.separator();
@@ -567,6 +709,7 @@ impl eframe::App for SpaghettiApp {
             force_params: self.layout_state.params().clone(),
             render: self.render.clone(),
             view: self.view_settings(),
+            recent_projects: self.recent_projects.clone(),
         };
         settings.save();
     }
