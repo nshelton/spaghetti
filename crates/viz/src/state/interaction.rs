@@ -7,6 +7,8 @@ use core_ir::SymbolId;
 pub struct InteractionState {
     /// Currently selected node (shown in details panel).
     pub selection: Option<SymbolId>,
+    /// Node currently hovered by the pointer.
+    pub hovered: Option<SymbolId>,
     /// Node currently being dragged on the canvas.
     pub dragging: Option<SymbolId>,
     /// Search text entered in the left panel.

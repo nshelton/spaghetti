@@ -3,14 +3,16 @@
 use egui::{Color32, Rect, Stroke, StrokeKind, Vec2};
 use glam::Vec2 as GVec2;
 
-use core_ir::SymbolId;
+use core_ir::{SymbolId, SymbolKind};
 
 use crate::app::{SpaghettiApp, ENERGY_THRESHOLD};
 use crate::camera::{NODE_HEIGHT, NODE_WIDTH};
 use crate::fps::paint_fps_overlay;
 
-/// World-space padding around children for expanded container backgrounds.
-const CONTAINER_PADDING: f32 = 30.0;
+/// World-space padding for top-level containers (Namespace, TranslationUnit).
+const TOPLEVEL_CONTAINER_PADDING: f32 = 50.0;
+/// World-space padding for class-level containers (Class, Struct).
+const CLASS_CONTAINER_PADDING: f32 = 15.0;
 /// Fixed world-space half-size for collapsed container boxes.
 /// Must match `COLLAPSED_HALF_SIZE` in the layout crate.
 const COLLAPSED_BOX_HALF: GVec2 = GVec2::new(80.0, 50.0);
@@ -43,14 +45,12 @@ impl SpaghettiApp {
                     if let Some(&world) = self.simulation.positions.0.get(&hit) {
                         self.simulation.layout_state.pin(hit, world);
                     }
-                    // Pin children of expanded containers so they move rigidly.
-                    if self.simulation.layout_state.is_container(hit)
-                        && self.simulation.layout_state.is_expanded(hit)
-                    {
-                        let children = self.simulation.layout_state.children_of(hit);
-                        for child in children {
-                            if let Some(&pos) = self.simulation.positions.0.get(&child) {
-                                self.simulation.layout_state.pin(child, pos);
+                    // Pin all descendants of containers so they move rigidly.
+                    if self.simulation.layout_state.is_container(hit) {
+                        let descendants = self.simulation.layout_state.all_descendants(hit);
+                        for d in descendants {
+                            if let Some(&pos) = self.simulation.positions.0.get(&d) {
+                                self.simulation.layout_state.pin(d, pos);
                             }
                         }
                     }
@@ -72,16 +72,13 @@ impl SpaghettiApp {
                             .unwrap_or(world);
                         let delta = world - old_pos;
                         self.simulation.layout_state.set_position(dragged_id, world);
-                        // Move children of expanded containers along with the parent.
-                        if self.simulation.layout_state.is_container(dragged_id)
-                            && self.simulation.layout_state.is_expanded(dragged_id)
-                        {
-                            let children = self.simulation.layout_state.children_of(dragged_id);
-                            for child in children {
-                                if let Some(&child_pos) = self.simulation.positions.0.get(&child) {
-                                    self.simulation
-                                        .layout_state
-                                        .set_position(child, child_pos + delta);
+                        // Move all descendants of containers along with the parent.
+                        if self.simulation.layout_state.is_container(dragged_id) {
+                            let descendants =
+                                self.simulation.layout_state.all_descendants(dragged_id);
+                            for d in descendants {
+                                if let Some(&d_pos) = self.simulation.positions.0.get(&d) {
+                                    self.simulation.layout_state.set_position(d, d_pos + delta);
                                 }
                             }
                         }
@@ -96,13 +93,11 @@ impl SpaghettiApp {
             // Drag released: unpin the node and its children.
             if response.drag_stopped_by(egui::PointerButton::Primary) {
                 if let Some(dragged_id) = self.interaction.dragging.take() {
-                    // Unpin children first if this was an expanded container.
-                    if self.simulation.layout_state.is_container(dragged_id)
-                        && self.simulation.layout_state.is_expanded(dragged_id)
-                    {
-                        let children = self.simulation.layout_state.children_of(dragged_id);
-                        for child in children {
-                            self.simulation.layout_state.unpin(child);
+                    // Unpin all descendants if this was a container.
+                    if self.simulation.layout_state.is_container(dragged_id) {
+                        let descendants = self.simulation.layout_state.all_descendants(dragged_id);
+                        for d in descendants {
+                            self.simulation.layout_state.unpin(d);
                         }
                     }
                     self.simulation.layout_state.unpin(dragged_id);
@@ -129,6 +124,11 @@ impl SpaghettiApp {
                     }
                 }
             }
+
+            // Update hover state each frame.
+            self.interaction.hovered = response
+                .hover_pos()
+                .and_then(|p| self.hit_test_compound(Some(p), canvas_center));
 
             // Press P to toggle pause on the layout simulation.
             if ui.input(|i| i.key_pressed(egui::Key::P)) && !ui.memory(|m| m.focused().is_some()) {
@@ -205,6 +205,10 @@ impl SpaghettiApp {
                 if self.filters.hidden_symbols.contains(id) {
                     continue;
                 }
+                // Skip container box when its node type is filtered out.
+                if !self.filters.node_filter.is_enabled(sym.kind) {
+                    continue;
+                }
                 let is_expanded = self.simulation.layout_state.is_expanded(*id);
 
                 let Some(&parent_pos) = self.simulation.positions.0.get(id) else {
@@ -212,19 +216,19 @@ impl SpaghettiApp {
                 };
 
                 let (min_w, max_w) = if is_expanded {
-                    // Dynamic bounding box from children positions.
-                    let children = self.simulation.layout_state.children_of(*id);
-                    if children.is_empty() {
+                    // Dynamic bounding box from ALL descendant positions.
+                    let descendants = self.simulation.layout_state.all_descendants(*id);
+                    if descendants.is_empty() {
                         continue;
                     }
                     let mut mn = GVec2::splat(f32::INFINITY);
                     let mut mx = GVec2::splat(f32::NEG_INFINITY);
                     let mut has_visible = false;
-                    for &child_id in &children {
-                        if self.filters.hidden_symbols.contains(&child_id) {
+                    for &desc_id in &descendants {
+                        if self.filters.hidden_symbols.contains(&desc_id) {
                             continue;
                         }
-                        if let Some(&pos) = self.simulation.positions.0.get(&child_id) {
+                        if let Some(&pos) = self.simulation.positions.0.get(&desc_id) {
                             mn = mn.min(pos - GVec2::new(NODE_WIDTH / 2.0, NODE_HEIGHT / 2.0));
                             mx = mx.max(pos + GVec2::new(NODE_WIDTH / 2.0, NODE_HEIGHT / 2.0));
                             has_visible = true;
@@ -235,9 +239,15 @@ impl SpaghettiApp {
                     }
                     mn = mn.min(parent_pos - GVec2::new(NODE_WIDTH / 2.0, NODE_HEIGHT / 2.0));
                     mx = mx.max(parent_pos + GVec2::new(NODE_WIDTH / 2.0, NODE_HEIGHT / 2.0));
+                    let pad = match sym.kind {
+                        SymbolKind::Namespace | SymbolKind::TranslationUnit => {
+                            TOPLEVEL_CONTAINER_PADDING
+                        }
+                        _ => CLASS_CONTAINER_PADDING,
+                    };
                     let title_height = 20.0;
-                    mn -= GVec2::new(CONTAINER_PADDING, CONTAINER_PADDING + title_height);
-                    mx += GVec2::new(CONTAINER_PADDING, CONTAINER_PADDING);
+                    mn -= GVec2::new(pad, pad + title_height);
+                    mx += GVec2::new(pad, pad);
                     (mn, mx)
                 } else {
                     // Fixed-size box for collapsed containers.
@@ -263,30 +273,40 @@ impl SpaghettiApp {
                 self.simulation.container_rects.push((*id, container_rect));
 
                 let base_color = self.render.render.node_color(sym.kind);
+                let is_selected = self.interaction.selection == Some(*id);
+                let is_hovered = self.interaction.hovered == Some(*id);
+
+                // Selection glow: expanded rect behind with soft color.
+                if is_selected {
+                    let glow_rect = container_rect.expand(6.0);
+                    painter.rect_filled(glow_rect, 12.0, with_alpha(base_color, 0.25));
+                }
+
                 let bg_alpha = if is_expanded { 0.15 } else { 0.25 };
-                let bg = with_alpha(base_color, bg_alpha);
+                let bg = if is_selected {
+                    with_alpha(brighten(base_color, 1.5), bg_alpha + 0.1)
+                } else if is_hovered {
+                    with_alpha(brighten(base_color, 1.3), bg_alpha + 0.05)
+                } else {
+                    with_alpha(base_color, bg_alpha)
+                };
                 painter.rect_filled(container_rect, 8.0, bg);
-                let border_w = if is_expanded { 1.0 } else { 2.0 };
+
+                let (border_w, border_alpha) = if is_selected {
+                    (3.0, 0.8)
+                } else if is_hovered {
+                    (2.5, 0.7)
+                } else if is_expanded {
+                    (1.0, 0.5)
+                } else {
+                    (2.0, 0.5)
+                };
                 painter.rect_stroke(
                     container_rect,
                     8.0,
-                    Stroke::new(border_w, with_alpha(base_color, 0.5)),
+                    Stroke::new(border_w, with_alpha(base_color, border_alpha)),
                     StrokeKind::Outside,
                 );
-
-                // Draw container title.
-                if self.render.camera.zoom >= 0.15 {
-                    let title_pos =
-                        egui::Pos2::new(container_rect.left() + 6.0, container_rect.top() + 2.0);
-                    let font = egui::FontId::proportional(13.0 * self.render.camera.zoom);
-                    painter.text(
-                        title_pos,
-                        egui::Align2::LEFT_TOP,
-                        &sym.name,
-                        font,
-                        with_alpha(Color32::WHITE, 0.8),
-                    );
-                }
             }
 
             // --- 2. Draw edges (direct, no rerouting) ---
@@ -411,44 +431,119 @@ impl SpaghettiApp {
                         continue;
                     }
 
+                    let is_selected = self.interaction.selection == Some(*id);
+                    let is_hovered = self.interaction.hovered == Some(*id);
+
                     if draw_rects {
                         let rect = Rect::from_center_size(screen_pos, node_size);
 
-                        let bg = if self.interaction.selection == Some(*id) {
+                        // Selection glow behind the node.
+                        if is_selected {
+                            let glow = rect.expand(4.0);
+                            let glow_color =
+                                with_alpha(self.render.render.node_color(sym.kind), 0.35);
+                            painter.rect_filled(glow, 6.0, glow_color);
+                        }
+
+                        let bg = if is_selected {
                             brighten(base, 2.0)
+                        } else if is_hovered {
+                            brighten(base, 1.5)
                         } else {
                             base
                         };
                         painter.rect_filled(rect, 4.0, bg);
+
+                        let (border_w, border_color) = if is_selected {
+                            (2.0, Color32::WHITE)
+                        } else if is_hovered {
+                            (2.0, Color32::from_gray(160))
+                        } else {
+                            (1.0, Color32::from_gray(60))
+                        };
                         painter.rect_stroke(
                             rect,
                             4.0,
-                            Stroke::new(1.0, Color32::from_gray(60)),
+                            Stroke::new(border_w, border_color),
                             StrokeKind::Outside,
                         );
-
-                        if draw_labels {
-                            let font = egui::FontId::proportional(12.0 * self.render.camera.zoom);
-                            painter.text(
-                                screen_pos,
-                                egui::Align2::CENTER_CENTER,
-                                &sym.name,
-                                font,
-                                Color32::WHITE,
-                            );
-                        }
                     } else {
-                        let color = if self.interaction.selection == Some(*id) {
-                            brighten(base, 2.0)
-                        } else {
-                            base
-                        };
-                        let r = if circle_mode {
+                        let base_r = if circle_mode {
                             circle_radius * self.render.camera.zoom
                         } else {
                             2.0
                         };
+
+                        // Selection glow behind the circle.
+                        if is_selected {
+                            let glow_color =
+                                with_alpha(self.render.render.node_color(sym.kind), 0.35);
+                            painter.circle_filled(screen_pos, base_r + 4.0, glow_color);
+                        }
+
+                        let color = if is_selected {
+                            brighten(base, 2.0)
+                        } else if is_hovered {
+                            brighten(base, 1.5)
+                        } else {
+                            base
+                        };
+                        let r = if is_hovered { base_r + 1.5 } else { base_r };
                         painter.circle_filled(screen_pos, r, color);
+                    }
+                }
+            }
+
+            // --- 4. Draw ALL labels on top (container titles + node labels) ---
+            if self.render.camera.zoom >= 0.15 {
+                // Container titles.
+                for &(id, rect) in &self.simulation.container_rects {
+                    if let Some(sym) = self.graph.graph.symbols.get(&id) {
+                        let title_pos = egui::Pos2::new(rect.left() + 6.0, rect.top() + 2.0);
+                        let font = egui::FontId::proportional(13.0 * self.render.camera.zoom);
+                        painter.text(
+                            title_pos,
+                            egui::Align2::LEFT_TOP,
+                            &sym.name,
+                            font,
+                            with_alpha(Color32::WHITE, 0.8),
+                        );
+                    }
+                }
+
+                // Node labels.
+                if draw_labels {
+                    let font = egui::FontId::proportional(12.0 * self.render.camera.zoom);
+                    for (id, sym) in &self.graph.graph.symbols {
+                        if self.filters.hidden_symbols.contains(id)
+                            || !self.filters.node_filter.is_enabled(sym.kind)
+                            || self.simulation.layout_state.is_container(*id)
+                        {
+                            continue;
+                        }
+                        if let Some(ref with_edges) = nodes_with_edges {
+                            if !with_edges.contains(id) {
+                                continue;
+                            }
+                        }
+                        if let Some(&world_pos) = self.simulation.positions.0.get(id) {
+                            if world_pos.x < vis_min.x
+                                || world_pos.x > vis_max.x
+                                || world_pos.y < vis_min.y
+                                || world_pos.y > vis_max.y
+                            {
+                                continue;
+                            }
+                            let screen_pos =
+                                self.render.camera.world_to_screen(world_pos, canvas_center);
+                            painter.text(
+                                screen_pos,
+                                egui::Align2::CENTER_CENTER,
+                                &sym.name,
+                                font.clone(),
+                                Color32::WHITE,
+                            );
+                        }
                     }
                 }
             }

@@ -74,6 +74,7 @@ impl SpaghettiApp {
             graph: GraphState { graph, file_tree },
             interaction: InteractionState {
                 selection: None,
+                hovered: None,
                 dragging: None,
                 search: String::new(),
                 auto_fitted: false,

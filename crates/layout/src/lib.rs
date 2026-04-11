@@ -254,6 +254,9 @@ pub struct LayoutState {
     /// Per-node bounding box sizes in world units. Used for size-aware
     /// repulsion (edge-to-edge distance instead of center-to-center).
     sizes: Vec<Vec2>,
+    /// Groups of sibling container indices (containers sharing the same parent).
+    /// Container repulsion only acts within each sibling group.
+    sibling_groups: Vec<Vec<usize>>,
 }
 
 impl LayoutState {
@@ -326,6 +329,11 @@ impl LayoutState {
             }
         }
 
+        // Build sibling groups: containers grouped by their shared parent.
+        // Top-level containers (no parent) form one group; children of each
+        // container that are themselves containers form another group.
+        let sibling_groups = build_sibling_groups(&containers, &parent_of);
+
         // Default: all containers collapsed. Children remain in the
         // simulation (visible, participate in forces) but are clamped
         // inside the collapsed container box each step.
@@ -354,6 +362,7 @@ impl LayoutState {
             collapse_hidden,
             external_hidden: HashSet::new(),
             sizes: vec![Vec2::new(120.0, 30.0); n],
+            sibling_groups,
         }
     }
 
@@ -498,9 +507,9 @@ impl LayoutState {
                 }
             }
 
-            // Containment force: pull children of containers toward their
-            // siblings' centroid so they stay clustered. Applies to both
-            // expanded and collapsed containers.
+            // Containment force: each container pulls its DIRECT children
+            // toward their centroid. Each hierarchy level manages its own
+            // children — no double-pulling through the tree.
             if p.containment_enabled && p.containment_strength > 0.0 {
                 for &c in &self.containers {
                     if self.hidden.contains(&c) {
@@ -510,7 +519,6 @@ impl LayoutState {
                     if children.len() < 2 {
                         continue;
                     }
-                    // Compute centroid of visible children.
                     let mut centroid = Vec2::ZERO;
                     let mut count = 0u32;
                     for &child in children {
@@ -596,36 +604,55 @@ impl LayoutState {
                 }
             }
 
-            // Container repulsion: gap-based repulsion between pairs where
-            // at least one node is a container. Prevents overlap of larger nodes.
+            // Container repulsion: gap-based repulsion between sibling
+            // containers only. Forces are applied as rigid-body translation
+            // (the container node AND all its descendants move together),
+            // preventing internal layout distortion.
             if p.container_repulsion_enabled && p.container_repulsion > 0.0 {
                 let cr = p.container_repulsion;
                 let min_d = p.min_dist;
-                for &c in &self.containers {
-                    // Only apply gap-based repulsion to expanded containers;
-                    // collapsed ones are rendered as small dots and handled by
-                    // regular point-based Coulomb repulsion.
-                    if self.hidden.contains(&c) || !self.expanded.contains(&c) {
+                for group in &self.sibling_groups {
+                    // Collect the expanded, visible containers in this group.
+                    let active: Vec<usize> = group
+                        .iter()
+                        .copied()
+                        .filter(|&c| !self.hidden.contains(&c) && self.expanded.contains(&c))
+                        .collect();
+                    if active.len() < 2 {
                         continue;
                     }
-                    let pos_c = self.positions[c];
-                    let half_c = self.sizes[c] * 0.5;
-                    for j in 0..len {
-                        if j == c || self.hidden.contains(&j) {
-                            continue;
+                    // Pairwise gap-based repulsion within the sibling group.
+                    for (i, &a) in active.iter().enumerate() {
+                        let pos_a = self.positions[a];
+                        let half_a = self.sizes[a] * 0.5;
+                        for &b in &active[(i + 1)..] {
+                            let delta = pos_a - self.positions[b];
+                            let dist_sq = delta.length_squared();
+                            if dist_sq < 1e-10 {
+                                continue;
+                            }
+                            let half_b = self.sizes[b] * 0.5;
+                            let gap_x = delta.x.abs() - (half_a.x + half_b.x);
+                            let gap_y = delta.y.abs() - (half_a.y + half_b.y);
+                            let gap = gap_x.max(gap_y).max(min_d);
+                            let f = delta.normalize_or_zero() * (cr / (gap * gap));
+
+                            // Rigid-body: apply force to container + all descendants.
+                            apply_force_to_subtree(
+                                a,
+                                f,
+                                &mut forces,
+                                &self.children_of,
+                                &self.hidden,
+                            );
+                            apply_force_to_subtree(
+                                b,
+                                -f,
+                                &mut forces,
+                                &self.children_of,
+                                &self.hidden,
+                            );
                         }
-                        let delta = pos_c - self.positions[j];
-                        let dist_sq = delta.length_squared();
-                        if dist_sq < 1e-10 {
-                            continue;
-                        }
-                        let half_j = self.sizes[j] * 0.5;
-                        let gap_x = delta.x.abs() - (half_c.x + half_j.x);
-                        let gap_y = delta.y.abs() - (half_c.y + half_j.y);
-                        let gap = gap_x.max(gap_y).max(min_d);
-                        let f = delta.normalize_or_zero() * (cr / (gap * gap));
-                        forces[c] += f;
-                        forces[j] -= f;
                     }
                 }
             }
@@ -663,18 +690,18 @@ impl LayoutState {
                 }
             }
 
-            // Clamp children of collapsed containers inside a fixed box
-            // around the parent position.
+            // Clamp ALL descendants of collapsed containers inside a
+            // fixed box around the parent position.
             for &c in &self.containers {
                 if self.expanded.contains(&c) || self.hidden.contains(&c) {
                     continue;
                 }
                 let center = self.positions[c];
-                for &child in &self.children_of[c] {
-                    if self.hidden.contains(&child) {
+                for &d in &self.all_descendants_idx(c) {
+                    if self.hidden.contains(&d) {
                         continue;
                     }
-                    let pos = &mut self.positions[child];
+                    let pos = &mut self.positions[d];
                     pos.x = pos.x.clamp(
                         center.x - COLLAPSED_HALF_SIZE.x,
                         center.x + COLLAPSED_HALF_SIZE.x,
@@ -830,8 +857,8 @@ impl LayoutState {
         self.hidden = &self.collapse_hidden | &self.external_hidden;
     }
 
-    /// Collapse a container node: children stay in the simulation but
-    /// are clamped inside a fixed-size box around the parent each step.
+    /// Collapse a container node: all descendants stay in the simulation
+    /// but are clamped inside a fixed-size box around the parent each step.
     pub fn collapse(&mut self, id: SymbolId) {
         let Some(&idx) = self.id_to_idx.get(&id) else {
             return;
@@ -840,20 +867,20 @@ impl LayoutState {
             return;
         }
         self.expanded.remove(&idx);
-        // Gather children close to parent so they animate into the box.
+        // Gather all descendants close to parent so they animate into the box.
         let parent_pos = self.positions[idx];
-        let children = self.children_of[idx].clone();
-        for (i, &child) in children.iter().enumerate() {
-            let angle = (i as f32) * std::f32::consts::TAU / children.len().max(1) as f32;
+        let descendants = self.all_descendants_idx(idx);
+        for (i, &d) in descendants.iter().enumerate() {
+            let angle = (i as f32) * std::f32::consts::TAU / descendants.len().max(1) as f32;
             let offset = Vec2::new(angle.cos(), angle.sin()) * 20.0;
-            self.positions[child] = parent_pos + offset;
-            self.velocities[child] = Vec2::ZERO;
+            self.positions[d] = parent_pos + offset;
+            self.velocities[d] = Vec2::ZERO;
         }
         self.reheat();
     }
 
-    /// Expand a container node: children are scattered outward and the
-    /// dynamic bounding-box rendering takes over.
+    /// Expand a container node: all descendants are scattered outward and
+    /// the dynamic bounding-box rendering takes over.
     pub fn expand(&mut self, id: SymbolId) {
         let Some(&idx) = self.id_to_idx.get(&id) else {
             return;
@@ -863,13 +890,12 @@ impl LayoutState {
         }
         self.expanded.insert(idx);
         let parent_pos = self.positions[idx];
-        let children = self.children_of[idx].clone();
-        for (i, &child) in children.iter().enumerate() {
-            // Scatter children in a circle around the parent.
-            let angle = (i as f32) * std::f32::consts::TAU / children.len().max(1) as f32;
+        let descendants = self.all_descendants_idx(idx);
+        for (i, &d) in descendants.iter().enumerate() {
+            let angle = (i as f32) * std::f32::consts::TAU / descendants.len().max(1) as f32;
             let offset = Vec2::new(angle.cos(), angle.sin()) * 50.0;
-            self.positions[child] = parent_pos + offset;
-            self.velocities[child] = Vec2::ZERO;
+            self.positions[d] = parent_pos + offset;
+            self.velocities[d] = Vec2::ZERO;
         }
         self.reheat();
     }
@@ -902,12 +928,34 @@ impl LayoutState {
         self.containers.contains(&idx)
     }
 
-    /// Return the children of a container node.
+    /// Return the direct children of a container node.
     pub fn children_of(&self, id: SymbolId) -> Vec<SymbolId> {
         let Some(&idx) = self.id_to_idx.get(&id) else {
             return Vec::new();
         };
         self.children_of[idx].iter().map(|&i| self.ids[i]).collect()
+    }
+
+    /// Return ALL descendants of a container (children, grandchildren, etc.).
+    pub fn all_descendants(&self, id: SymbolId) -> Vec<SymbolId> {
+        let Some(&idx) = self.id_to_idx.get(&id) else {
+            return Vec::new();
+        };
+        self.all_descendants_idx(idx)
+            .iter()
+            .map(|&i| self.ids[i])
+            .collect()
+    }
+
+    /// Internal: collect all descendant indices recursively.
+    fn all_descendants_idx(&self, idx: usize) -> Vec<usize> {
+        let mut result = Vec::new();
+        let mut stack = self.children_of[idx].clone();
+        while let Some(child) = stack.pop() {
+            result.push(child);
+            stack.extend_from_slice(&self.children_of[child]);
+        }
+        result
     }
 
     /// Return the parent container of a node, if any.
@@ -949,6 +997,41 @@ impl LayoutState {
     /// a fixed box), this always returns an empty list.
     pub fn collapsed_hidden_ids(&self) -> Vec<SymbolId> {
         Vec::new()
+    }
+}
+
+/// Build sibling groups: containers grouped by their shared parent.
+/// Top-level containers (`parent_of[c] == None`) form one group; children of
+/// each container that are themselves containers form another group.
+fn build_sibling_groups(
+    containers: &HashSet<usize>,
+    parent_of: &[Option<usize>],
+) -> Vec<Vec<usize>> {
+    let mut by_parent: HashMap<Option<usize>, Vec<usize>> = HashMap::new();
+    for &c in containers {
+        by_parent.entry(parent_of[c]).or_default().push(c);
+    }
+    // Only keep groups with at least 2 siblings (single containers can't repel).
+    by_parent.into_values().filter(|g| g.len() >= 2).collect()
+}
+
+/// Apply a force to a node and all its descendants (rigid-body translation).
+/// Walks the subtree via `children_of` without allocating.
+fn apply_force_to_subtree(
+    root: usize,
+    force: Vec2,
+    forces: &mut [Vec2],
+    children_of: &[Vec<usize>],
+    hidden: &HashSet<usize>,
+) {
+    forces[root] += force;
+    // Use a manual stack to avoid recursion overhead.
+    let mut stack: Vec<usize> = children_of[root].clone();
+    while let Some(node) = stack.pop() {
+        if !hidden.contains(&node) {
+            forces[node] += force;
+            stack.extend_from_slice(&children_of[node]);
+        }
     }
 }
 
