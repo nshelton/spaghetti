@@ -549,6 +549,27 @@ impl LayoutState {
         self.total_steps = self.total_steps.saturating_sub(100);
     }
 
+    /// Randomize all node positions and zero velocities, then reheat.
+    /// Uses the current timestamp as a seed so each reset looks different.
+    pub fn randomize(&mut self) {
+        let seed = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos() as u64)
+            .unwrap_or(12345);
+        let n = self.positions.len();
+        for (i, pos) in self.positions.iter_mut().enumerate() {
+            let hash = seed.wrapping_mul(i as u64 + 1).wrapping_add(0x9E37_79B9);
+            let x = ((hash & 0xFFFF) as f32 / 65535.0 - 0.5) * 400.0;
+            let y = (((hash >> 16) & 0xFFFF) as f32 / 65535.0 - 0.5) * 400.0;
+            *pos = Vec2::new(x, y);
+        }
+        for v in &mut self.velocities {
+            *v = Vec2::ZERO;
+        }
+        self.total_steps = 0;
+        let _ = n;
+    }
+
     /// Set which symbols are hidden from the simulation.
     ///
     /// Hidden nodes are excluded from all force computations (repulsion,

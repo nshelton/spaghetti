@@ -91,6 +91,11 @@ impl SpaghettiApp {
                     .fit_to_bounds(&self.positions, response.rect.size());
             }
 
+            // Press R to randomize the layout.
+            if ui.input(|i| i.key_pressed(egui::Key::R)) && !ui.memory(|m| m.focused().is_some()) {
+                self.layout_state.randomize();
+            }
+
             // Request repaint while the layout is still settling.
             if energy > ENERGY_THRESHOLD || self.dragging.is_some() {
                 ui.ctx().request_repaint();

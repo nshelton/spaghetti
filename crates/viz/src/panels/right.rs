@@ -273,6 +273,14 @@ impl SpaghettiApp {
                         changed = true;
                     }
 
+                    if ui
+                        .button("Randomize layout (R)")
+                        .on_hover_text("Scatter all nodes to random positions")
+                        .clicked()
+                    {
+                        self.layout_state.randomize();
+                    }
+
                     if changed {
                         self.layout_state.reheat();
                     }
