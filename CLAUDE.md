@@ -115,13 +115,9 @@ This list exists because scope creep kills this kind of project. If you find you
 - Incremental re-indexing
 - Uninstantiated template modeling
 - SFINAE / concept overload visualization
-- Symbol kinds beyond `Class`, `Method`, and `Function` in the clang frontend
-
-The core-ir enums may contain more variants than the frontend currently emits — that is intentional, to avoid churning the IR later.
-
 ## Current Status
 
-The clang frontend is functional, emitting `Class`, `Method`, and `Function` symbols with `Calls`, `Inherits`, `Contains`, and `Overrides` edges. The layout uses an incremental force-directed simulation (`LayoutState`) driven frame-by-frame with node dragging/pinning support. The camera module (`viz/src/camera.rs`) handles pan, zoom, and hit-testing.
+The clang frontend emits all `SymbolKind` variants defined in `core-ir`: `Class`, `Struct`, `Function`, `Method`, `Field`, `Namespace`, `TemplateInstantiation`, and `TranslationUnit`. It also emits all `EdgeKind` variants: `Calls`, `Inherits`, `Contains`, `Overrides`, `ReadsField`, `WritesField`, `Includes`, `Instantiates`, and `HasType`. The layout uses an incremental force-directed simulation (`LayoutState`) driven frame-by-frame with node dragging/pinning support. The camera module (`viz/src/camera.rs`) handles pan, zoom, and hit-testing.
 
 To verify the project is healthy:
 

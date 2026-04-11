@@ -110,6 +110,41 @@ impl Default for ForceParams {
                 attraction: 0.012,
             },
         );
+        edge_params.insert(
+            EdgeKind::ReadsField,
+            EdgeKindParams {
+                target_distance: 100.0,
+                attraction: 0.008,
+            },
+        );
+        edge_params.insert(
+            EdgeKind::WritesField,
+            EdgeKindParams {
+                target_distance: 100.0,
+                attraction: 0.008,
+            },
+        );
+        edge_params.insert(
+            EdgeKind::Includes,
+            EdgeKindParams {
+                target_distance: 180.0,
+                attraction: 0.006,
+            },
+        );
+        edge_params.insert(
+            EdgeKind::Instantiates,
+            EdgeKindParams {
+                target_distance: 160.0,
+                attraction: 0.008,
+            },
+        );
+        edge_params.insert(
+            EdgeKind::HasType,
+            EdgeKindParams {
+                target_distance: 120.0,
+                attraction: 0.006,
+            },
+        );
 
         Self {
             repulsion: 5000.0,
@@ -183,12 +218,6 @@ impl LayoutState {
         let edge_pairs: Vec<(usize, usize, EdgeKind)> = graph
             .edges
             .iter()
-            .filter(|e| {
-                matches!(
-                    e.kind,
-                    EdgeKind::Calls | EdgeKind::Inherits | EdgeKind::Contains | EdgeKind::Overrides
-                )
-            })
             .filter_map(|e| {
                 let from = id_to_idx.get(&e.from)?;
                 let to = id_to_idx.get(&e.to)?;
@@ -201,6 +230,11 @@ impl LayoutState {
             EdgeKind::Inherits,
             EdgeKind::Contains,
             EdgeKind::Overrides,
+            EdgeKind::ReadsField,
+            EdgeKind::WritesField,
+            EdgeKind::Includes,
+            EdgeKind::Instantiates,
+            EdgeKind::HasType,
         ];
 
         let velocities = vec![Vec2::ZERO; n];

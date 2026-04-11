@@ -210,16 +210,23 @@ pub fn file_summary(file: &FileNode) -> String {
     let mut classes = 0u32;
     let mut methods = 0u32;
     let mut functions = 0u32;
+    let mut fields = 0u32;
+    let mut namespaces = 0u32;
     for &(_, kind, _) in &file.symbols {
         match kind {
             SymbolKind::Class | SymbolKind::Struct => classes += 1,
             SymbolKind::Method => methods += 1,
             SymbolKind::Function => functions += 1,
+            SymbolKind::Field => fields += 1,
+            SymbolKind::Namespace => namespaces += 1,
             _ => {}
         }
     }
 
     let mut parts = Vec::new();
+    if namespaces > 0 {
+        parts.push(format!("{namespaces} ns"));
+    }
     if classes > 0 {
         parts.push(format!(
             "{classes} {}",
@@ -236,6 +243,12 @@ pub fn file_summary(file: &FileNode) -> String {
         parts.push(format!(
             "{functions} {}",
             if functions == 1 { "fn" } else { "fns" }
+        ));
+    }
+    if fields > 0 {
+        parts.push(format!(
+            "{fields} {}",
+            if fields == 1 { "field" } else { "fields" }
         ));
     }
 
