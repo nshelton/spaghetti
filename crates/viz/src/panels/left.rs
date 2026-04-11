@@ -93,8 +93,6 @@ impl SpaghettiApp {
                 if visibility_changed {
                     self.filters
                         .sync_hidden_symbols(&self.graph, &mut self.simulation);
-                    self.filters
-                        .sync_hidden_to_layout(&self.graph, &mut self.simulation);
                 }
 
                 ui.separator();

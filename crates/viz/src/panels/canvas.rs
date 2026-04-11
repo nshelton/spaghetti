@@ -90,6 +90,18 @@ impl SpaghettiApp {
                 }
             }
 
+            // Middle-click drag: always pan, regardless of what's under the cursor.
+            // Read directly from input since Sense::click_and_drag() only
+            // tracks the primary button for drag events.
+            let middle_dragging = ui.input(|i| i.pointer.middle_down());
+            if middle_dragging {
+                let delta = ui.input(|i| i.pointer.delta());
+                if delta != egui::Vec2::ZERO {
+                    self.render.camera.offset.x += delta.x / self.render.camera.zoom;
+                    self.render.camera.offset.y += delta.y / self.render.camera.zoom;
+                }
+            }
+
             // Drag released: unpin the node and its children.
             if response.drag_stopped_by(egui::PointerButton::Primary) {
                 if let Some(dragged_id) = self.interaction.dragging.take() {
@@ -141,6 +153,9 @@ impl SpaghettiApp {
                 .layout_state
                 .set_visible_edge_kinds(&active_kinds);
             if !self.simulation.paused {
+                // Update container sizes before stepping so overlap resolution
+                // uses the real bounding boxes (positions shift each frame).
+                self.simulation.update_node_sizes(&self.graph.graph);
                 self.simulation
                     .layout_state
                     .step_budgeted(std::time::Duration::from_millis(8));

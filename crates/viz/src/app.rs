@@ -372,8 +372,6 @@ impl SpaghettiApp {
                     self.simulation.layout_state = *layout_state;
                     self.filters
                         .sync_hidden_symbols(&self.graph, &mut self.simulation);
-                    self.filters
-                        .sync_hidden_to_layout(&self.graph, &mut self.simulation);
                     self.simulation.positions = self.simulation.layout_state.positions();
                     self.interaction.selection = None;
                     self.render.camera = Camera2D::default();

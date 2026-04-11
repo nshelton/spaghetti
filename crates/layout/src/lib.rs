@@ -7,7 +7,7 @@
 //! - [`LayoutState`]: incremental simulation driven frame-by-frame, with
 //!   support for pinning nodes (interactive dragging).
 
-use core_ir::{EdgeKind, Graph, SymbolId};
+use core_ir::{EdgeKind, Graph, SymbolId, SymbolKind};
 use glam::Vec2;
 use indexmap::IndexMap;
 use rayon::prelude::*;
@@ -245,6 +245,9 @@ pub struct LayoutState {
     children_of: Vec<Vec<usize>>,
     /// Set of node indices that are containers (have >=1 Contains-child).
     containers: HashSet<usize>,
+    /// Containers that are top-level (Namespace or TranslationUnit).
+    /// These get reduced containment strength.
+    toplevel_containers: HashSet<usize>,
     /// Which containers are currently expanded (children visible).
     expanded: HashSet<usize>,
     /// Nodes hidden by collapse (tracked separately from file-tree hidden).
@@ -329,6 +332,20 @@ impl LayoutState {
             }
         }
 
+        // Identify top-level containers (Namespace, TranslationUnit).
+        let mut toplevel_containers = HashSet::new();
+        for &c in &containers {
+            let sym_id = ids[c];
+            if let Some(sym) = graph.symbols.get(&sym_id) {
+                if matches!(
+                    sym.kind,
+                    SymbolKind::Namespace | SymbolKind::TranslationUnit
+                ) {
+                    toplevel_containers.insert(c);
+                }
+            }
+        }
+
         // Build sibling groups: containers grouped by their shared parent.
         // Top-level containers (no parent) form one group; children of each
         // container that are themselves containers form another group.
@@ -358,6 +375,7 @@ impl LayoutState {
             parent_of,
             children_of,
             containers,
+            toplevel_containers,
             expanded,
             collapse_hidden,
             external_hidden: HashSet::new(),
@@ -508,8 +526,8 @@ impl LayoutState {
             }
 
             // Containment force: each container pulls its DIRECT children
-            // toward their centroid. Each hierarchy level manages its own
-            // children — no double-pulling through the tree.
+            // toward their centroid. Top-level containers (TU/Namespace)
+            // use half strength so class-level containment dominates.
             if p.containment_enabled && p.containment_strength > 0.0 {
                 for &c in &self.containers {
                     if self.hidden.contains(&c) {
@@ -532,10 +550,14 @@ impl LayoutState {
                     }
                     centroid /= count as f32;
 
+                    let strength = if self.toplevel_containers.contains(&c) {
+                        p.containment_strength * 0.5
+                    } else {
+                        p.containment_strength
+                    };
                     for &child in children {
                         if !self.hidden.contains(&child) {
-                            forces[child] +=
-                                (centroid - self.positions[child]) * p.containment_strength;
+                            forces[child] += (centroid - self.positions[child]) * strength;
                         }
                     }
                 }
@@ -604,13 +626,12 @@ impl LayoutState {
                 }
             }
 
-            // Container repulsion: gap-based repulsion between sibling
-            // containers only. Forces are applied as rigid-body translation
-            // (the container node AND all its descendants move together),
-            // preventing internal layout distortion.
+            // Container overlap resolution: push sibling containers apart
+            // only when their bounding boxes actually overlap. Force is
+            // proportional to overlap depth so containers separate just
+            // enough to stop intersecting, then stop receiving force.
             if p.container_repulsion_enabled && p.container_repulsion > 0.0 {
                 let cr = p.container_repulsion;
-                let min_d = p.min_dist;
                 for group in &self.sibling_groups {
                     // Collect the expanded, visible containers in this group.
                     let active: Vec<usize> = group
@@ -621,37 +642,82 @@ impl LayoutState {
                     if active.len() < 2 {
                         continue;
                     }
-                    // Pairwise gap-based repulsion within the sibling group.
-                    for (i, &a) in active.iter().enumerate() {
+
+                    // Grid-accelerated overlap detection: bucket containers by
+                    // cell so we only check nearby pairs instead of all O(S²).
+                    let max_extent = active
+                        .iter()
+                        .map(|&c| self.sizes[c].x.max(self.sizes[c].y))
+                        .fold(0.0f32, f32::max);
+                    // Cell size = largest container extent so overlapping pairs
+                    // are always in the same or adjacent cells.
+                    let cell_size = max_extent.max(1.0);
+                    let inv_cell = 1.0 / cell_size;
+
+                    let mut grid: HashMap<(i32, i32), Vec<usize>> = HashMap::new();
+                    for &c in &active {
+                        let cx = (self.positions[c].x * inv_cell).floor() as i32;
+                        let cy = (self.positions[c].y * inv_cell).floor() as i32;
+                        grid.entry((cx, cy)).or_default().push(c);
+                    }
+
+                    // Check each container against neighbours in a 3×3 cell window.
+                    for &a in &active {
                         let pos_a = self.positions[a];
                         let half_a = self.sizes[a] * 0.5;
-                        for &b in &active[(i + 1)..] {
-                            let delta = pos_a - self.positions[b];
-                            let dist_sq = delta.length_squared();
-                            if dist_sq < 1e-10 {
-                                continue;
-                            }
-                            let half_b = self.sizes[b] * 0.5;
-                            let gap_x = delta.x.abs() - (half_a.x + half_b.x);
-                            let gap_y = delta.y.abs() - (half_a.y + half_b.y);
-                            let gap = gap_x.max(gap_y).max(min_d);
-                            let f = delta.normalize_or_zero() * (cr / (gap * gap));
+                        let ax = (pos_a.x * inv_cell).floor() as i32;
+                        let ay = (pos_a.y * inv_cell).floor() as i32;
 
-                            // Rigid-body: apply force to container + all descendants.
-                            apply_force_to_subtree(
-                                a,
-                                f,
-                                &mut forces,
-                                &self.children_of,
-                                &self.hidden,
-                            );
-                            apply_force_to_subtree(
-                                b,
-                                -f,
-                                &mut forces,
-                                &self.children_of,
-                                &self.hidden,
-                            );
+                        for dx in -1i32..=1 {
+                            for dy in -1i32..=1 {
+                                let key = (ax.wrapping_add(dx), ay.wrapping_add(dy));
+                                let Some(bucket) = grid.get(&key) else {
+                                    continue;
+                                };
+                                for &b in bucket {
+                                    // Avoid self-pairs and double-counting (a < b).
+                                    if b <= a {
+                                        continue;
+                                    }
+                                    let pos_b = self.positions[b];
+                                    let half_b = self.sizes[b] * 0.5;
+
+                                    // AABB overlap test on each axis.
+                                    let overlap_x =
+                                        (half_a.x + half_b.x) - (pos_a.x - pos_b.x).abs();
+                                    let overlap_y =
+                                        (half_a.y + half_b.y) - (pos_a.y - pos_b.y).abs();
+
+                                    if overlap_x <= 0.0 || overlap_y <= 0.0 {
+                                        continue; // No overlap — skip.
+                                    }
+
+                                    // Push apart along the axis of least overlap
+                                    // (minimum penetration direction).
+                                    let delta = pos_a - pos_b;
+                                    let f = if overlap_x < overlap_y {
+                                        Vec2::new(delta.x.signum() * overlap_x * cr, 0.0)
+                                    } else {
+                                        Vec2::new(0.0, delta.y.signum() * overlap_y * cr)
+                                    };
+
+                                    // Rigid-body: move container + all descendants.
+                                    apply_force_to_subtree(
+                                        a,
+                                        f,
+                                        &mut forces,
+                                        &self.children_of,
+                                        &self.hidden,
+                                    );
+                                    apply_force_to_subtree(
+                                        b,
+                                        -f,
+                                        &mut forces,
+                                        &self.children_of,
+                                        &self.hidden,
+                                    );
+                                }
+                            }
                         }
                     }
                 }
@@ -681,7 +747,15 @@ impl LayoutState {
                     *pos = pin_pos;
                     *vel = Vec2::ZERO;
                 } else {
-                    *vel = (*vel + *force) * effective_damping;
+                    // Clamp force magnitude to prevent explosive acceleration
+                    // when nodes are very close or container overlaps are large.
+                    let mut f = *force;
+                    let f_mag = f.length();
+                    let max_force = p.max_velocity * 2.0;
+                    if f_mag > max_force {
+                        f *= max_force / f_mag;
+                    }
+                    *vel = (*vel + f) * effective_damping;
                     let speed = vel.length();
                     if speed > max_vel {
                         *vel *= max_vel / speed;

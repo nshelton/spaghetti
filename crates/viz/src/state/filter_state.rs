@@ -207,13 +207,13 @@ impl FilterState {
         sim.layout_state.set_hidden(&hidden);
     }
 
-    /// Recompute the effective hidden-symbols set from file-tree visibility.
-    /// Collapse no longer hides children (they stay visible inside the box).
+    /// Recompute the effective hidden-symbols set from file-tree visibility,
+    /// then re-apply all filters (node-kind, edgeless) to the layout engine.
     pub fn sync_hidden_symbols(&mut self, graph: &GraphState, sim: &mut SimulationState) {
-        let file_hidden = graph.file_tree.hidden_symbols();
-        self.hidden_symbols = file_hidden.clone();
-        let hidden_vec: Vec<_> = file_hidden.into_iter().collect();
-        sim.layout_state.set_hidden(&hidden_vec);
+        self.hidden_symbols = graph.file_tree.hidden_symbols();
         sim.update_node_sizes(&graph.graph);
+        // Always re-apply the full filter stack so node-kind and edgeless
+        // filters aren't lost when file-tree or collapse state changes.
+        self.sync_hidden_to_layout(graph, sim);
     }
 }
