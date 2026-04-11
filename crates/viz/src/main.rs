@@ -11,6 +11,7 @@ mod log_capture;
 mod panels;
 mod progress;
 mod settings;
+mod state;
 mod widgets;
 
 use std::sync::{Arc, Mutex};
@@ -39,11 +40,11 @@ fn main() -> Result<()> {
 
     // Start with an empty canvas; auto-load last project if available.
     let mut app = app::SpaghettiApp::empty(log_buffer);
-    app.recent_projects = recent_projects;
+    app.indexing.recent_projects = recent_projects;
     app.apply_saved_settings(&saved_settings);
 
     // If a recent project exists, queue it for background loading.
-    if let Some(last_project) = app.recent_projects.first().cloned() {
+    if let Some(last_project) = app.indexing.recent_projects.first().cloned() {
         if last_project.exists() {
             app.start_indexing(last_project);
         }

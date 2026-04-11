@@ -1,6 +1,7 @@
 //! Right panel: details of the selected symbol + layout controls.
 
-use crate::app::{SpaghettiApp, ALL_EDGE_KINDS, ALL_SYMBOL_KINDS};
+use crate::app::SpaghettiApp;
+use crate::state::filter_state::{ALL_EDGE_KINDS, ALL_SYMBOL_KINDS};
 
 impl SpaghettiApp {
     /// Draw the right panel: details of selected symbol + layout controls.
@@ -13,17 +14,19 @@ impl SpaghettiApp {
                     ui.heading("Details");
                     ui.separator();
 
-                    if self.selection.len() > 1 {
-                        ui.label(format!("{} nodes selected", self.selection.len()));
-                    } else if let Some(&sel_id) = self.selection.iter().next() {
-                        if let Some(sym) = self.graph.symbols.get(&sel_id) {
+                    if let Some(sel_id) = self.interaction.selection {
+                        if let Some(sym) = self.graph.graph.symbols.get(&sel_id) {
                             ui.label(format!("Name: {}", sym.name));
                             ui.label(format!("Qualified: {}", sym.qualified_name));
                             ui.label(format!("Kind: {:?}", sym.kind));
 
                             if let Some(loc) = &sym.location {
-                                let file_str =
-                                    self.graph.files.resolve(loc.file).unwrap_or("<unknown>");
+                                let file_str = self
+                                    .graph
+                                    .graph
+                                    .files
+                                    .resolve(loc.file)
+                                    .unwrap_or("<unknown>");
                                 ui.label(format!(
                                     "Location: {}:{}:{}",
                                     file_str, loc.line, loc.col
@@ -37,21 +40,23 @@ impl SpaghettiApp {
                             }
 
                             // Collapse/Expand button for container nodes.
-                            if self.layout_state.is_container(sel_id) {
+                            if self.simulation.layout_state.is_container(sel_id) {
                                 ui.separator();
-                                let children = self.layout_state.children_of(sel_id);
+                                let children = self.simulation.layout_state.children_of(sel_id);
                                 let n = children.len();
-                                if self.layout_state.is_expanded(sel_id) {
+                                if self.simulation.layout_state.is_expanded(sel_id) {
                                     ui.label(format!("Children: {n} (expanded)"));
                                     if ui.button("Collapse").clicked() {
-                                        self.layout_state.collapse(sel_id);
-                                        self.sync_hidden_symbols();
+                                        self.simulation.layout_state.collapse(sel_id);
+                                        self.filters
+                                            .sync_hidden_symbols(&self.graph, &mut self.simulation);
                                     }
                                 } else {
                                     ui.label(format!("Children: {n} (collapsed)"));
                                     if ui.button("Expand").clicked() {
-                                        self.layout_state.expand(sel_id);
-                                        self.sync_hidden_symbols();
+                                        self.simulation.layout_state.expand(sel_id);
+                                        self.filters
+                                            .sync_hidden_symbols(&self.graph, &mut self.simulation);
                                     }
                                 }
                             }
@@ -60,29 +65,32 @@ impl SpaghettiApp {
                             ui.separator();
                             ui.heading("Connections");
 
-                            let active = self.edge_filter.active_kinds();
+                            let active = self.filters.edge_filter.active_kinds();
 
                             for &kind in &ALL_EDGE_KINDS {
                                 if !active.contains(&kind) {
                                     continue;
                                 }
 
-                                // Collect outgoing and incoming edges of this kind.
                                 let mut outgoing: Vec<(&str, bool)> = Vec::new();
                                 let mut incoming: Vec<(&str, bool)> = Vec::new();
 
-                                for edge in &self.graph.edges {
+                                for edge in &self.graph.graph.edges {
                                     if edge.kind != kind {
                                         continue;
                                     }
                                     if edge.from == sel_id {
-                                        if let Some(target) = self.graph.symbols.get(&edge.to) {
-                                            let is_external = self.graph.is_external(edge.to);
+                                        if let Some(target) = self.graph.graph.symbols.get(&edge.to)
+                                        {
+                                            let is_external = self.graph.graph.is_external(edge.to);
                                             outgoing.push((&target.qualified_name, is_external));
                                         }
                                     } else if edge.to == sel_id {
-                                        if let Some(source) = self.graph.symbols.get(&edge.from) {
-                                            let is_external = self.graph.is_external(edge.from);
+                                        if let Some(source) =
+                                            self.graph.graph.symbols.get(&edge.from)
+                                        {
+                                            let is_external =
+                                                self.graph.graph.is_external(edge.from);
                                             incoming.push((&source.qualified_name, is_external));
                                         }
                                     }
@@ -139,20 +147,24 @@ impl SpaghettiApp {
                     ui.heading("Rendering");
                     ui.separator();
 
-                    crate::widgets::toggle_button(ui, &mut self.render.circle_mode, "Circle mode");
-                    if self.render.circle_mode {
+                    crate::widgets::toggle_button(
+                        ui,
+                        &mut self.render.render.circle_mode,
+                        "Circle mode",
+                    );
+                    if self.render.render.circle_mode {
                         ui.add(
-                            egui::Slider::new(&mut self.render.circle_radius, 1.0..=50.0)
+                            egui::Slider::new(&mut self.render.render.circle_radius, 1.0..=50.0)
                                 .text("Radius"),
                         );
                     }
 
                     ui.add(
-                        egui::Slider::new(&mut self.render.node_opacity, 0.0..=1.0)
+                        egui::Slider::new(&mut self.render.render.node_opacity, 0.0..=1.0)
                             .text("Node opacity"),
                     );
                     ui.add(
-                        egui::Slider::new(&mut self.render.edge_opacity, 0.0..=1.0)
+                        egui::Slider::new(&mut self.render.render.edge_opacity, 0.0..=1.0)
                             .text("Edge opacity"),
                     );
 
@@ -163,20 +175,27 @@ impl SpaghettiApp {
                     let mut node_filter_changed = false;
                     for &kind in &ALL_SYMBOL_KINDS {
                         let kind_name = format!("{kind:?}");
-                        let enabled = self.node_filter.is_enabled(kind);
-                        if toggle_swatch(ui, &mut self.render.node_colors, &kind_name, enabled) {
-                            self.node_filter.toggle(kind);
+                        let enabled = self.filters.node_filter.is_enabled(kind);
+                        if toggle_swatch(
+                            ui,
+                            &mut self.render.render.node_colors,
+                            &kind_name,
+                            enabled,
+                        ) {
+                            self.filters.node_filter.toggle(kind);
                             node_filter_changed = true;
                         }
                     }
                     if node_filter_changed {
-                        self.sync_hidden_to_layout();
+                        self.filters
+                            .sync_hidden_to_layout(&self.graph, &mut self.simulation);
                     }
                     if ui
-                        .checkbox(&mut self.hide_edgeless, "Hide edgeless nodes")
+                        .checkbox(&mut self.filters.hide_edgeless, "Hide edgeless nodes")
                         .changed()
                     {
-                        self.sync_hidden_to_layout();
+                        self.filters
+                            .sync_hidden_to_layout(&self.graph, &mut self.simulation);
                     }
 
                     // Edge types: toggleable color swatches with per-kind force sliders.
@@ -194,47 +213,51 @@ impl SpaghettiApp {
                     let mut edge_filter_changed = false;
                     for &kind in &ALL_EDGE_KINDS {
                         let kind_name = format!("{kind:?}");
-                        let enabled = self.edge_filter.is_enabled(kind);
-                        if toggle_swatch(ui, &mut self.render.edge_colors, &kind_name, enabled) {
-                            self.edge_filter.toggle(kind);
+                        let enabled = self.filters.edge_filter.is_enabled(kind);
+                        if toggle_swatch(
+                            ui,
+                            &mut self.render.render.edge_colors,
+                            &kind_name,
+                            enabled,
+                        ) {
+                            self.filters.edge_filter.toggle(kind);
                             edge_filter_changed = true;
                         }
                         if enabled {
                             let ep = self
+                                .simulation
                                 .layout_state
                                 .params_mut()
                                 .edge_params
                                 .entry(kind)
                                 .or_insert(default_ep);
-                            let resp = ui.indent(format!("edge_sliders_{kind:?}"), |ui| {
-                                let mut inner_changed = false;
-                                inner_changed |= ui
+                            ui.indent(format!("edge_sliders_{kind:?}"), |ui| {
+                                changed |= ui
                                     .add(
                                         egui::Slider::new(&mut ep.target_distance, 1.0..=100.0)
                                             .text("Dist"),
                                     )
                                     .changed();
-                                inner_changed |= ui
+                                changed |= ui
                                     .add(
                                         egui::Slider::new(&mut ep.attraction, 0.0..=2.0)
                                             .text("Attract"),
                                     )
                                     .changed();
-                                inner_changed
                             });
-                            changed |= resp.inner;
                         }
                     }
 
-                    if edge_filter_changed && self.hide_edgeless {
-                        self.sync_hidden_to_layout();
+                    if edge_filter_changed && self.filters.hide_edgeless {
+                        self.filters
+                            .sync_hidden_to_layout(&self.graph, &mut self.simulation);
                     }
 
                     ui.add_space(4.0);
                     if ui.button("Reset colors").clicked() {
                         let defaults = crate::settings::RenderSettings::default();
-                        self.render.node_colors = defaults.node_colors;
-                        self.render.edge_colors = defaults.edge_colors;
+                        self.render.render.node_colors = defaults.node_colors;
+                        self.render.render.edge_colors = defaults.edge_colors;
                     }
 
                     ui.add_space(16.0);
@@ -243,7 +266,7 @@ impl SpaghettiApp {
                     ui.heading("Layout Controls");
                     ui.separator();
 
-                    let params = self.layout_state.params_mut();
+                    let params = self.simulation.layout_state.params_mut();
 
                     changed |= ui
                         .add(
@@ -269,9 +292,49 @@ impl SpaghettiApp {
                         .changed();
 
                     ui.add_space(8.0);
+                    ui.label("Per-Edge Kind");
+
+                    let default_ep = layout::EdgeKindParams {
+                        target_distance: 150.0,
+                        attraction: 0.01,
+                    };
+
+                    for kind in &ALL_EDGE_KINDS {
+                        let label = format!("{kind:?}");
+                        ui.add_space(4.0);
+                        ui.label(&label);
+
+                        let params = self.simulation.layout_state.params_mut();
+                        let ep = params.edge_params.entry(*kind).or_insert(default_ep);
+                        changed |= ui
+                            .add(
+                                egui::Slider::new(&mut ep.target_distance, 1.0..=100.0)
+                                    .text("Target dist"),
+                            )
+                            .changed();
+
+                        changed |= ui
+                            .add(
+                                egui::Slider::new(&mut ep.attraction, 0.0..=1.0).text("Attraction"),
+                            )
+                            .changed();
+                    }
+
+                    ui.add_space(8.0);
+                    ui.label("Containment");
+
+                    let params = self.simulation.layout_state.params_mut();
+                    changed |= ui
+                        .add(
+                            egui::Slider::new(&mut params.containment_strength, 0.0..=0.2)
+                                .text("Strength"),
+                        )
+                        .changed();
+
+                    ui.add_space(8.0);
                     ui.label("Location Affinity");
 
-                    let params = self.layout_state.params_mut();
+                    let params = self.simulation.layout_state.params_mut();
                     changed |= ui
                         .add(
                             egui::Slider::new(&mut params.location_strength, 0.0..=2.0)
@@ -288,7 +351,7 @@ impl SpaghettiApp {
 
                     ui.add_space(4.0);
                     if ui.button("Reset to defaults").clicked() {
-                        *self.layout_state.params_mut() = layout::ForceParams::default();
+                        *self.simulation.layout_state.params_mut() = layout::ForceParams::default();
                         changed = true;
                     }
 
@@ -297,7 +360,7 @@ impl SpaghettiApp {
                         .on_hover_text("Scatter all nodes to random positions")
                         .clicked()
                     {
-                        self.layout_state.randomize();
+                        self.simulation.layout_state.randomize();
                     }
 
                     if ui
@@ -305,10 +368,10 @@ impl SpaghettiApp {
                         .on_hover_text("Slightly nudge all nodes — press repeatedly for more")
                         .clicked()
                     {
-                        self.layout_state.juggle();
+                        self.simulation.layout_state.juggle();
                     }
 
-                    let pause_label = if self.paused {
+                    let pause_label = if self.simulation.paused {
                         "Resume (P)"
                     } else {
                         "Pause (P)"
@@ -318,11 +381,11 @@ impl SpaghettiApp {
                         .on_hover_text("Pause or resume the force-directed simulation")
                         .clicked()
                     {
-                        self.paused = !self.paused;
+                        self.simulation.paused = !self.simulation.paused;
                     }
 
                     if changed {
-                        self.layout_state.reheat();
+                        self.simulation.layout_state.reheat();
                     }
                 });
             });
@@ -346,7 +409,6 @@ fn toggle_swatch(
     let (rect, response) =
         ui.allocate_exact_size(size, egui::Sense::click().union(egui::Sense::click()));
 
-    // Paint the swatch: full color when enabled, dark grey when disabled.
     let bg = if enabled {
         color
     } else {
@@ -354,7 +416,6 @@ fn toggle_swatch(
     };
     ui.painter().rect_filled(rect, 3.0, bg);
 
-    // Text color: white when enabled, dim grey when disabled.
     let text_color = if enabled {
         egui::Color32::WHITE
     } else {
@@ -368,7 +429,6 @@ fn toggle_swatch(
         text_color,
     );
 
-    // Right-click opens color picker via context menu.
     response
         .clone()
         .on_hover_text("Click: toggle, Right-click: color");
@@ -378,6 +438,5 @@ fn toggle_swatch(
         *rgb = [color.r(), color.g(), color.b()];
     });
 
-    // Left-click toggles.
     response.clicked()
 }

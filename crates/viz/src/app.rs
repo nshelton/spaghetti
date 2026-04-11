@@ -1,153 +1,26 @@
 //! The main eframe application for spaghetti.
 
-use std::collections::HashSet;
-use std::path::PathBuf;
-use std::sync::mpsc::{Receiver, Sender};
 use std::sync::{Arc, Mutex};
 
-use std::collections::HashMap;
-
-use core_ir::{EdgeKind, Graph, SymbolId, SymbolKind};
-use layout::{LayoutState, Positions};
+use core_ir::Graph;
+use layout::LayoutState;
 use tracing::Level;
 
-use crate::file_tree::FileTree;
-
 use crate::camera::{Camera2D, NodeSizes};
+use crate::file_tree::FileTree;
 use crate::fps::FpsCounter;
 use crate::log_capture::LogBuffer;
 use crate::progress::{ProgressMessage, ProgressState};
 use crate::settings::ViewSettings;
+use crate::state::filter_state::{EdgeKindFilter, SymbolKindFilter};
+use crate::state::{
+    ConsoleState, FilterState, GraphState, IndexingState, InteractionState, RenderState,
+    SimulationState,
+};
 
-/// All symbol kinds in the system.
-pub(crate) const ALL_SYMBOL_KINDS: [SymbolKind; 8] = [
-    SymbolKind::Class,
-    SymbolKind::Struct,
-    SymbolKind::Function,
-    SymbolKind::Method,
-    SymbolKind::Field,
-    SymbolKind::Namespace,
-    SymbolKind::TemplateInstantiation,
-    SymbolKind::TranslationUnit,
-];
-
-/// All edge kinds in the system.
-pub(crate) const ALL_EDGE_KINDS: [EdgeKind; 9] = [
-    EdgeKind::Calls,
-    EdgeKind::Inherits,
-    EdgeKind::Contains,
-    EdgeKind::Overrides,
-    EdgeKind::ReadsField,
-    EdgeKind::WritesField,
-    EdgeKind::Includes,
-    EdgeKind::Instantiates,
-    EdgeKind::HasType,
-];
-
-/// Edge kind filter state — tracks which edge kinds are visible.
-pub(crate) struct EdgeKindFilter {
-    enabled: HashSet<EdgeKind>,
-}
-
-impl Default for EdgeKindFilter {
-    fn default() -> Self {
-        Self {
-            enabled: ALL_EDGE_KINDS.iter().copied().collect(),
-        }
-    }
-}
-
-impl EdgeKindFilter {
-    /// Restore from saved edge filter map. Missing keys default to enabled.
-    pub(crate) fn from_saved(saved: &HashMap<String, bool>) -> Self {
-        let mut enabled = HashSet::new();
-        for &kind in &ALL_EDGE_KINDS {
-            let key = format!("{kind:?}");
-            let is_enabled = saved.get(&key).copied().unwrap_or(true);
-            if is_enabled {
-                enabled.insert(kind);
-            }
-        }
-        Self { enabled }
-    }
-
-    /// Export current state as a string-keyed map for serialization.
-    pub(crate) fn to_saved(&self) -> HashMap<String, bool> {
-        ALL_EDGE_KINDS
-            .iter()
-            .map(|&kind| (format!("{kind:?}"), self.enabled.contains(&kind)))
-            .collect()
-    }
-
-    /// Returns the list of currently active edge kinds.
-    pub(crate) fn active_kinds(&self) -> Vec<EdgeKind> {
-        self.enabled.iter().copied().collect()
-    }
-
-    /// Check whether a specific edge kind is enabled.
-    pub(crate) fn is_enabled(&self, kind: EdgeKind) -> bool {
-        self.enabled.contains(&kind)
-    }
-
-    /// Toggle a specific edge kind on or off.
-    pub(crate) fn toggle(&mut self, kind: EdgeKind) {
-        if self.enabled.contains(&kind) {
-            self.enabled.remove(&kind);
-        } else {
-            self.enabled.insert(kind);
-        }
-    }
-}
-
-/// Symbol kind filter state — tracks which node kinds are visible.
-pub(crate) struct SymbolKindFilter {
-    enabled: HashSet<SymbolKind>,
-}
-
-impl Default for SymbolKindFilter {
-    fn default() -> Self {
-        Self {
-            enabled: ALL_SYMBOL_KINDS.iter().copied().collect(),
-        }
-    }
-}
-
-impl SymbolKindFilter {
-    /// Restore from saved node filter map. Missing keys default to enabled.
-    pub(crate) fn from_saved(saved: &HashMap<String, bool>) -> Self {
-        let mut enabled = HashSet::new();
-        for &kind in &ALL_SYMBOL_KINDS {
-            let key = format!("{kind:?}");
-            let is_enabled = saved.get(&key).copied().unwrap_or(true);
-            if is_enabled {
-                enabled.insert(kind);
-            }
-        }
-        Self { enabled }
-    }
-
-    /// Export current state as a string-keyed map for serialization.
-    pub(crate) fn to_saved(&self) -> HashMap<String, bool> {
-        ALL_SYMBOL_KINDS
-            .iter()
-            .map(|&kind| (format!("{kind:?}"), self.enabled.contains(&kind)))
-            .collect()
-    }
-
-    /// Check whether a specific symbol kind is enabled.
-    pub(crate) fn is_enabled(&self, kind: SymbolKind) -> bool {
-        self.enabled.contains(&kind)
-    }
-
-    /// Toggle a specific symbol kind on or off.
-    pub(crate) fn toggle(&mut self, kind: SymbolKind) {
-        if self.enabled.contains(&kind) {
-            self.enabled.remove(&kind);
-        } else {
-            self.enabled.insert(kind);
-        }
-    }
-}
+/// Energy threshold below which the simulation is considered settled and
+/// repaints are no longer requested.
+pub(crate) const ENERGY_THRESHOLD: f32 = 0.01;
 
 /// Parse a tracing level from a string, defaulting to INFO.
 fn level_from_str(s: &str) -> Level {
@@ -160,75 +33,22 @@ fn level_from_str(s: &str) -> Level {
     }
 }
 
-/// Energy threshold below which the simulation is considered settled and
-/// repaints are no longer requested.
-pub(crate) const ENERGY_THRESHOLD: f32 = 0.01;
-
-/// Main application state.
+/// Main application state, composed of domain-specific sub-structs.
 pub struct SpaghettiApp {
-    // -- Graph data --
-    pub(crate) graph: Graph,
-    pub(crate) positions: Positions,
-    pub(crate) layout_state: LayoutState,
-
-    // -- Interaction state --
-    pub(crate) camera: Camera2D,
-    /// Currently selected nodes (shift-click to multi-select).
-    pub(crate) selection: HashSet<SymbolId>,
-    pub(crate) edge_filter: EdgeKindFilter,
-    pub(crate) node_filter: SymbolKindFilter,
-    pub(crate) search: String,
-    /// The anchor node currently being dragged, if any.
-    pub(crate) dragging: Option<SymbolId>,
-    /// World-space offsets from the drag anchor for each selected node during group drag.
-    pub(crate) drag_offsets: HashMap<SymbolId, glam::Vec2>,
-    /// Per-node world-space sizes (recomputed when graph or collapse state changes).
-    pub(crate) node_sizes: NodeSizes,
-    /// Whether the initial auto-fit has been performed.
-    pub(crate) auto_fitted: bool,
-    /// Frame counter used to trigger auto-fit after a timeout.
-    pub(crate) frame_count: u32,
-    /// File/directory tree built from symbol locations.
-    pub(crate) file_tree: FileTree,
-    /// Symbols currently hidden by file-tree visibility toggles.
-    pub(crate) hidden_symbols: HashSet<SymbolId>,
-    /// Whether to hide nodes that have no edges.
-    pub(crate) hide_edgeless: bool,
-    /// Whether the layout simulation is paused.
-    pub(crate) paused: bool,
-    /// Saved directory visibility (applied after indexing completes).
-    pub(crate) pending_dir_visibility: HashMap<String, bool>,
-
-    // -- Rendering settings (persisted) --
-    pub(crate) render: crate::settings::RenderSettings,
-
-    // -- Menu / UI state --
-    pub(crate) show_console: bool,
-    pub(crate) indexing: bool,
-    /// Path to the last opened compile_commands.json (for cache clearing).
-    pub(crate) compile_commands_path: Option<PathBuf>,
-    /// Most-recently-opened project paths (newest first, max 5).
-    pub(crate) recent_projects: Vec<PathBuf>,
-
-    // -- Log capture --
-    pub(crate) log_buffer: Arc<Mutex<LogBuffer>>,
-    pub(crate) console_level_filter: Level,
-
-    // -- Progress overlay --
-    pub(crate) progress_state: Option<ProgressState>,
-    pub(crate) progress_rx: Option<Receiver<ProgressMessage>>,
-    pub(crate) cancel_tx: Option<Sender<()>>,
-
-    // -- File dialog --
-    pub(crate) pending_file_dialog: Option<Receiver<Option<PathBuf>>>,
-
-    // -- FPS counter --
-    pub(crate) fps: FpsCounter,
-
-    // -- Compound node state --
-    /// Screen-space rects of expanded containers (computed each frame for
-    /// hit-testing). Pairs of (container SymbolId, screen Rect).
-    pub(crate) container_rects: Vec<(SymbolId, egui::Rect)>,
+    /// Graph data and file tree.
+    pub(crate) graph: GraphState,
+    /// User interaction: selection, drag, search.
+    pub(crate) interaction: InteractionState,
+    /// Visibility filtering: edge/node kind toggles, hidden symbols.
+    pub(crate) filters: FilterState,
+    /// Force-directed layout simulation.
+    pub(crate) simulation: SimulationState,
+    /// Rendering: colors, camera, FPS.
+    pub(crate) render: RenderState,
+    /// Console/log viewer.
+    pub(crate) console: ConsoleState,
+    /// Background indexing and file dialog.
+    pub(crate) indexing: IndexingState,
 }
 
 impl SpaghettiApp {
@@ -243,7 +63,6 @@ impl SpaghettiApp {
     ) -> Self {
         let positions = layout_state.positions();
         let mut file_tree = FileTree::from_graph(&graph);
-        // Apply saved directory visibility (gracefully ignores stale paths).
         file_tree.apply_visibility(&view.dir_visibility);
         let hidden_symbols = file_tree.hidden_symbols();
         let camera = Camera2D {
@@ -252,140 +71,56 @@ impl SpaghettiApp {
         };
 
         let mut app = Self {
-            graph,
-            positions,
-            layout_state,
-            camera,
-            selection: HashSet::new(),
-            edge_filter: EdgeKindFilter::from_saved(&view.edge_filters),
-            node_filter: SymbolKindFilter::from_saved(&view.node_filters),
-            search: String::new(),
-            dragging: None,
-            drag_offsets: HashMap::new(),
-            node_sizes: NodeSizes(indexmap::IndexMap::new()),
-            auto_fitted: false,
-            frame_count: 0,
-            file_tree,
-            hidden_symbols,
-            hide_edgeless: view.hide_edgeless,
-            paused: false,
-            pending_dir_visibility: view.dir_visibility.clone(),
-            render,
-            show_console: view.show_console,
-            indexing: false,
-            compile_commands_path: None,
-            recent_projects: Vec::new(),
-            log_buffer,
-            console_level_filter: level_from_str(&view.console_level),
-            progress_state: None,
-            progress_rx: None,
-            cancel_tx: None,
-            pending_file_dialog: None,
-            fps: FpsCounter::new(60),
-            container_rects: Vec::new(),
+            graph: GraphState { graph, file_tree },
+            interaction: InteractionState {
+                selection: None,
+                dragging: None,
+                search: String::new(),
+                auto_fitted: false,
+                frame_count: 0,
+            },
+            filters: FilterState {
+                edge_filter: EdgeKindFilter::from_saved(&view.edge_filters),
+                node_filter: SymbolKindFilter::from_saved(&view.node_filters),
+                hidden_symbols,
+                hide_edgeless: view.hide_edgeless,
+                pending_dir_visibility: view.dir_visibility.clone(),
+            },
+            simulation: SimulationState {
+                layout_state,
+                positions,
+                node_sizes: NodeSizes(Default::default()),
+                paused: false,
+                container_rects: Vec::new(),
+            },
+            render: RenderState {
+                render,
+                camera,
+                fps: FpsCounter::new(60),
+            },
+            console: ConsoleState {
+                show_console: view.show_console,
+                log_buffer,
+                console_level_filter: level_from_str(&view.console_level),
+            },
+            indexing: IndexingState::default(),
         };
-        app.sync_hidden_to_layout();
-        app.compute_node_sizes();
+        app.filters
+            .sync_hidden_to_layout(&app.graph, &mut app.simulation);
         app
-    }
-
-    /// Recompute the combined hidden set (file-tree visibility + node-kind
-    /// filter + edgeless filter) and push it to the layout engine.
-    pub(crate) fn sync_hidden_to_layout(&mut self) {
-        let mut hidden: Vec<SymbolId> = self.hidden_symbols.iter().copied().collect();
-
-        // Collect nodes that have at least one *visible* edge (if the edgeless
-        // filter is on). An edge is visible when its kind is enabled and both
-        // endpoints have visible node kinds and aren't file-tree-hidden.
-        let nodes_with_edges: Option<HashSet<SymbolId>> = if self.hide_edgeless {
-            let active_kinds = self.edge_filter.active_kinds();
-            let mut set = HashSet::new();
-            for edge in &self.graph.edges {
-                if !active_kinds.contains(&edge.kind) {
-                    continue;
-                }
-                let from_ok = !self.hidden_symbols.contains(&edge.from)
-                    && self
-                        .graph
-                        .symbols
-                        .get(&edge.from)
-                        .is_some_and(|s| self.node_filter.is_enabled(s.kind));
-                let to_ok = !self.hidden_symbols.contains(&edge.to)
-                    && self
-                        .graph
-                        .symbols
-                        .get(&edge.to)
-                        .is_some_and(|s| self.node_filter.is_enabled(s.kind));
-                if from_ok && to_ok {
-                    set.insert(edge.from);
-                    set.insert(edge.to);
-                }
-            }
-            Some(set)
-        } else {
-            None
-        };
-
-        for (id, sym) in &self.graph.symbols {
-            if self.hidden_symbols.contains(id) {
-                continue;
-            }
-            if !self.node_filter.is_enabled(sym.kind) {
-                hidden.push(*id);
-                continue;
-            }
-            if let Some(ref with_edges) = nodes_with_edges {
-                if !with_edges.contains(id) {
-                    hidden.push(*id);
-                }
-            }
-        }
-        self.layout_state.set_hidden(&hidden);
-    }
-
-    /// Recompute the effective hidden-symbols set by merging file-tree
-    /// visibility with layout collapse state.
-    pub(crate) fn sync_hidden_symbols(&mut self) {
-        let file_hidden = self.file_tree.hidden_symbols();
-        let collapse_hidden = self.layout_state.collapsed_hidden_ids();
-        self.hidden_symbols = &file_hidden | &collapse_hidden.into_iter().collect();
-        let hidden_vec: Vec<_> = file_hidden.into_iter().collect();
-        self.layout_state.set_hidden(&hidden_vec);
-        self.compute_node_sizes();
-    }
-
-    /// Recompute per-node sizes based on container/collapse state.
-    pub(crate) fn compute_node_sizes(&mut self) {
-        use crate::camera::{NODE_HEIGHT, NODE_WIDTH};
-        use crate::panels::canvas::COLLAPSED_CONTAINER_SCALE;
-
-        let default_size = glam::Vec2::new(NODE_WIDTH, NODE_HEIGHT);
-        let collapsed_size = default_size * COLLAPSED_CONTAINER_SCALE;
-        let mut sizes = indexmap::IndexMap::new();
-        for id in self.graph.symbols.keys() {
-            let is_collapsed =
-                self.layout_state.is_container(*id) && !self.layout_state.is_expanded(*id);
-            let size = if is_collapsed {
-                collapsed_size
-            } else {
-                default_size
-            };
-            sizes.insert(*id, size);
-        }
-        self.node_sizes = NodeSizes(sizes);
     }
 
     /// Snapshot the current view state for serialization.
     pub(crate) fn view_settings(&self) -> ViewSettings {
         ViewSettings {
-            edge_filters: self.edge_filter.to_saved(),
-            node_filters: self.node_filter.to_saved(),
-            camera_offset: [self.camera.offset.x, self.camera.offset.y],
-            camera_zoom: self.camera.zoom,
-            show_console: self.show_console,
-            console_level: format!("{}", self.console_level_filter),
-            hide_edgeless: self.hide_edgeless,
-            dir_visibility: self.file_tree.visibility_map(),
+            edge_filters: self.filters.edge_filter.to_saved(),
+            node_filters: self.filters.node_filter.to_saved(),
+            camera_offset: [self.render.camera.offset.x, self.render.camera.offset.y],
+            camera_zoom: self.render.camera.zoom,
+            show_console: self.console.show_console,
+            console_level: format!("{}", self.console.console_level_filter),
+            hide_edgeless: self.filters.hide_edgeless,
+            dir_visibility: self.graph.file_tree.visibility_map(),
         }
     }
 
@@ -406,9 +141,9 @@ impl SpaghettiApp {
     fn menu_bar(&mut self, ui: &mut egui::Ui) {
         egui::Panel::top("menu_bar").show_inside(ui, |ui| {
             egui::MenuBar::new().ui(ui, |ui| {
-                let mut open_recent: Option<PathBuf> = None;
+                let mut open_recent: Option<std::path::PathBuf> = None;
                 ui.menu_button("File", |ui| {
-                    let enabled = !self.indexing;
+                    let enabled = !self.indexing.indexing;
                     if ui
                         .add_enabled(enabled, egui::Button::new("Open…"))
                         .clicked()
@@ -416,15 +151,14 @@ impl SpaghettiApp {
                         ui.close();
                         self.open_file_dialog();
                     }
-                    if !self.recent_projects.is_empty() {
+                    if !self.indexing.recent_projects.is_empty() {
                         ui.separator();
                         ui.label("Recent Projects");
-                        for path in &self.recent_projects {
+                        for path in &self.indexing.recent_projects {
                             let label = path
                                 .file_name()
                                 .and_then(|f| f.to_str())
                                 .map(|name| {
-                                    // Show parent dir for context
                                     path.parent()
                                         .and_then(|p| p.file_name())
                                         .and_then(|d| d.to_str())
@@ -448,7 +182,7 @@ impl SpaghettiApp {
                 }
 
                 ui.menu_button("View", |ui| {
-                    if crate::widgets::toggle_button(ui, &mut self.show_console, "Console")
+                    if crate::widgets::toggle_button(ui, &mut self.console.show_console, "Console")
                         .changed()
                     {
                         ui.close();
@@ -456,12 +190,13 @@ impl SpaghettiApp {
                 });
 
                 ui.menu_button("Settings", |ui| {
-                    let can_reload = self.compile_commands_path.is_some() && !self.indexing;
+                    let can_reload =
+                        self.indexing.compile_commands_path.is_some() && !self.indexing.indexing;
                     if ui
                         .add_enabled(can_reload, egui::Button::new("Clear Cache & Reload"))
                         .clicked()
                     {
-                        if let Some(cc_path) = self.compile_commands_path.clone() {
+                        if let Some(cc_path) = self.indexing.compile_commands_path.clone() {
                             let cache_dir = frontend_clang::cache_dir(&cc_path);
                             match std::fs::remove_dir_all(&cache_dir) {
                                 Ok(()) => {
@@ -499,44 +234,43 @@ impl SpaghettiApp {
                 .pick_file();
             let _ = tx.send(file);
         });
-        self.pending_file_dialog = Some(rx);
+        self.indexing.pending_file_dialog = Some(rx);
     }
 
     /// Apply persisted settings (render, view, force params) to the app.
     pub fn apply_saved_settings(&mut self, settings: &crate::settings::AppSettings) {
-        self.render = settings.render.clone();
-        self.edge_filter = EdgeKindFilter::from_saved(&settings.view.edge_filters);
-        self.node_filter = SymbolKindFilter::from_saved(&settings.view.node_filters);
-        self.show_console = settings.view.show_console;
-        self.console_level_filter = level_from_str(&settings.view.console_level);
-        self.hide_edgeless = settings.view.hide_edgeless;
-        self.camera = Camera2D {
+        self.render.render = settings.render.clone();
+        self.filters.edge_filter = EdgeKindFilter::from_saved(&settings.view.edge_filters);
+        self.filters.node_filter = SymbolKindFilter::from_saved(&settings.view.node_filters);
+        self.console.show_console = settings.view.show_console;
+        self.console.console_level_filter = level_from_str(&settings.view.console_level);
+        self.filters.hide_edgeless = settings.view.hide_edgeless;
+        self.render.camera = Camera2D {
             offset: egui::Vec2::new(
                 settings.view.camera_offset[0],
                 settings.view.camera_offset[1],
             ),
             zoom: settings.view.camera_zoom,
         };
-        *self.layout_state.params_mut() = settings.force_params.clone();
-        self.pending_dir_visibility = settings.view.dir_visibility.clone();
+        *self.simulation.layout_state.params_mut() = settings.force_params.clone();
+        self.filters.pending_dir_visibility = settings.view.dir_visibility.clone();
     }
 
     /// Start indexing a file in a background thread.
-    pub fn start_indexing(&mut self, path: PathBuf) {
-        self.indexing = true;
-        self.compile_commands_path = Some(path.clone());
-        // Track in recent projects list.
-        self.recent_projects.retain(|p| p != &path);
-        self.recent_projects.insert(0, path.clone());
-        self.recent_projects.truncate(5);
-        let params = self.layout_state.params().clone();
+    pub fn start_indexing(&mut self, path: std::path::PathBuf) {
+        self.indexing.indexing = true;
+        self.indexing.compile_commands_path = Some(path.clone());
+        self.indexing.recent_projects.retain(|p| p != &path);
+        self.indexing.recent_projects.insert(0, path.clone());
+        self.indexing.recent_projects.truncate(5);
+        let params = self.simulation.layout_state.params().clone();
 
         let (progress_tx, progress_rx) = std::sync::mpsc::channel();
         let (cancel_tx, cancel_rx) = std::sync::mpsc::channel::<()>();
 
-        self.progress_state = Some(ProgressState::new("Indexing…"));
-        self.progress_rx = Some(progress_rx);
-        self.cancel_tx = Some(cancel_tx);
+        self.indexing.progress_state = Some(ProgressState::new("Indexing…"));
+        self.indexing.progress_rx = Some(progress_rx);
+        self.indexing.cancel_tx = Some(cancel_tx);
 
         std::thread::spawn(move || {
             if let Err(e) = progress_tx.send(ProgressMessage::Status(format!(
@@ -550,7 +284,6 @@ impl SpaghettiApp {
             let tx = progress_tx.clone();
             let result =
                 frontend_clang::index_project_with_progress(&path, move |current, total, file| {
-                    // Check for cancellation
                     if cancel_rx.try_recv().is_ok() {
                         return false;
                     }
@@ -567,7 +300,6 @@ impl SpaghettiApp {
             match result {
                 Ok(graph) => {
                     if graph.symbol_count() == 0 && graph.edge_count() == 0 {
-                        // Cancelled mid-indexing, nothing useful produced
                         let _ = progress_tx.send(ProgressMessage::Cancelled);
                         return;
                     }
@@ -594,27 +326,26 @@ impl SpaghettiApp {
 
     /// Poll channels each frame for file dialog results and progress updates.
     fn poll_channels(&mut self) {
-        // Check file dialog result
         let mut opened_path = None;
-        if let Some(rx) = &self.pending_file_dialog {
+        if let Some(rx) = &self.indexing.pending_file_dialog {
             if let Ok(result) = rx.try_recv() {
                 opened_path = result;
-                self.pending_file_dialog = None;
+                self.indexing.pending_file_dialog = None;
             }
         }
         if let Some(path) = opened_path {
             self.start_indexing(path);
         }
 
-        // Collect progress messages (to avoid borrow issues).
         let messages: Vec<_> = self
+            .indexing
             .progress_rx
             .as_ref()
             .map(|rx| rx.try_iter().collect())
             .unwrap_or_default();
 
         for msg in messages {
-            if let Some(state) = &mut self.progress_state {
+            if let Some(state) = &mut self.indexing.progress_state {
                 state.apply(&msg);
             }
 
@@ -623,26 +354,23 @@ impl SpaghettiApp {
                     graph,
                     layout_state,
                 } => {
-                    // Preserve directory visibility: merge pending (from
-                    // settings on disk) with current tree state so both
-                    // startup and re-index restore the user's toggles.
-                    let mut vis = self.pending_dir_visibility.clone();
-                    vis.extend(self.file_tree.visibility_map());
-                    self.file_tree = FileTree::from_graph(&graph);
-                    self.file_tree.apply_visibility(&vis);
-                    self.graph = *graph;
-                    self.layout_state = *layout_state;
-                    self.sync_hidden_symbols();
-                    self.sync_hidden_to_layout();
-                    self.positions = self.layout_state.positions();
-                    self.selection.clear();
-                    self.camera = Camera2D::default();
-                    self.dragging = None;
-                    self.drag_offsets.clear();
-                    self.compute_node_sizes();
-                    self.auto_fitted = false;
-                    self.frame_count = 0;
-                    self.container_rects.clear();
+                    let mut vis = self.filters.pending_dir_visibility.clone();
+                    vis.extend(self.graph.file_tree.visibility_map());
+                    self.graph.file_tree = FileTree::from_graph(&graph);
+                    self.graph.file_tree.apply_visibility(&vis);
+                    self.graph.graph = *graph;
+                    self.simulation.layout_state = *layout_state;
+                    self.filters
+                        .sync_hidden_symbols(&self.graph, &mut self.simulation);
+                    self.filters
+                        .sync_hidden_to_layout(&self.graph, &mut self.simulation);
+                    self.simulation.positions = self.simulation.layout_state.positions();
+                    self.interaction.selection = None;
+                    self.render.camera = Camera2D::default();
+                    self.interaction.dragging = None;
+                    self.interaction.auto_fitted = false;
+                    self.interaction.frame_count = 0;
+                    self.simulation.container_rects.clear();
                     self.finish_indexing();
                 }
                 ProgressMessage::Failed(ref err) => {
@@ -660,19 +388,18 @@ impl SpaghettiApp {
 
     /// Clean up indexing state after completion, failure, or cancellation.
     fn finish_indexing(&mut self) {
-        self.indexing = false;
-        self.progress_state = None;
-        self.progress_rx = None;
-        self.cancel_tx = None;
+        self.indexing.indexing = false;
+        self.indexing.progress_state = None;
+        self.indexing.progress_rx = None;
+        self.indexing.cancel_tx = None;
     }
 
     /// Draw the progress overlay (modal).
     fn progress_overlay(&mut self, ui: &mut egui::Ui) {
-        let Some(state) = &self.progress_state else {
+        let Some(state) = &self.indexing.progress_state else {
             return;
         };
 
-        // Semi-transparent backdrop
         let screen_rect = ui.ctx().content_rect();
         ui.painter()
             .rect_filled(screen_rect, 0.0, egui::Color32::from_black_alpha(160));
@@ -686,7 +413,6 @@ impl SpaghettiApp {
                         ui.heading(&state.status);
                         ui.separator();
 
-                        // Progress bar
                         if let Some(frac) = state.fraction() {
                             let bar = egui::ProgressBar::new(frac).text(format!(
                                 "{}/{}",
@@ -698,7 +424,6 @@ impl SpaghettiApp {
                             ui.spinner();
                         }
 
-                        // Scrollable message log
                         if !state.messages.is_empty() {
                             ui.separator();
                             egui::ScrollArea::vertical()
@@ -713,9 +438,8 @@ impl SpaghettiApp {
 
                         ui.separator();
 
-                        // Cancel button
                         if ui.button("Cancel").clicked() {
-                            if let Some(tx) = &self.cancel_tx {
+                            if let Some(tx) = &self.indexing.cancel_tx {
                                 let _ = tx.send(());
                             }
                         }
@@ -738,10 +462,10 @@ impl eframe::App for SpaghettiApp {
 
     fn on_exit(&mut self) {
         let settings = crate::settings::AppSettings {
-            force_params: self.layout_state.params().clone(),
-            render: self.render.clone(),
+            force_params: self.simulation.layout_state.params().clone(),
+            render: self.render.render.clone(),
             view: self.view_settings(),
-            recent_projects: self.recent_projects.clone(),
+            recent_projects: self.indexing.recent_projects.clone(),
         };
         settings.save();
     }
@@ -751,35 +475,26 @@ impl eframe::App for SpaghettiApp {
 mod tests {
     use super::*;
 
-    /// Smoke test: app can be created with an empty graph.
     #[test]
     fn app_creates_with_empty_graph() {
         let log_buffer = Arc::new(Mutex::new(LogBuffer::new()));
         let app = SpaghettiApp::empty(log_buffer);
-        assert_eq!(app.graph.symbol_count(), 0);
-        assert_eq!(app.graph.edge_count(), 0);
-        assert!(!app.indexing);
-        assert!(!app.show_console);
-        assert!(app.selection.is_empty());
+        assert_eq!(app.graph.graph.symbol_count(), 0);
+        assert_eq!(app.graph.graph.edge_count(), 0);
+        assert!(!app.indexing.indexing);
+        assert!(!app.console.show_console);
+        assert!(app.interaction.selection.is_none());
     }
 
-    /// Menu items should report disabled when indexing is active.
     #[test]
     fn menu_disabled_during_indexing() {
         let log_buffer = Arc::new(Mutex::new(LogBuffer::new()));
         let mut app = SpaghettiApp::empty(log_buffer);
 
-        assert!(!app.indexing, "not indexing initially");
-
-        // Simulate indexing started
-        app.indexing = true;
-        assert!(app.indexing, "indexing flag is set");
-
-        // The menu_bar method checks `self.indexing` to disable Open.
-        // We verify the flag is correctly gating — the actual UI rendering
-        // requires an egui context which is not available in unit tests.
-
-        app.indexing = false;
-        assert!(!app.indexing, "indexing flag cleared");
+        assert!(!app.indexing.indexing, "not indexing initially");
+        app.indexing.indexing = true;
+        assert!(app.indexing.indexing, "indexing flag is set");
+        app.indexing.indexing = false;
+        assert!(!app.indexing.indexing, "indexing flag cleared");
     }
 }

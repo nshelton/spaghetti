@@ -1,7 +1,5 @@
 //! Left panel: search bar, edge filters, and file tree.
 
-use std::collections::HashSet;
-
 use crate::app::SpaghettiApp;
 use crate::file_tree::{self, DirNode, FileNode};
 
@@ -12,6 +10,7 @@ impl SpaghettiApp {
             .default_size(260.0)
             .show_inside(ui, |ui| {
                 let project_name = self
+                    .indexing
                     .compile_commands_path
                     .as_ref()
                     .and_then(|p| p.parent())
@@ -21,14 +20,14 @@ impl SpaghettiApp {
                 ui.heading(project_name);
                 ui.label(format!(
                     "{} nodes, {} edges",
-                    self.graph.symbol_count(),
-                    self.graph.edge_count()
+                    self.graph.graph.symbol_count(),
+                    self.graph.graph.edge_count()
                 ));
                 ui.separator();
 
                 // Search
                 ui.label("Search:");
-                ui.text_edit_singleline(&mut self.search);
+                ui.text_edit_singleline(&mut self.interaction.search);
                 ui.separator();
 
                 // File tree
@@ -36,7 +35,7 @@ impl SpaghettiApp {
                 let mut visibility_changed = false;
 
                 egui::ScrollArea::vertical().show(ui, |ui| {
-                    let search_lower = self.search.to_lowercase();
+                    let search_lower = self.interaction.search.to_lowercase();
                     let search = if search_lower.is_empty() {
                         None
                     } else {
@@ -44,18 +43,19 @@ impl SpaghettiApp {
                     };
 
                     // Root-level directories
-                    for dir in &mut self.file_tree.roots {
-                        visibility_changed |= draw_dir_node(ui, dir, &mut self.selection, search);
+                    for dir in &mut self.graph.file_tree.roots {
+                        visibility_changed |=
+                            draw_dir_node(ui, dir, &mut self.interaction.selection, search);
                     }
 
                     // Root-level files
-                    for file in &self.file_tree.root_files {
-                        draw_file_node(ui, file, &mut self.selection, search);
+                    for file in &self.graph.file_tree.root_files {
+                        draw_file_node(ui, file, &mut self.interaction.selection, search);
                     }
 
                     // External symbols (collapsed, with visibility toggle)
-                    if !self.file_tree.external_symbols.is_empty() {
-                        let ext_count = self.file_tree.external_symbols.len();
+                    if !self.graph.file_tree.external_symbols.is_empty() {
+                        let ext_count = self.graph.file_tree.external_symbols.len();
                         let id = ui.make_persistent_id("_externals");
                         egui::collapsing_header::CollapsingState::load_with_default_open(
                             ui.ctx(),
@@ -64,7 +64,7 @@ impl SpaghettiApp {
                         )
                         .show_header(ui, |ui| {
                             if ui
-                                .checkbox(&mut self.file_tree.externals_visible, "")
+                                .checkbox(&mut self.graph.file_tree.externals_visible, "")
                                 .changed()
                             {
                                 visibility_changed = true;
@@ -72,18 +72,17 @@ impl SpaghettiApp {
                             ui.label(format!("<external> ({ext_count} symbols)"));
                         })
                         .body(|ui| {
-                            for &(sym_id, kind, ref name) in &self.file_tree.external_symbols {
+                            for &(sym_id, kind, ref name) in &self.graph.file_tree.external_symbols
+                            {
                                 if let Some(search) = search {
                                     if !name.to_lowercase().contains(search) {
                                         continue;
                                     }
                                 }
                                 let label = format!("{kind:?} {name}");
-                                let selected =
-                                    self.selection.len() == 1 && self.selection.contains(&sym_id);
+                                let selected = self.interaction.selection == Some(sym_id);
                                 if ui.selectable_label(selected, &label).clicked() {
-                                    self.selection.clear();
-                                    self.selection.insert(sym_id);
+                                    self.interaction.selection = Some(sym_id);
                                 }
                             }
                         });
@@ -92,8 +91,10 @@ impl SpaghettiApp {
 
                 // If visibility changed, recompute hidden set and push to layout.
                 if visibility_changed {
-                    self.sync_hidden_symbols();
-                    self.sync_hidden_to_layout();
+                    self.filters
+                        .sync_hidden_symbols(&self.graph, &mut self.simulation);
+                    self.filters
+                        .sync_hidden_to_layout(&self.graph, &mut self.simulation);
                 }
 
                 ui.separator();
@@ -101,12 +102,14 @@ impl SpaghettiApp {
                 // Collapse / Expand All buttons
                 ui.horizontal(|ui| {
                     if ui.button("Collapse All").clicked() {
-                        self.layout_state.collapse_all();
-                        self.sync_hidden_symbols();
+                        self.simulation.layout_state.collapse_all();
+                        self.filters
+                            .sync_hidden_symbols(&self.graph, &mut self.simulation);
                     }
                     if ui.button("Expand All").clicked() {
-                        self.layout_state.expand_all();
-                        self.sync_hidden_symbols();
+                        self.simulation.layout_state.expand_all();
+                        self.filters
+                            .sync_hidden_symbols(&self.graph, &mut self.simulation);
                     }
                 });
             });
@@ -118,7 +121,7 @@ impl SpaghettiApp {
 fn draw_dir_node(
     ui: &mut egui::Ui,
     dir: &mut DirNode,
-    selection: &mut HashSet<core_ir::SymbolId>,
+    selection: &mut Option<core_ir::SymbolId>,
     search: Option<&str>,
 ) -> bool {
     let mut changed = false;
@@ -127,7 +130,6 @@ fn draw_dir_node(
     egui::collapsing_header::CollapsingState::load_with_default_open(ui.ctx(), id, false)
         .show_header(ui, |ui| {
             if ui.checkbox(&mut dir.visible, "").changed() {
-                // Propagate visibility to all children.
                 set_visibility_recursive(dir, dir.visible);
                 changed = true;
             }
@@ -150,7 +152,7 @@ fn draw_dir_node(
 fn draw_file_node(
     ui: &mut egui::Ui,
     file: &FileNode,
-    selection: &mut HashSet<core_ir::SymbolId>,
+    selection: &mut Option<core_ir::SymbolId>,
     search: Option<&str>,
 ) {
     let summary = file_tree::file_summary(file);
@@ -167,10 +169,9 @@ fn draw_file_node(
                     }
                 }
                 let label = format!("{kind:?} {name}");
-                let selected = selection.len() == 1 && selection.contains(&sym_id);
+                let selected = *selection == Some(sym_id);
                 if ui.selectable_label(selected, &label).clicked() {
-                    selection.clear();
-                    selection.insert(sym_id);
+                    *selection = Some(sym_id);
                 }
             }
         });

@@ -7,7 +7,7 @@ use crate::app::SpaghettiApp;
 impl SpaghettiApp {
     /// Draw the log console panel (toggled via View > Console).
     pub(crate) fn console_panel(&mut self, ui: &mut egui::Ui) {
-        if !self.show_console {
+        if !self.console.show_console {
             return;
         }
 
@@ -21,32 +21,32 @@ impl SpaghettiApp {
 
                     // Level filter
                     egui::ComboBox::from_id_salt("log_level_filter")
-                        .selected_text(format!("{}", self.console_level_filter))
+                        .selected_text(format!("{}", self.console.console_level_filter))
                         .show_ui(ui, |ui| {
                             ui.selectable_value(
-                                &mut self.console_level_filter,
+                                &mut self.console.console_level_filter,
                                 Level::ERROR,
                                 "ERROR",
                             );
                             ui.selectable_value(
-                                &mut self.console_level_filter,
+                                &mut self.console.console_level_filter,
                                 Level::WARN,
                                 "WARN",
                             );
                             ui.selectable_value(
-                                &mut self.console_level_filter,
+                                &mut self.console.console_level_filter,
                                 Level::INFO,
                                 "INFO",
                             );
                             ui.selectable_value(
-                                &mut self.console_level_filter,
+                                &mut self.console.console_level_filter,
                                 Level::DEBUG,
                                 "DEBUG",
                             );
                         });
 
                     if ui.button("Clear").clicked() {
-                        if let Ok(mut buf) = self.log_buffer.lock() {
+                        if let Ok(mut buf) = self.console.log_buffer.lock() {
                             buf.clear();
                         }
                     }
@@ -59,9 +59,9 @@ impl SpaghettiApp {
                     .auto_shrink([false; 2]);
 
                 scroll_area.show(ui, |ui| {
-                    if let Ok(buf) = self.log_buffer.lock() {
+                    if let Ok(buf) = self.console.log_buffer.lock() {
                         for entry in buf.entries() {
-                            if entry.level > self.console_level_filter {
+                            if entry.level > self.console.console_level_filter {
                                 continue;
                             }
                             let color = level_color(entry.level);

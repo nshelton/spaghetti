@@ -8,11 +8,11 @@ use glam::Vec2 as GVec2;
 use core_ir::SymbolId;
 
 use crate::app::{SpaghettiApp, ENERGY_THRESHOLD};
-use crate::camera::NODE_WIDTH;
+use crate::camera::{NODE_HEIGHT, NODE_WIDTH};
 use crate::fps::paint_fps_overlay;
 
 /// Scale factor for collapsed container nodes (slightly larger than normal).
-pub const COLLAPSED_CONTAINER_SCALE: f32 = 1.3;
+const COLLAPSED_CONTAINER_SCALE: f32 = 1.3;
 /// World-space padding around children for expanded container backgrounds.
 const CONTAINER_PADDING: f32 = 30.0;
 
@@ -29,94 +29,50 @@ impl SpaghettiApp {
             let scroll_delta = ui.input(|i| i.smooth_scroll_delta.y);
             if scroll_delta != 0.0 {
                 let zoom_factor = 1.0 + scroll_delta * 0.002;
-                self.camera.apply_zoom(zoom_factor);
+                self.render.camera.apply_zoom(zoom_factor);
             }
 
             // --- Drag / pan / click interaction ---
-            let shift_held = ui.input(|i| i.modifiers.shift);
 
-            // Drag started: begin dragging a node (selection changes happen
-            // in the clicked() handler to avoid conflicts).
+            // Drag started: determine whether we are dragging a node or panning.
             if response.drag_started_by(egui::PointerButton::Primary) {
                 if let Some(hit) =
                     self.hit_test_compound(response.interact_pointer_pos(), canvas_center)
                 {
-                    let already_selected = self.selection.contains(&hit);
-
-                    // If dragging an unselected node without shift, solo-select it
-                    // immediately so group-drag works on the right set of nodes.
-                    if !already_selected && !shift_held {
-                        self.selection.clear();
-                        self.selection.insert(hit);
-                    } else if !already_selected && shift_held {
-                        // Shift-drag on unselected: add to selection for group drag.
-                        self.selection.insert(hit);
-                    }
-
-                    // Pin all selected nodes and compute offsets from anchor.
-                    self.dragging = Some(hit);
-                    let anchor_pos = self.positions.0.get(&hit).copied().unwrap_or(GVec2::ZERO);
-                    self.drag_offsets.clear();
-                    for &sel_id in &self.selection {
-                        if let Some(&pos) = self.positions.0.get(&sel_id) {
-                            self.layout_state.pin(sel_id, pos);
-                            self.drag_offsets.insert(sel_id, pos - anchor_pos);
-                        }
+                    self.interaction.dragging = Some(hit);
+                    self.interaction.selection = Some(hit);
+                    if let Some(&world) = self.simulation.positions.0.get(&hit) {
+                        self.simulation.layout_state.pin(hit, world);
                     }
                 }
             }
 
             // Ongoing drag.
             if response.dragged_by(egui::PointerButton::Primary) {
-                if let Some(anchor_id) = self.dragging {
-                    // Move all selected nodes, maintaining relative offsets.
+                if let Some(dragged_id) = self.interaction.dragging {
                     if let Some(pointer) = response.interact_pointer_pos() {
-                        let anchor_world = self.camera.screen_to_world(pointer, canvas_center);
-                        self.layout_state.set_position(anchor_id, anchor_world);
-                        for (&sel_id, &offset) in &self.drag_offsets {
-                            if sel_id != anchor_id {
-                                self.layout_state
-                                    .set_position(sel_id, anchor_world + offset);
-                            }
-                        }
+                        let world = self.render.camera.screen_to_world(pointer, canvas_center);
+                        self.simulation.layout_state.set_position(dragged_id, world);
                     }
                 } else {
-                    // No node drag — pan the camera.
                     let delta = response.drag_delta();
-                    self.camera.offset.x += delta.x / self.camera.zoom;
-                    self.camera.offset.y += delta.y / self.camera.zoom;
+                    self.render.camera.offset.x += delta.x / self.render.camera.zoom;
+                    self.render.camera.offset.y += delta.y / self.render.camera.zoom;
                 }
             }
 
-            // Drag released: unpin all selected nodes.
-            if response.drag_stopped_by(egui::PointerButton::Primary)
-                && self.dragging.take().is_some()
-            {
-                for &sel_id in &self.selection {
-                    self.layout_state.unpin(sel_id);
+            // Drag released: unpin the node.
+            if response.drag_stopped_by(egui::PointerButton::Primary) {
+                if let Some(dragged_id) = self.interaction.dragging.take() {
+                    self.simulation.layout_state.unpin(dragged_id);
                 }
-                self.drag_offsets.clear();
             }
 
-            // Handle click (select) — only fires for short clicks, not drags.
+            // Handle click (select) — only when not dragging.
             if response.clicked() {
                 if let Some(pointer) = response.interact_pointer_pos() {
-                    let hit = self.hit_test_compound(Some(pointer), canvas_center);
-                    if let Some(id) = hit {
-                        if shift_held {
-                            // Shift-click: toggle in/out of selection.
-                            if !self.selection.remove(&id) {
-                                self.selection.insert(id);
-                            }
-                        } else {
-                            // Plain click: solo select.
-                            self.selection.clear();
-                            self.selection.insert(id);
-                        }
-                    } else if !shift_held {
-                        // Clicked empty space: clear selection.
-                        self.selection.clear();
-                    }
+                    self.interaction.selection =
+                        self.hit_test_compound(Some(pointer), canvas_center);
                 }
             }
 
@@ -124,9 +80,10 @@ impl SpaghettiApp {
             if response.double_clicked() {
                 if let Some(pointer) = response.interact_pointer_pos() {
                     if let Some(hit) = self.hit_test_compound(Some(pointer), canvas_center) {
-                        if self.layout_state.is_container(hit) {
-                            self.layout_state.toggle_expand(hit);
-                            self.sync_hidden_symbols();
+                        if self.simulation.layout_state.is_container(hit) {
+                            self.simulation.layout_state.toggle_expand(hit);
+                            self.filters
+                                .sync_hidden_symbols(&self.graph, &mut self.simulation);
                         }
                     }
                 }
@@ -134,93 +91,99 @@ impl SpaghettiApp {
 
             // Press P to toggle pause on the layout simulation.
             if ui.input(|i| i.key_pressed(egui::Key::P)) && !ui.memory(|m| m.focused().is_some()) {
-                self.paused = !self.paused;
+                self.simulation.paused = !self.simulation.paused;
             }
 
             // --- Run incremental simulation ---
-            // Use a time budget so large graphs don't block the frame.
-            let active_kinds = self.edge_filter.active_kinds();
-            self.layout_state.set_visible_edge_kinds(&active_kinds);
-            if !self.paused {
-                self.layout_state
+            let active_kinds = self.filters.edge_filter.active_kinds();
+            self.simulation
+                .layout_state
+                .set_visible_edge_kinds(&active_kinds);
+            if !self.simulation.paused {
+                self.simulation
+                    .layout_state
                     .step_budgeted(std::time::Duration::from_millis(8));
             }
-            self.positions = self.layout_state.positions();
+            self.simulation.positions = self.simulation.layout_state.positions();
 
             // Auto-fit camera once the layout settles or after a timeout.
-            let energy = self.layout_state.energy();
-            self.frame_count = self.frame_count.saturating_add(1);
-            let auto_fit_timeout = self.frame_count >= 120; // ~2s at 60fps
-            if !self.auto_fitted && (energy < ENERGY_THRESHOLD || auto_fit_timeout) {
-                self.camera
-                    .fit_to_bounds(&self.positions, &self.node_sizes, response.rect.size());
-                self.auto_fitted = true;
+            let energy = self.simulation.layout_state.energy();
+            self.interaction.frame_count = self.interaction.frame_count.saturating_add(1);
+            let auto_fit_timeout = self.interaction.frame_count >= 120;
+            if !self.interaction.auto_fitted && (energy < ENERGY_THRESHOLD || auto_fit_timeout) {
+                self.render.camera.fit_to_bounds(
+                    &self.simulation.positions,
+                    &self.simulation.node_sizes,
+                    response.rect.size(),
+                );
+                self.interaction.auto_fitted = true;
             }
 
             // Press F to re-frame the view.
             if ui.input(|i| i.key_pressed(egui::Key::F)) && !ui.memory(|m| m.focused().is_some()) {
-                self.camera
-                    .fit_to_bounds(&self.positions, &self.node_sizes, response.rect.size());
+                self.render.camera.fit_to_bounds(
+                    &self.simulation.positions,
+                    &self.simulation.node_sizes,
+                    response.rect.size(),
+                );
             }
 
             // Press R to randomize the layout.
             if ui.input(|i| i.key_pressed(egui::Key::R)) && !ui.memory(|m| m.focused().is_some()) {
-                self.layout_state.randomize();
+                self.simulation.layout_state.randomize();
             }
 
             // Press J to juggle (slightly perturb) the layout.
             if ui.input(|i| i.key_pressed(egui::Key::J)) && !ui.memory(|m| m.focused().is_some()) {
-                self.layout_state.juggle();
+                self.simulation.layout_state.juggle();
             }
 
             // Request repaint while the layout is still settling.
-            if energy > ENERGY_THRESHOLD || self.dragging.is_some() {
+            if energy > ENERGY_THRESHOLD || self.interaction.dragging.is_some() {
                 ui.ctx().request_repaint();
             }
 
-            // Viewport culling: compute the visible world-space rectangle
-            // with a margin so partially-visible nodes/edges aren't clipped.
-            let margin = NODE_WIDTH; // world-space margin
-            let (vis_min, vis_max) = self.camera.visible_world_rect(response.rect);
+            // Viewport culling
+            let margin = NODE_WIDTH;
+            let (vis_min, vis_max) = self.render.camera.visible_world_rect(response.rect);
             let vis_min = GVec2::new(vis_min.x - margin, vis_min.y - margin);
             let vis_max = GVec2::new(vis_max.x + margin, vis_max.y + margin);
 
             // LOD thresholds based on zoom level.
-            let circle_mode = self.render.circle_mode;
-            let circle_radius = self.render.circle_radius;
-            let draw_labels = !circle_mode && self.camera.zoom >= 0.4;
-            let draw_rects = !circle_mode && self.camera.zoom >= 0.15;
+            let circle_mode = self.render.render.circle_mode;
+            let circle_radius = self.render.render.circle_radius;
+            let draw_labels = !circle_mode && self.render.camera.zoom >= 0.4;
+            let draw_rects = !circle_mode && self.render.camera.zoom >= 0.15;
 
             // --- Build edge rerouting map for collapsed containers ---
             let reroute = self.build_edge_reroute_map();
 
             // --- 1. Draw expanded container backgrounds ---
-            // Store container screen rects for hit-testing.
-            self.container_rects.clear();
-            for (id, sym) in &self.graph.symbols {
-                if !self.layout_state.is_container(*id) || !self.layout_state.is_expanded(*id) {
+            self.simulation.container_rects.clear();
+            for (id, sym) in &self.graph.graph.symbols {
+                if !self.simulation.layout_state.is_container(*id)
+                    || !self.simulation.layout_state.is_expanded(*id)
+                {
                     continue;
                 }
-                if self.hidden_symbols.contains(id) {
+                if self.filters.hidden_symbols.contains(id) {
                     continue;
                 }
-                let children = self.layout_state.children_of(*id);
+                let children = self.simulation.layout_state.children_of(*id);
                 if children.is_empty() {
                     continue;
                 }
 
-                // Compute world-space bounding box of visible children.
                 let mut min_w = GVec2::splat(f32::INFINITY);
                 let mut max_w = GVec2::splat(f32::NEG_INFINITY);
                 let mut has_visible = false;
                 for &child_id in &children {
-                    if self.hidden_symbols.contains(&child_id) {
+                    if self.filters.hidden_symbols.contains(&child_id) {
                         continue;
                     }
-                    if let Some(&pos) = self.positions.0.get(&child_id) {
-                        let half = self.node_sizes.get(&child_id) * 0.5;
-                        min_w = min_w.min(pos - half);
-                        max_w = max_w.max(pos + half);
+                    if let Some(&pos) = self.simulation.positions.0.get(&child_id) {
+                        min_w = min_w.min(pos - GVec2::new(NODE_WIDTH / 2.0, NODE_HEIGHT / 2.0));
+                        max_w = max_w.max(pos + GVec2::new(NODE_WIDTH / 2.0, NODE_HEIGHT / 2.0));
                         has_visible = true;
                     }
                 }
@@ -228,19 +191,15 @@ impl SpaghettiApp {
                     continue;
                 }
 
-                // Also include the container node itself in the bounds.
-                if let Some(&parent_pos) = self.positions.0.get(id) {
-                    let half = self.node_sizes.get(id) * 0.5;
-                    min_w = min_w.min(parent_pos - half);
-                    max_w = max_w.max(parent_pos + half);
+                if let Some(&parent_pos) = self.simulation.positions.0.get(id) {
+                    min_w = min_w.min(parent_pos - GVec2::new(NODE_WIDTH / 2.0, NODE_HEIGHT / 2.0));
+                    max_w = max_w.max(parent_pos + GVec2::new(NODE_WIDTH / 2.0, NODE_HEIGHT / 2.0));
                 }
 
-                // Add padding and leave space for the title at the top.
-                let title_height = 20.0; // world units for the title bar
+                let title_height = 20.0;
                 min_w -= GVec2::new(CONTAINER_PADDING, CONTAINER_PADDING + title_height);
                 max_w += GVec2::new(CONTAINER_PADDING, CONTAINER_PADDING);
 
-                // Viewport culling for the container.
                 if max_w.x < vis_min.x
                     || min_w.x > vis_max.x
                     || max_w.y < vis_min.y
@@ -249,15 +208,13 @@ impl SpaghettiApp {
                     continue;
                 }
 
-                let screen_min = self.camera.world_to_screen(min_w, canvas_center);
-                let screen_max = self.camera.world_to_screen(max_w, canvas_center);
+                let screen_min = self.render.camera.world_to_screen(min_w, canvas_center);
+                let screen_max = self.render.camera.world_to_screen(max_w, canvas_center);
                 let container_rect = Rect::from_min_max(screen_min, screen_max);
 
-                // Store for hit-testing.
-                self.container_rects.push((*id, container_rect));
+                self.simulation.container_rects.push((*id, container_rect));
 
-                // Draw background.
-                let base_color = self.render.node_color(sym.kind);
+                let base_color = self.render.render.node_color(sym.kind);
                 let bg = with_alpha(base_color, 0.15);
                 painter.rect_filled(container_rect, 8.0, bg);
                 painter.rect_stroke(
@@ -267,11 +224,10 @@ impl SpaghettiApp {
                     StrokeKind::Outside,
                 );
 
-                // Draw container title at the top-left.
                 if draw_labels {
                     let title_pos =
                         egui::Pos2::new(container_rect.left() + 6.0, container_rect.top() + 2.0);
-                    let font = egui::FontId::proportional(13.0 * self.camera.zoom);
+                    let font = egui::FontId::proportional(13.0 * self.render.camera.zoom);
                     painter.text(
                         title_pos,
                         egui::Align2::LEFT_TOP,
@@ -285,42 +241,40 @@ impl SpaghettiApp {
             // --- 2. Draw edges (with rerouting for collapsed containers) ---
             let mut drawn_aggregated: HashSet<(SymbolId, SymbolId, u8)> = HashSet::new();
 
-            for edge in &self.graph.edges {
+            for edge in &self.graph.graph.edges {
                 if !active_kinds.contains(&edge.kind) {
                     continue;
                 }
 
-                // Reroute endpoints through collapsed containers.
                 let from_id = reroute.get(&edge.from).copied().unwrap_or(edge.from);
                 let to_id = reroute.get(&edge.to).copied().unwrap_or(edge.to);
 
-                // Skip internal edges (both endpoints reroute to same container).
                 if from_id == to_id {
                     continue;
                 }
 
-                // Skip if either effective endpoint is hidden.
-                if self.hidden_symbols.contains(&from_id) || self.hidden_symbols.contains(&to_id) {
+                if self.filters.hidden_symbols.contains(&from_id)
+                    || self.filters.hidden_symbols.contains(&to_id)
+                {
                     continue;
                 }
 
-                // Skip edges where either endpoint's symbol kind is filtered out.
                 let from_visible_kind = self
+                    .graph
                     .graph
                     .symbols
                     .get(&edge.from)
-                    .is_some_and(|s| self.node_filter.is_enabled(s.kind));
+                    .is_some_and(|s| self.filters.node_filter.is_enabled(s.kind));
                 let to_visible_kind = self
+                    .graph
                     .graph
                     .symbols
                     .get(&edge.to)
-                    .is_some_and(|s| self.node_filter.is_enabled(s.kind));
+                    .is_some_and(|s| self.filters.node_filter.is_enabled(s.kind));
                 if !from_visible_kind || !to_visible_kind {
                     continue;
                 }
 
-                // Dedup aggregated edges: if this is a rerouted edge, only draw
-                // one line per (from_container, to_container, kind) triple.
                 let is_rerouted =
                     reroute.contains_key(&edge.from) || reroute.contains_key(&edge.to);
                 if is_rerouted {
@@ -330,10 +284,9 @@ impl SpaghettiApp {
                     }
                 }
 
-                let from_pos = self.positions.0.get(&from_id);
-                let to_pos = self.positions.0.get(&to_id);
+                let from_pos = self.simulation.positions.0.get(&from_id);
+                let to_pos = self.simulation.positions.0.get(&to_id);
                 if let (Some(&from), Some(&to)) = (from_pos, to_pos) {
-                    // Cull: skip edge if both endpoints are outside the viewport.
                     let from_visible = from.x >= vis_min.x
                         && from.x <= vis_max.x
                         && from.y >= vis_min.y
@@ -346,39 +299,40 @@ impl SpaghettiApp {
                         continue;
                     }
 
-                    let screen_from = self.camera.world_to_screen(from, canvas_center);
-                    let screen_to = self.camera.world_to_screen(to, canvas_center);
+                    let screen_from = self.render.camera.world_to_screen(from, canvas_center);
+                    let screen_to = self.render.camera.world_to_screen(to, canvas_center);
 
-                    let color =
-                        with_alpha(self.render.edge_color(edge.kind), self.render.edge_opacity);
+                    let color = with_alpha(
+                        self.render.render.edge_color(edge.kind),
+                        self.render.render.edge_opacity,
+                    );
                     let thickness = if is_rerouted { 2.5 } else { 1.5 };
                     painter.line_segment([screen_from, screen_to], Stroke::new(thickness, color));
                 }
             }
 
             // --- 3. Draw nodes ---
-            // When hide_edgeless is on, only show nodes that have at least one
-            // visible edge (edge kind enabled, both endpoints' node kinds enabled
-            // and not file-tree-hidden).
             let nodes_with_edges: Option<std::collections::HashSet<core_ir::SymbolId>> =
-                if self.hide_edgeless {
+                if self.filters.hide_edgeless {
                     let mut set = std::collections::HashSet::new();
-                    for edge in &self.graph.edges {
+                    for edge in &self.graph.graph.edges {
                         if !active_kinds.contains(&edge.kind) {
                             continue;
                         }
-                        let from_ok = !self.hidden_symbols.contains(&edge.from)
+                        let from_ok = !self.filters.hidden_symbols.contains(&edge.from)
                             && self
+                                .graph
                                 .graph
                                 .symbols
                                 .get(&edge.from)
-                                .is_some_and(|s| self.node_filter.is_enabled(s.kind));
-                        let to_ok = !self.hidden_symbols.contains(&edge.to)
+                                .is_some_and(|s| self.filters.node_filter.is_enabled(s.kind));
+                        let to_ok = !self.filters.hidden_symbols.contains(&edge.to)
                             && self
+                                .graph
                                 .graph
                                 .symbols
                                 .get(&edge.to)
-                                .is_some_and(|s| self.node_filter.is_enabled(s.kind));
+                                .is_some_and(|s| self.filters.node_filter.is_enabled(s.kind));
                         if from_ok && to_ok {
                             set.insert(edge.from);
                             set.insert(edge.to);
@@ -388,11 +342,17 @@ impl SpaghettiApp {
                 } else {
                     None
                 };
-            for (id, sym) in &self.graph.symbols {
-                if self.hidden_symbols.contains(id) {
+            let node_size = Vec2::new(
+                NODE_WIDTH * self.render.camera.zoom,
+                NODE_HEIGHT * self.render.camera.zoom,
+            );
+            let container_node_size = node_size * COLLAPSED_CONTAINER_SCALE;
+
+            for (id, sym) in &self.graph.graph.symbols {
+                if self.filters.hidden_symbols.contains(id) {
                     continue;
                 }
-                if !self.node_filter.is_enabled(sym.kind) {
+                if !self.filters.node_filter.is_enabled(sym.kind) {
                     continue;
                 }
                 if let Some(ref with_edges) = nodes_with_edges {
@@ -400,8 +360,7 @@ impl SpaghettiApp {
                         continue;
                     }
                 }
-                if let Some(&world_pos) = self.positions.0.get(id) {
-                    // Viewport culling: skip nodes entirely outside the visible area.
+                if let Some(&world_pos) = self.simulation.positions.0.get(id) {
                     if world_pos.x < vis_min.x
                         || world_pos.x > vis_max.x
                         || world_pos.y < vis_min.y
@@ -410,30 +369,31 @@ impl SpaghettiApp {
                         continue;
                     }
 
-                    let screen_pos = self.camera.world_to_screen(world_pos, canvas_center);
-                    let base =
-                        with_alpha(self.render.node_color(sym.kind), self.render.node_opacity);
+                    let screen_pos = self.render.camera.world_to_screen(world_pos, canvas_center);
+                    let base = with_alpha(
+                        self.render.render.node_color(sym.kind),
+                        self.render.render.node_opacity,
+                    );
 
-                    let is_container = self.layout_state.is_container(*id);
-                    let is_collapsed = is_container && !self.layout_state.is_expanded(*id);
-                    let is_selected = self.selection.contains(id);
+                    let is_container = self.simulation.layout_state.is_container(*id);
+                    let is_collapsed =
+                        is_container && !self.simulation.layout_state.is_expanded(*id);
 
                     if draw_rects {
-                        let world_size = self.node_sizes.get(id);
-                        let screen_size = Vec2::new(
-                            world_size.x * self.camera.zoom,
-                            world_size.y * self.camera.zoom,
-                        );
-                        let rect = Rect::from_center_size(screen_pos, screen_size);
+                        let size = if is_collapsed {
+                            container_node_size
+                        } else {
+                            node_size
+                        };
+                        let rect = Rect::from_center_size(screen_pos, size);
 
-                        let bg = if is_selected {
+                        let bg = if self.interaction.selection == Some(*id) {
                             brighten(base, 2.0)
                         } else {
                             base
                         };
                         painter.rect_filled(rect, 4.0, bg);
 
-                        // Collapsed containers get a thicker border.
                         let border_width = if is_collapsed { 2.0 } else { 1.0 };
                         painter.rect_stroke(
                             rect,
@@ -442,11 +402,10 @@ impl SpaghettiApp {
                             StrokeKind::Outside,
                         );
 
-                        // Label (only when zoomed in enough)
                         if draw_labels {
-                            let font = egui::FontId::proportional(12.0 * self.camera.zoom);
+                            let font = egui::FontId::proportional(12.0 * self.render.camera.zoom);
                             let label = if is_collapsed {
-                                let n = self.layout_state.children_of(*id).len();
+                                let n = self.simulation.layout_state.children_of(*id).len();
                                 format!("{} (+{})", sym.name, n)
                             } else {
                                 sym.name.clone()
@@ -460,14 +419,13 @@ impl SpaghettiApp {
                             );
                         }
                     } else {
-                        // Circle mode or very low zoom: draw a filled circle.
-                        let color = if is_selected {
+                        let color = if self.interaction.selection == Some(*id) {
                             brighten(base, 2.0)
                         } else {
                             base
                         };
                         let r = if circle_mode {
-                            let base_r = circle_radius * self.camera.zoom;
+                            let base_r = circle_radius * self.render.camera.zoom;
                             if is_collapsed {
                                 base_r * COLLAPSED_CONTAINER_SCALE
                             } else {
@@ -482,8 +440,8 @@ impl SpaghettiApp {
             }
 
             // FPS overlay
-            self.fps.tick();
-            paint_fps_overlay(ui, response.rect, self.fps.fps());
+            self.render.fps.tick();
+            paint_fps_overlay(ui, response.rect, self.render.fps.fps());
         });
     }
 
@@ -491,9 +449,11 @@ impl SpaghettiApp {
     /// for edge rerouting.
     fn build_edge_reroute_map(&self) -> HashMap<SymbolId, SymbolId> {
         let mut reroute = HashMap::new();
-        for (id, _sym) in &self.graph.symbols {
-            if self.layout_state.is_container(*id) && !self.layout_state.is_expanded(*id) {
-                for child_id in self.layout_state.children_of(*id) {
+        for (id, _sym) in &self.graph.graph.symbols {
+            if self.simulation.layout_state.is_container(*id)
+                && !self.simulation.layout_state.is_expanded(*id)
+            {
+                for child_id in self.simulation.layout_state.children_of(*id) {
                     reroute.insert(child_id, *id);
                 }
             }
@@ -502,37 +462,31 @@ impl SpaghettiApp {
     }
 
     /// Hit-test that accounts for expanded container backgrounds.
-    ///
-    /// Checks children first (they're on top), then regular nodes,
-    /// then expanded container backgrounds.
     fn hit_test_compound(
         &self,
         pointer: Option<egui::Pos2>,
         canvas_center: egui::Pos2,
     ) -> Option<SymbolId> {
-        // First try the normal node hit-test (children and regular nodes).
-        let radius = if self.render.circle_mode {
-            Some(self.render.circle_radius)
+        let radius = if self.render.render.circle_mode {
+            Some(self.render.render.circle_radius)
         } else {
             None
         };
         if let Some(hit) = crate::camera::hit_test(
-            &self.camera,
-            &self.positions,
-            &self.node_sizes,
+            &self.render.camera,
+            &self.simulation.positions,
+            &self.simulation.node_sizes,
             pointer,
             canvas_center,
             radius,
         ) {
-            // Only return if the node is visible (not hidden by collapse/file-tree).
-            if !self.hidden_symbols.contains(&hit) {
+            if !self.filters.hidden_symbols.contains(&hit) {
                 return Some(hit);
             }
         }
 
-        // Then check expanded container background rects.
         let pointer = pointer?;
-        for &(id, rect) in self.container_rects.iter().rev() {
+        for &(id, rect) in self.simulation.container_rects.iter().rev() {
             if rect.contains(pointer) {
                 return Some(id);
             }
