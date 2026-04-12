@@ -388,6 +388,10 @@ impl LayoutState {
                 params.edge_params.clone(),
                 params.attraction_enabled,
             )),
+            Box::new(forces::Containment::new(
+                params.containment_strength,
+                params.containment_enabled,
+            )),
             Box::new(forces::LocationAffinity::new(
                 params.location_strength,
                 params.location_falloff,
@@ -446,6 +450,8 @@ impl LayoutState {
         let location_strength = self.params.location_strength;
         let location_falloff = self.params.location_falloff;
         let location_enabled = self.params.location_enabled;
+        let containment_strength = self.params.containment_strength;
+        let containment_enabled = self.params.containment_enabled;
         for force in self.forces.iter_mut() {
             let any = force.as_any_mut();
             if let Some(g) = any.downcast_mut::<forces::Gravity>() {
@@ -472,6 +478,11 @@ impl LayoutState {
                 l.strength = location_strength;
                 l.falloff = location_falloff;
                 l.enabled = location_enabled;
+                continue;
+            }
+            if let Some(c) = any.downcast_mut::<forces::Containment>() {
+                c.strength = containment_strength;
+                c.enabled = containment_enabled;
                 continue;
             }
         }
@@ -524,51 +535,13 @@ impl LayoutState {
             // a `Force` further down instead of seeding this buffer itself.
             let mut forces = vec![Vec2::ZERO; len];
 
-            // Containment force: each container pulls its DIRECT children
-            // toward their centroid. Top-level containers (TU/Namespace)
-            // use half strength so class-level containment dominates.
-            if p.containment_enabled && p.containment_strength > 0.0 {
-                for &c in &self.containers {
-                    if !self.active[c] {
-                        continue;
-                    }
-                    let children = &self.children_of[c];
-                    if children.len() < 2 {
-                        continue;
-                    }
-                    let mut centroid = Vec2::ZERO;
-                    let mut count = 0u32;
-                    for &child in children {
-                        if self.active[child] {
-                            centroid += self.positions[child];
-                            count += 1;
-                        }
-                    }
-                    if count < 2 {
-                        continue;
-                    }
-                    centroid /= count as f32;
-
-                    let strength = if self.toplevel_containers.contains(&c) {
-                        p.containment_strength * 0.5
-                    } else {
-                        p.containment_strength
-                    };
-                    for &child in children {
-                        if self.active[child] {
-                            forces[child] += (centroid - self.positions[child]) * strength;
-                        }
-                    }
-                }
-            }
-
             // --- Extracted forces pipeline (issue #33) ---
             //
             // Forces that have been migrated out of this inline code run
             // through the trait-based pipeline. Currently: repulsion,
-            // spring attraction, location affinity, gravity. Future
-            // extractions (containment, container repulsion) will append
-            // to `self.forces` and delete more of the inline code below.
+            // spring attraction, containment, location affinity, gravity.
+            // The last remaining inline force (container repulsion) will
+            // be extracted next.
             let ctx = forces::ForceContext {
                 positions: &self.positions,
                 sizes: &self.sizes,
