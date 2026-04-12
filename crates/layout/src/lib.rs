@@ -387,6 +387,13 @@ impl LayoutState {
                 params.min_dist,
                 params.repulsion_enabled,
             )),
+            Box::new(forces::SpringAttraction::new(
+                params.attraction,
+                params.ideal_length,
+                params.min_dist,
+                params.edge_params.clone(),
+                params.attraction_enabled,
+            )),
             Box::new(forces::Gravity::new(params.gravity, params.gravity_enabled)),
         ];
 
@@ -424,13 +431,19 @@ impl LayoutState {
     /// `import_params` and remove `ForceParams` from `LayoutState`.
     fn sync_forces_from_params(&mut self) {
         // Snapshot relevant scalars first — we can't hold `&self.params`
-        // while also mutably iterating `self.forces`.
+        // while also mutably iterating `self.forces`. `edge_params` is
+        // cloned because `SpringAttraction` owns its own copy.
         let gravity_strength = self.params.gravity;
         let gravity_enabled = self.params.gravity_enabled;
         let repulsion_strength = self.params.repulsion;
         let repulsion_cutoff = self.params.repulsion_cutoff;
         let repulsion_min_dist = self.params.min_dist;
         let repulsion_enabled = self.params.repulsion_enabled;
+        let attraction_strength = self.params.attraction;
+        let attraction_ideal_length = self.params.ideal_length;
+        let attraction_min_dist = self.params.min_dist;
+        let attraction_enabled = self.params.attraction_enabled;
+        let attraction_edge_params = self.params.edge_params.clone();
         for force in self.forces.iter_mut() {
             let any = force.as_any_mut();
             if let Some(g) = any.downcast_mut::<forces::Gravity>() {
@@ -443,6 +456,14 @@ impl LayoutState {
                 r.cutoff = repulsion_cutoff;
                 r.min_dist = repulsion_min_dist;
                 r.enabled = repulsion_enabled;
+                continue;
+            }
+            if let Some(s) = any.downcast_mut::<forces::SpringAttraction>() {
+                s.global_attraction = attraction_strength;
+                s.global_ideal_length = attraction_ideal_length;
+                s.min_dist = attraction_min_dist;
+                s.enabled = attraction_enabled;
+                s.edge_params = attraction_edge_params.clone();
                 continue;
             }
         }
@@ -494,34 +515,6 @@ impl LayoutState {
             // Fresh accumulator for this iteration. Repulsion now runs as
             // a `Force` further down instead of seeding this buffer itself.
             let mut forces = vec![Vec2::ZERO; len];
-
-            // Attractive forces along visible edges only (per-edge-kind params).
-            //
-            // Linear spring, but each endpoint's force is divided by
-            // sqrt(degree) so hub nodes (many connections) don't get
-            // yanked across the canvas by the sum of all their edges.
-            if p.attraction_enabled {
-                for &(from, to, kind) in &self.edge_pairs {
-                    if !self.visible_edge_kinds.contains(&kind) {
-                        continue;
-                    }
-                    if !self.active[from] || !self.active[to] {
-                        continue;
-                    }
-                    let (attr, rest_len) = if let Some(ep) = p.edge_params.get(&kind) {
-                        (ep.attraction, ep.target_distance)
-                    } else {
-                        (p.attraction, p.ideal_length)
-                    };
-                    let delta = self.positions[to] - self.positions[from];
-                    let dist = delta.length().max(p.min_dist);
-                    let displacement = attr * (dist - rest_len);
-                    let dir = delta.normalize_or_zero();
-                    // Scale by 1/sqrt(degree) at each endpoint so hubs stay calm.
-                    forces[from] += dir * displacement / self.degrees[from].sqrt();
-                    forces[to] -= dir * displacement / self.degrees[to].sqrt();
-                }
-            }
 
             // Containment force: each container pulls its DIRECT children
             // toward their centroid. Top-level containers (TU/Namespace)
@@ -606,9 +599,9 @@ impl LayoutState {
             //
             // Forces that have been migrated out of this inline code run
             // through the trait-based pipeline. Currently: repulsion,
-            // gravity. Future extractions (spring attraction, containment,
-            // etc.) will append to `self.forces` and delete more of the
-            // inline code below.
+            // spring attraction, gravity. Future extractions (containment,
+            // location affinity, container repulsion) will append to
+            // `self.forces` and delete more of the inline code below.
             let ctx = forces::ForceContext {
                 positions: &self.positions,
                 sizes: &self.sizes,

@@ -19,9 +19,11 @@ use std::collections::HashSet;
 
 pub mod gravity;
 pub mod repulsion;
+pub mod spring_attraction;
 
 pub use gravity::Gravity;
 pub use repulsion::Repulsion;
+pub use spring_attraction::SpringAttraction;
 
 /// Threshold (in nodes) above which forces may parallelise their inner
 /// loops under rayon. For smaller graphs, the overhead of spawning work
