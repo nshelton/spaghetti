@@ -422,6 +422,22 @@ impl LayoutState {
         }
     }
 
+    /// Borrow the pipeline force of type `T`, if present. Each force
+    /// type is unique in the pipeline, so the result effectively
+    /// identifies "the" force of that type.
+    pub fn force<T: forces::Force>(&self) -> Option<&T> {
+        self.forces
+            .iter()
+            .find_map(|f| f.as_any().downcast_ref::<T>())
+    }
+
+    /// Mutably borrow the pipeline force of type `T`, if present.
+    pub fn force_mut<T: forces::Force>(&mut self) -> Option<&mut T> {
+        self.forces
+            .iter_mut()
+            .find_map(|f| f.as_any_mut().downcast_mut::<T>())
+    }
+
     /// Copy parameter values from [`ForceParams`] into each pipeline
     /// force. Runs once per `step_inner` call so UI-driven param edits
     /// take effect immediately without plumbing a setter per field.
