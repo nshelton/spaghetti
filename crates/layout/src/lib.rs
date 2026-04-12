@@ -12,6 +12,7 @@ pub mod forces;
 use core_ir::{EdgeKind, Graph, SymbolId, SymbolKind};
 use glam::Vec2;
 use indexmap::IndexMap;
+use rayon::prelude::*;
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::time::{Duration, Instant};
@@ -539,45 +540,75 @@ impl LayoutState {
     /// Applies adaptive cooling (damping decays over time), clamps per-node
     /// force and velocity magnitudes, skips hidden nodes, and holds pinned
     /// nodes at their fixed positions. Increments `total_steps`.
+    ///
+    /// Above [`forces::PARALLEL_THRESHOLD`] nodes the per-node update runs
+    /// under rayon: each iteration writes exactly one position/velocity
+    /// slot, so the work parallelises without contention.
     fn integrate(&mut self, forces: &[Vec2]) {
-        let p = &self.params;
-        // Adaptive cooling: damping decreases over time so the layout
-        // progressively freezes into place.
         let cooling = (1.0 - (self.total_steps as f32 / 300.0).min(0.95)).max(0.05);
-        let effective_damping = p.damping * cooling;
-        let max_vel = p.max_velocity * cooling;
-        let max_force = p.max_velocity * 2.0;
+        let effective_damping = self.params.damping * cooling;
+        let max_vel = self.params.max_velocity * cooling;
+        let max_force = self.params.max_velocity * 2.0;
         self.total_steps += 1;
 
-        for (i, (((id, pos), vel), force)) in self
-            .ids
-            .iter()
-            .zip(self.positions.iter_mut())
-            .zip(self.velocities.iter_mut())
-            .zip(forces.iter())
-            .enumerate()
-        {
-            if !self.active[i] {
+        let n = self.positions.len();
+        if n == 0 {
+            return;
+        }
+
+        // Split `self` into disjoint field borrows so the parallel loop
+        // can hold mutable borrows on positions/velocities while sharing
+        // `active`, `ids`, and `pins` across worker threads.
+        let positions = &mut self.positions;
+        let velocities = &mut self.velocities;
+        let active: &[bool] = &self.active;
+        let ids: &[SymbolId] = &self.ids;
+        let pins = &self.pins;
+
+        // Per-node integration step, shared between the serial and
+        // parallel paths so the math stays identical.
+        let integrate_one = |i: usize, pos: &mut Vec2, vel: &mut Vec2, force: Vec2| {
+            if !active[i] {
                 *vel = Vec2::ZERO;
-                continue;
+                return;
             }
-            if let Some(&pin_pos) = self.pins.get(id) {
+            if let Some(&pin_pos) = pins.get(&ids[i]) {
                 *pos = pin_pos;
                 *vel = Vec2::ZERO;
-            } else {
-                // Clamp force magnitude to prevent explosive acceleration
-                // when nodes are very close or container overlaps are large.
-                let mut f = *force;
-                let f_mag = f.length();
-                if f_mag > max_force {
-                    f *= max_force / f_mag;
-                }
-                *vel = (*vel + f) * effective_damping;
-                let speed = vel.length();
-                if speed > max_vel {
-                    *vel *= max_vel / speed;
-                }
-                *pos += *vel;
+                return;
+            }
+            // Clamp force magnitude to prevent explosive acceleration
+            // when nodes are very close or container overlaps are large.
+            let mut f = force;
+            let f_mag = f.length();
+            if f_mag > max_force {
+                f *= max_force / f_mag;
+            }
+            *vel = (*vel + f) * effective_damping;
+            let speed = vel.length();
+            if speed > max_vel {
+                *vel *= max_vel / speed;
+            }
+            *pos += *vel;
+        };
+
+        if n >= forces::PARALLEL_THRESHOLD {
+            positions
+                .par_iter_mut()
+                .zip(velocities.par_iter_mut())
+                .zip(forces.par_iter())
+                .enumerate()
+                .for_each(|(i, ((pos, vel), force))| {
+                    integrate_one(i, pos, vel, *force);
+                });
+        } else {
+            for (i, ((pos, vel), force)) in positions
+                .iter_mut()
+                .zip(velocities.iter_mut())
+                .zip(forces.iter())
+                .enumerate()
+            {
+                integrate_one(i, pos, vel, *force);
             }
         }
     }
