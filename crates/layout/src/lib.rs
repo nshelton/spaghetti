@@ -438,6 +438,20 @@ impl LayoutState {
             .find_map(|f| f.as_any_mut().downcast_mut::<T>())
     }
 
+    /// Snapshot the current tunable parameters into a [`ForceParams`]
+    /// struct for serialization to `spaghetti_settings.json`.
+    pub fn export_params(&self) -> ForceParams {
+        self.params.clone()
+    }
+
+    /// Apply a [`ForceParams`] snapshot to the simulation. Individual
+    /// force params are propagated into the pipeline on the next
+    /// [`step`](Self::step) via the same sync mechanism `params_mut`
+    /// already uses.
+    pub fn import_params(&mut self, params: &ForceParams) {
+        self.params = params.clone();
+    }
+
     /// Copy parameter values from [`ForceParams`] into each pipeline
     /// force. Runs once per `step_inner` call so UI-driven param edits
     /// take effect immediately without plumbing a setter per field.
