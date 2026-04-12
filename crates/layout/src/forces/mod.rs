@@ -17,12 +17,14 @@ use glam::Vec2;
 use std::any::Any;
 use std::collections::HashSet;
 
+pub mod container_repulsion;
 pub mod containment;
 pub mod gravity;
 pub mod location_affinity;
 pub mod repulsion;
 pub mod spring_attraction;
 
+pub use container_repulsion::ContainerRepulsion;
 pub use containment::Containment;
 pub use gravity::Gravity;
 pub use location_affinity::LocationAffinity;

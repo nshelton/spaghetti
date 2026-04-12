@@ -260,9 +260,6 @@ pub struct LayoutState {
     /// Per-node bounding box sizes in world units. Used for size-aware
     /// repulsion (edge-to-edge distance instead of center-to-center).
     sizes: Vec<Vec2>,
-    /// Groups of sibling container indices (containers sharing the same parent).
-    /// Container repulsion only acts within each sibling group.
-    sibling_groups: Vec<Vec<usize>>,
     /// Composable force pipeline. Forces are progressively extracted out of
     /// `step_inner` into this list (see issue #33). On each step, every
     /// enabled force accumulates contributions into the shared force buffer.
@@ -392,6 +389,11 @@ impl LayoutState {
                 params.containment_strength,
                 params.containment_enabled,
             )),
+            Box::new(forces::ContainerRepulsion::new(
+                params.container_repulsion,
+                sibling_groups,
+                params.container_repulsion_enabled,
+            )),
             Box::new(forces::LocationAffinity::new(
                 params.location_strength,
                 params.location_falloff,
@@ -422,7 +424,6 @@ impl LayoutState {
             collapse_hidden,
             external_hidden,
             sizes: vec![Vec2::new(120.0, 30.0); n],
-            sibling_groups,
             forces: force_pipeline,
         }
     }
@@ -452,6 +453,8 @@ impl LayoutState {
         let location_enabled = self.params.location_enabled;
         let containment_strength = self.params.containment_strength;
         let containment_enabled = self.params.containment_enabled;
+        let container_repulsion_strength = self.params.container_repulsion;
+        let container_repulsion_enabled = self.params.container_repulsion_enabled;
         for force in self.forces.iter_mut() {
             let any = force.as_any_mut();
             if let Some(g) = any.downcast_mut::<forces::Gravity>() {
@@ -483,6 +486,11 @@ impl LayoutState {
             if let Some(c) = any.downcast_mut::<forces::Containment>() {
                 c.strength = containment_strength;
                 c.enabled = containment_enabled;
+                continue;
+            }
+            if let Some(cr) = any.downcast_mut::<forces::ContainerRepulsion>() {
+                cr.strength = container_repulsion_strength;
+                cr.enabled = container_repulsion_enabled;
                 continue;
             }
         }
@@ -535,13 +543,12 @@ impl LayoutState {
             // a `Force` further down instead of seeding this buffer itself.
             let mut forces = vec![Vec2::ZERO; len];
 
-            // --- Extracted forces pipeline (issue #33) ---
+            // --- Force pipeline ---
             //
-            // Forces that have been migrated out of this inline code run
-            // through the trait-based pipeline. Currently: repulsion,
-            // spring attraction, containment, location affinity, gravity.
-            // The last remaining inline force (container repulsion) will
-            // be extracted next.
+            // All forces now run through the trait-based pipeline:
+            // repulsion, spring attraction, containment, container
+            // repulsion, location affinity, gravity. step_inner is down
+            // to ctx setup → accumulate → integrate → clamp.
             let ctx = forces::ForceContext {
                 positions: &self.positions,
                 sizes: &self.sizes,
@@ -558,103 +565,6 @@ impl LayoutState {
             for force in &self.forces {
                 if force.enabled() {
                     force.apply(&ctx, &mut forces);
-                }
-            }
-
-            // Container overlap resolution: push sibling containers apart
-            // only when their bounding boxes actually overlap. Force is
-            // proportional to overlap depth so containers separate just
-            // enough to stop intersecting, then stop receiving force.
-            if p.container_repulsion_enabled && p.container_repulsion > 0.0 {
-                let cr = p.container_repulsion;
-                for group in &self.sibling_groups {
-                    // Collect the expanded, visible containers in this group.
-                    let live_siblings: Vec<usize> = group
-                        .iter()
-                        .copied()
-                        .filter(|&c| self.active[c] && self.expanded.contains(&c))
-                        .collect();
-                    if live_siblings.len() < 2 {
-                        continue;
-                    }
-
-                    // Grid-accelerated overlap detection: bucket containers by
-                    // cell so we only check nearby pairs instead of all O(S²).
-                    let max_extent = live_siblings
-                        .iter()
-                        .map(|&c| self.sizes[c].x.max(self.sizes[c].y))
-                        .fold(0.0f32, f32::max);
-                    // Cell size = largest container extent so overlapping pairs
-                    // are always in the same or adjacent cells.
-                    let cell_size = max_extent.max(1.0);
-                    let inv_cell = 1.0 / cell_size;
-
-                    let mut grid: HashMap<(i32, i32), Vec<usize>> = HashMap::new();
-                    for &c in &live_siblings {
-                        let cx = (self.positions[c].x * inv_cell).floor() as i32;
-                        let cy = (self.positions[c].y * inv_cell).floor() as i32;
-                        grid.entry((cx, cy)).or_default().push(c);
-                    }
-
-                    // Check each container against neighbours in a 3×3 cell window.
-                    for &a in &live_siblings {
-                        let pos_a = self.positions[a];
-                        let half_a = self.sizes[a] * 0.5;
-                        let ax = (pos_a.x * inv_cell).floor() as i32;
-                        let ay = (pos_a.y * inv_cell).floor() as i32;
-
-                        for dx in -1i32..=1 {
-                            for dy in -1i32..=1 {
-                                let key = (ax.wrapping_add(dx), ay.wrapping_add(dy));
-                                let Some(bucket) = grid.get(&key) else {
-                                    continue;
-                                };
-                                for &b in bucket {
-                                    // Avoid self-pairs and double-counting (a < b).
-                                    if b <= a {
-                                        continue;
-                                    }
-                                    let pos_b = self.positions[b];
-                                    let half_b = self.sizes[b] * 0.5;
-
-                                    // AABB overlap test on each axis.
-                                    let overlap_x =
-                                        (half_a.x + half_b.x) - (pos_a.x - pos_b.x).abs();
-                                    let overlap_y =
-                                        (half_a.y + half_b.y) - (pos_a.y - pos_b.y).abs();
-
-                                    if overlap_x <= 0.0 || overlap_y <= 0.0 {
-                                        continue; // No overlap — skip.
-                                    }
-
-                                    // Push apart along the axis of least overlap
-                                    // (minimum penetration direction).
-                                    let delta = pos_a - pos_b;
-                                    let f = if overlap_x < overlap_y {
-                                        Vec2::new(delta.x.signum() * overlap_x * cr, 0.0)
-                                    } else {
-                                        Vec2::new(0.0, delta.y.signum() * overlap_y * cr)
-                                    };
-
-                                    // Rigid-body: move container + all descendants.
-                                    apply_force_to_subtree(
-                                        a,
-                                        f,
-                                        &mut forces,
-                                        &self.children_of,
-                                        &self.active,
-                                    );
-                                    apply_force_to_subtree(
-                                        b,
-                                        -f,
-                                        &mut forces,
-                                        &self.children_of,
-                                        &self.active,
-                                    );
-                                }
-                            }
-                        }
-                    }
                 }
             }
 
@@ -1028,27 +938,6 @@ fn build_sibling_groups(
     }
     // Only keep groups with at least 2 siblings (single containers can't repel).
     by_parent.into_values().filter(|g| g.len() >= 2).collect()
-}
-
-/// Apply a force to a node and all its descendants (rigid-body translation).
-/// Walks the subtree via `children_of` without allocating. Descendants
-/// whose `active` flag is `false` are skipped.
-fn apply_force_to_subtree(
-    root: usize,
-    force: Vec2,
-    forces: &mut [Vec2],
-    children_of: &[Vec<usize>],
-    active: &[bool],
-) {
-    forces[root] += force;
-    // Use a manual stack to avoid recursion overhead.
-    let mut stack: Vec<usize> = children_of[root].clone();
-    while let Some(node) = stack.pop() {
-        if active[node] {
-            forces[node] += force;
-            stack.extend_from_slice(&children_of[node]);
-        }
-    }
 }
 
 /// Build hierarchical directory groups from the graph's file table.
