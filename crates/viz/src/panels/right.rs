@@ -240,27 +240,27 @@ impl SpaghettiApp {
                             edge_filter_changed = true;
                         }
                         if enabled {
-                            let ep = self
+                            if let Some(spring) = self
                                 .simulation
                                 .layout_state
-                                .params_mut()
-                                .edge_params
-                                .entry(kind)
-                                .or_insert(default_ep);
-                            ui.indent(format!("edge_sliders_{kind:?}"), |ui| {
-                                changed |= ui
-                                    .add(
-                                        egui::Slider::new(&mut ep.target_distance, 1.0..=100.0)
-                                            .text("Dist"),
-                                    )
-                                    .changed();
-                                changed |= ui
-                                    .add(
-                                        egui::Slider::new(&mut ep.attraction, 0.0..=2.0)
-                                            .text("Attract"),
-                                    )
-                                    .changed();
-                            });
+                                .force_mut::<layout::forces::SpringAttraction>()
+                            {
+                                let ep = spring.edge_params.entry(kind).or_insert(default_ep);
+                                ui.indent(format!("edge_sliders_{kind:?}"), |ui| {
+                                    changed |= ui
+                                        .add(
+                                            egui::Slider::new(&mut ep.target_distance, 1.0..=100.0)
+                                                .text("Dist"),
+                                        )
+                                        .changed();
+                                    changed |= ui
+                                        .add(
+                                            egui::Slider::new(&mut ep.attraction, 0.0..=2.0)
+                                                .text("Attract"),
+                                        )
+                                        .changed();
+                                });
+                            }
                         }
                     }
 
@@ -284,8 +284,16 @@ impl SpaghettiApp {
 
                     // Repulsion
                     {
-                        let params = self.simulation.layout_state.params_mut();
-                        let mut enabled = params.repulsion_enabled;
+                        let mut enabled = self
+                            .simulation
+                            .layout_state
+                            .force::<layout::forces::Repulsion>()
+                            .is_some_and(|r| r.enabled);
+                        let mut strength = self
+                            .simulation
+                            .layout_state
+                            .force::<layout::forces::Repulsion>()
+                            .map_or(0.0, |r| r.strength);
                         let id = ui.make_persistent_id("force_repulsion");
                         egui::collapsing_header::CollapsingState::load_with_default_open(
                             ui.ctx(),
@@ -301,22 +309,32 @@ impl SpaghettiApp {
                             if !enabled {
                                 ui.disable();
                             }
-                            let p = self.simulation.layout_state.params_mut();
                             changed |= ui
                                 .add(
-                                    egui::Slider::new(&mut p.repulsion, 100.0..=1_000_000.0)
+                                    egui::Slider::new(&mut strength, 100.0..=1_000_000.0)
                                         .logarithmic(true)
                                         .text("Strength"),
                                 )
                                 .changed();
                         });
-                        self.simulation.layout_state.params_mut().repulsion_enabled = enabled;
+                        if let Some(r) = self
+                            .simulation
+                            .layout_state
+                            .force_mut::<layout::forces::Repulsion>()
+                        {
+                            r.enabled = enabled;
+                            r.strength = strength;
+                        }
                     }
 
-                    // Edge Springs (attraction)
+                    // Edge Springs (attraction). Per-kind sliders live in the
+                    // Edge Types section above; this block is just the on/off.
                     {
-                        let params = self.simulation.layout_state.params_mut();
-                        let mut enabled = params.attraction_enabled;
+                        let mut enabled = self
+                            .simulation
+                            .layout_state
+                            .force::<layout::forces::SpringAttraction>()
+                            .is_some_and(|s| s.enabled);
                         let id = ui.make_persistent_id("force_attraction");
                         egui::collapsing_header::CollapsingState::load_with_default_open(
                             ui.ctx(),
@@ -334,13 +352,27 @@ impl SpaghettiApp {
                             }
                             ui.label("Per-edge-kind sliders are above in Edge Types.");
                         });
-                        self.simulation.layout_state.params_mut().attraction_enabled = enabled;
+                        if let Some(s) = self
+                            .simulation
+                            .layout_state
+                            .force_mut::<layout::forces::SpringAttraction>()
+                        {
+                            s.enabled = enabled;
+                        }
                     }
 
                     // Gravity
                     {
-                        let params = self.simulation.layout_state.params_mut();
-                        let mut enabled = params.gravity_enabled;
+                        let mut enabled = self
+                            .simulation
+                            .layout_state
+                            .force::<layout::forces::Gravity>()
+                            .is_some_and(|g| g.enabled);
+                        let mut strength = self
+                            .simulation
+                            .layout_state
+                            .force::<layout::forces::Gravity>()
+                            .map_or(0.0, |g| g.strength);
                         let id = ui.make_persistent_id("force_gravity");
                         egui::collapsing_header::CollapsingState::load_with_default_open(
                             ui.ctx(),
@@ -356,18 +388,37 @@ impl SpaghettiApp {
                             if !enabled {
                                 ui.disable();
                             }
-                            let p = self.simulation.layout_state.params_mut();
                             changed |= ui
-                                .add(egui::Slider::new(&mut p.gravity, 0.0..=0.1).text("Strength"))
+                                .add(egui::Slider::new(&mut strength, 0.0..=0.1).text("Strength"))
                                 .changed();
                         });
-                        self.simulation.layout_state.params_mut().gravity_enabled = enabled;
+                        if let Some(g) = self
+                            .simulation
+                            .layout_state
+                            .force_mut::<layout::forces::Gravity>()
+                        {
+                            g.enabled = enabled;
+                            g.strength = strength;
+                        }
                     }
 
                     // Location Affinity
                     {
-                        let params = self.simulation.layout_state.params_mut();
-                        let mut enabled = params.location_enabled;
+                        let mut enabled = self
+                            .simulation
+                            .layout_state
+                            .force::<layout::forces::LocationAffinity>()
+                            .is_some_and(|l| l.enabled);
+                        let mut strength = self
+                            .simulation
+                            .layout_state
+                            .force::<layout::forces::LocationAffinity>()
+                            .map_or(0.0, |l| l.strength);
+                        let mut falloff = self
+                            .simulation
+                            .layout_state
+                            .force::<layout::forces::LocationAffinity>()
+                            .map_or(0.0, |l| l.falloff);
                         let id = ui.make_persistent_id("force_location");
                         egui::collapsing_header::CollapsingState::load_with_default_open(
                             ui.ctx(),
@@ -383,27 +434,36 @@ impl SpaghettiApp {
                             if !enabled {
                                 ui.disable();
                             }
-                            let p = self.simulation.layout_state.params_mut();
                             changed |= ui
-                                .add(
-                                    egui::Slider::new(&mut p.location_strength, 0.0..=2.0)
-                                        .text("Strength"),
-                                )
+                                .add(egui::Slider::new(&mut strength, 0.0..=2.0).text("Strength"))
                                 .changed();
                             changed |= ui
-                                .add(
-                                    egui::Slider::new(&mut p.location_falloff, 0.0..=1.0)
-                                        .text("Falloff"),
-                                )
+                                .add(egui::Slider::new(&mut falloff, 0.0..=1.0).text("Falloff"))
                                 .changed();
                         });
-                        self.simulation.layout_state.params_mut().location_enabled = enabled;
+                        if let Some(l) = self
+                            .simulation
+                            .layout_state
+                            .force_mut::<layout::forces::LocationAffinity>()
+                        {
+                            l.enabled = enabled;
+                            l.strength = strength;
+                            l.falloff = falloff;
+                        }
                     }
 
                     // Containment
                     {
-                        let params = self.simulation.layout_state.params_mut();
-                        let mut enabled = params.containment_enabled;
+                        let mut enabled = self
+                            .simulation
+                            .layout_state
+                            .force::<layout::forces::Containment>()
+                            .is_some_and(|c| c.enabled);
+                        let mut strength = self
+                            .simulation
+                            .layout_state
+                            .force::<layout::forces::Containment>()
+                            .map_or(0.0, |c| c.strength);
                         let id = ui.make_persistent_id("force_containment");
                         egui::collapsing_header::CollapsingState::load_with_default_open(
                             ui.ctx(),
@@ -419,24 +479,32 @@ impl SpaghettiApp {
                             if !enabled {
                                 ui.disable();
                             }
-                            let p = self.simulation.layout_state.params_mut();
                             changed |= ui
-                                .add(
-                                    egui::Slider::new(&mut p.containment_strength, 0.0..=2.0)
-                                        .text("Strength"),
-                                )
+                                .add(egui::Slider::new(&mut strength, 0.0..=2.0).text("Strength"))
                                 .changed();
                         });
-                        self.simulation
+                        if let Some(c) = self
+                            .simulation
                             .layout_state
-                            .params_mut()
-                            .containment_enabled = enabled;
+                            .force_mut::<layout::forces::Containment>()
+                        {
+                            c.enabled = enabled;
+                            c.strength = strength;
+                        }
                     }
 
                     // Container Repulsion (gap-based)
                     {
-                        let params = self.simulation.layout_state.params_mut();
-                        let mut enabled = params.container_repulsion_enabled;
+                        let mut enabled = self
+                            .simulation
+                            .layout_state
+                            .force::<layout::forces::ContainerRepulsion>()
+                            .is_some_and(|cr| cr.enabled);
+                        let mut strength = self
+                            .simulation
+                            .layout_state
+                            .force::<layout::forces::ContainerRepulsion>()
+                            .map_or(0.0, |cr| cr.strength);
                         let id = ui.make_persistent_id("force_container_repulsion");
                         egui::collapsing_header::CollapsingState::load_with_default_open(
                             ui.ctx(),
@@ -452,19 +520,22 @@ impl SpaghettiApp {
                             if !enabled {
                                 ui.disable();
                             }
-                            let p = self.simulation.layout_state.params_mut();
                             changed |= ui
                                 .add(
-                                    egui::Slider::new(&mut p.container_repulsion, 10.0..=100_000.0)
+                                    egui::Slider::new(&mut strength, 10.0..=100_000.0)
                                         .logarithmic(true)
                                         .text("Strength"),
                                 )
                                 .changed();
                         });
-                        self.simulation
+                        if let Some(cr) = self
+                            .simulation
                             .layout_state
-                            .params_mut()
-                            .container_repulsion_enabled = enabled;
+                            .force_mut::<layout::forces::ContainerRepulsion>()
+                        {
+                            cr.enabled = enabled;
+                            cr.strength = strength;
+                        }
                     }
 
                     ui.add_space(16.0);
@@ -474,15 +545,13 @@ impl SpaghettiApp {
                     ui.separator();
 
                     {
-                        let params = self.simulation.layout_state.params_mut();
+                        let state = &mut self.simulation.layout_state;
                         changed |= ui
-                            .add(
-                                egui::Slider::new(&mut params.damping, 0.01..=0.99).text("Damping"),
-                            )
+                            .add(egui::Slider::new(&mut state.damping, 0.01..=0.99).text("Damping"))
                             .changed();
                         changed |= ui
                             .add(
-                                egui::Slider::new(&mut params.max_velocity, 1.0..=200.0)
+                                egui::Slider::new(&mut state.max_velocity, 1.0..=200.0)
                                     .text("Max vel"),
                             )
                             .changed();
@@ -490,7 +559,9 @@ impl SpaghettiApp {
 
                     ui.add_space(4.0);
                     if ui.button("Reset to defaults").clicked() {
-                        *self.simulation.layout_state.params_mut() = layout::ForceParams::default();
+                        self.simulation
+                            .layout_state
+                            .import_params(&layout::ForceParams::default());
                         changed = true;
                     }
 

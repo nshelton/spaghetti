@@ -227,7 +227,11 @@ pub struct LayoutState {
     visible_edge_kinds: Vec<EdgeKind>,
     id_to_idx: IndexMap<SymbolId, usize>,
     pins: IndexMap<SymbolId, Vec2>,
-    params: ForceParams,
+    /// Velocity damping factor applied each step (lower = more damping).
+    pub damping: f32,
+    /// Maximum velocity magnitude per node per step. Prevents wild
+    /// overshooting when forces are large.
+    pub max_velocity: f32,
     /// Per-node edge degree (number of edges touching this node).
     /// Used to normalize spring forces on high-degree hubs.
     degrees: Vec<f32>,
@@ -406,7 +410,8 @@ impl LayoutState {
             visible_edge_kinds,
             id_to_idx,
             pins: IndexMap::new(),
-            params,
+            damping: params.damping,
+            max_velocity: params.max_velocity,
             degrees,
             total_steps: 0,
             active,
@@ -439,60 +444,89 @@ impl LayoutState {
     }
 
     /// Snapshot the current tunable parameters into a [`ForceParams`]
-    /// struct for serialization to `spaghetti_settings.json`.
+    /// struct for serialization to `spaghetti_settings.json`. Reads
+    /// each value from its canonical home: integration params come from
+    /// `self`, force-specific params come from the pipeline entries.
     pub fn export_params(&self) -> ForceParams {
-        self.params.clone()
+        let mut out = ForceParams {
+            damping: self.damping,
+            max_velocity: self.max_velocity,
+            ..ForceParams::default()
+        };
+        if let Some(r) = self.force::<forces::Repulsion>() {
+            out.repulsion = r.strength;
+            out.repulsion_cutoff = r.cutoff;
+            out.min_dist = r.min_dist;
+            out.repulsion_enabled = r.enabled;
+        }
+        if let Some(s) = self.force::<forces::SpringAttraction>() {
+            out.attraction = s.global_attraction;
+            out.ideal_length = s.global_ideal_length;
+            out.attraction_enabled = s.enabled;
+            out.edge_params.clone_from(&s.edge_params);
+        }
+        if let Some(g) = self.force::<forces::Gravity>() {
+            out.gravity = g.strength;
+            out.gravity_enabled = g.enabled;
+        }
+        if let Some(l) = self.force::<forces::LocationAffinity>() {
+            out.location_strength = l.strength;
+            out.location_falloff = l.falloff;
+            out.location_enabled = l.enabled;
+        }
+        if let Some(c) = self.force::<forces::Containment>() {
+            out.containment_strength = c.strength;
+            out.containment_enabled = c.enabled;
+        }
+        if let Some(cr) = self.force::<forces::ContainerRepulsion>() {
+            out.container_repulsion = cr.strength;
+            out.container_repulsion_enabled = cr.enabled;
+        }
+        out
     }
 
-    /// Apply a [`ForceParams`] snapshot to the simulation. Individual
-    /// force params are propagated into the pipeline on the next
-    /// [`step`](Self::step) via the same sync mechanism `params_mut`
-    /// already uses.
+    /// Apply a [`ForceParams`] snapshot to the simulation, writing
+    /// each value directly into its canonical home (integration params
+    /// on `self`, force params on the pipeline entries).
     pub fn import_params(&mut self, params: &ForceParams) {
-        self.params = params.clone();
-    }
-
-    /// Copy parameter values from [`ForceParams`] into each pipeline
-    /// force. Runs once per `step_inner` call so UI-driven param edits
-    /// take effect immediately without plumbing a setter per field.
-    fn sync_forces_from_params(&mut self) {
-        let p = self.params.clone();
+        self.damping = params.damping;
+        self.max_velocity = params.max_velocity;
         for force in self.forces.iter_mut() {
             let any = force.as_any_mut();
             if let Some(g) = any.downcast_mut::<forces::Gravity>() {
-                g.strength = p.gravity;
-                g.enabled = p.gravity_enabled;
+                g.strength = params.gravity;
+                g.enabled = params.gravity_enabled;
                 continue;
             }
             if let Some(r) = any.downcast_mut::<forces::Repulsion>() {
-                r.strength = p.repulsion;
-                r.cutoff = p.repulsion_cutoff;
-                r.min_dist = p.min_dist;
-                r.enabled = p.repulsion_enabled;
+                r.strength = params.repulsion;
+                r.cutoff = params.repulsion_cutoff;
+                r.min_dist = params.min_dist;
+                r.enabled = params.repulsion_enabled;
                 continue;
             }
             if let Some(s) = any.downcast_mut::<forces::SpringAttraction>() {
-                s.global_attraction = p.attraction;
-                s.global_ideal_length = p.ideal_length;
-                s.min_dist = p.min_dist;
-                s.enabled = p.attraction_enabled;
-                s.edge_params.clone_from(&p.edge_params);
+                s.global_attraction = params.attraction;
+                s.global_ideal_length = params.ideal_length;
+                s.min_dist = params.min_dist;
+                s.enabled = params.attraction_enabled;
+                s.edge_params.clone_from(&params.edge_params);
                 continue;
             }
             if let Some(l) = any.downcast_mut::<forces::LocationAffinity>() {
-                l.strength = p.location_strength;
-                l.falloff = p.location_falloff;
-                l.enabled = p.location_enabled;
+                l.strength = params.location_strength;
+                l.falloff = params.location_falloff;
+                l.enabled = params.location_enabled;
                 continue;
             }
             if let Some(c) = any.downcast_mut::<forces::Containment>() {
-                c.strength = p.containment_strength;
-                c.enabled = p.containment_enabled;
+                c.strength = params.containment_strength;
+                c.enabled = params.containment_enabled;
                 continue;
             }
             if let Some(cr) = any.downcast_mut::<forces::ContainerRepulsion>() {
-                cr.strength = p.container_repulsion;
-                cr.enabled = p.container_repulsion_enabled;
+                cr.strength = params.container_repulsion;
+                cr.enabled = params.container_repulsion_enabled;
                 continue;
             }
         }
@@ -529,8 +563,6 @@ impl LayoutState {
         if len == 0 {
             return;
         }
-
-        self.sync_forces_from_params();
 
         for _ in 0..n {
             if early_stop && self.energy() < EARLY_STOP_ENERGY {
@@ -576,9 +608,9 @@ impl LayoutState {
     /// slot, so the work parallelises without contention.
     fn integrate(&mut self, forces: &[Vec2]) {
         let cooling = (1.0 - (self.total_steps as f32 / 300.0).min(0.95)).max(0.05);
-        let effective_damping = self.params.damping * cooling;
-        let max_vel = self.params.max_velocity * cooling;
-        let max_force = self.params.max_velocity * 2.0;
+        let effective_damping = self.damping * cooling;
+        let max_vel = self.max_velocity * cooling;
+        let max_force = self.max_velocity * 2.0;
         self.total_steps += 1;
 
         let n = self.positions.len();
@@ -729,16 +761,6 @@ impl LayoutState {
     /// layout has settled and repaints can stop.
     pub fn energy(&self) -> f32 {
         self.velocities.iter().map(|v| v.length_squared()).sum()
-    }
-
-    /// Shared reference to the current force parameters.
-    pub fn params(&self) -> &ForceParams {
-        &self.params
-    }
-
-    /// Mutable reference to the force parameters for live-tweaking.
-    pub fn params_mut(&mut self) -> &mut ForceParams {
-        &mut self.params
     }
 
     /// Partially reset the cooling schedule so parameter changes take visible
