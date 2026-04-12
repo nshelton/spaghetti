@@ -262,6 +262,10 @@ pub struct LayoutState {
     /// Groups of sibling container indices (containers sharing the same parent).
     /// Container repulsion only acts within each sibling group.
     sibling_groups: Vec<Vec<usize>>,
+    /// Composable force pipeline. Forces are progressively extracted out of
+    /// `step_inner` into this list (see issue #33). On each step, every
+    /// enabled force accumulates contributions into the shared force buffer.
+    forces: Vec<Box<dyn forces::Force>>,
 }
 
 impl LayoutState {
@@ -360,6 +364,16 @@ impl LayoutState {
         let collapse_hidden = HashSet::new();
         let hidden = HashSet::new();
 
+        // Build the force pipeline. Forces are progressively extracted out
+        // of the inline code in `step_inner` (see issue #33). Each force
+        // carries its own enabled flag and tunable parameters, kept in sync
+        // with `ForceParams` via `sync_forces_from_params` until Phase 3
+        // removes the facade entirely.
+        let force_pipeline: Vec<Box<dyn forces::Force>> = vec![Box::new(forces::Gravity::new(
+            params.gravity,
+            params.gravity_enabled,
+        ))];
+
         Self {
             ids,
             positions,
@@ -383,6 +397,23 @@ impl LayoutState {
             external_hidden: HashSet::new(),
             sizes: vec![Vec2::new(120.0, 30.0); n],
             sibling_groups,
+            forces: force_pipeline,
+        }
+    }
+
+    /// Copy parameter values from the legacy [`ForceParams`] struct into
+    /// each extracted force. This keeps the existing `params_mut()` /
+    /// settings-load flow working while forces are progressively extracted.
+    /// Phase 3 of issue #33 will replace it with `export_params` /
+    /// `import_params` and remove `ForceParams` from `LayoutState`.
+    fn sync_forces_from_params(&mut self) {
+        let gravity_strength = self.params.gravity;
+        let gravity_enabled = self.params.gravity_enabled;
+        for force in self.forces.iter_mut() {
+            if let Some(g) = force.as_any_mut().downcast_mut::<forces::Gravity>() {
+                g.strength = gravity_strength;
+                g.enabled = gravity_enabled;
+            }
         }
     }
 
@@ -420,6 +451,11 @@ impl LayoutState {
         if len == 0 {
             return;
         }
+
+        // Push the latest tunable values from `self.params` into any
+        // already-extracted forces before stepping.
+        self.sync_forces_from_params();
+
         let p = &self.params;
 
         for _ in 0..n {
@@ -606,25 +642,33 @@ impl LayoutState {
                 }
             }
 
-            // Gravity: gentle pull toward the centroid (skip hidden)
-            if p.gravity_enabled && p.gravity > 0.0 {
-                let mut centroid = Vec2::ZERO;
-                let mut visible_count = 0u32;
-                for (i, pos) in self.positions.iter().enumerate() {
-                    if !self.hidden.contains(&i) {
-                        centroid += *pos;
-                        visible_count += 1;
-                    }
-                }
-                if visible_count > 0 {
-                    centroid /= visible_count as f32;
-                    for (i, (force, pos)) in
-                        forces.iter_mut().zip(self.positions.iter()).enumerate()
-                    {
-                        if !self.hidden.contains(&i) {
-                            *force += (centroid - *pos) * p.gravity;
-                        }
-                    }
+            // --- Extracted forces pipeline (issue #33) ---
+            //
+            // Forces that have been migrated out of this inline code run
+            // through the trait-based pipeline. Currently: gravity. Future
+            // extractions (repulsion, spring attraction, etc.) will append
+            // to `self.forces` and delete more of the inline code.
+            //
+            // `active` is rebuilt per-step from the current hidden set. Step
+            // 1c of the refactor will replace this with a persistent
+            // `Vec<bool>` on `LayoutState` (see the §1 optimization).
+            let active: Vec<bool> = (0..len).map(|i| !self.hidden.contains(&i)).collect();
+            let ctx = forces::ForceContext {
+                positions: &self.positions,
+                sizes: &self.sizes,
+                degrees: &self.degrees,
+                active: &active,
+                edge_pairs: &self.edge_pairs,
+                visible_edge_kinds: &self.visible_edge_kinds,
+                children_of: &self.children_of,
+                containers: &self.containers,
+                expanded: &self.expanded,
+                toplevel_containers: &self.toplevel_containers,
+                node_count: len,
+            };
+            for force in &self.forces {
+                if force.enabled() {
+                    force.apply(&ctx, &mut forces);
                 }
             }
 

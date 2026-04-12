@@ -7,15 +7,19 @@
 //! and references, so forces always see the current positions, sizes,
 //! visibility, and topology.
 //!
-//! This module is currently scaffolding: the individual force
-//! implementations (repulsion, spring attraction, gravity, location affinity,
-//! containment, container repulsion) will be added in later steps of the
-//! layout refactor. Until then, [`crate::LayoutState::step_inner`] continues
-//! to compute forces inline.
+//! Forces are progressively extracted from [`crate::LayoutState::step_inner`]
+//! into this module. Each extraction step leaves the simulation's overall
+//! behavior unchanged — the inline computation is replaced with a call into
+//! the pipeline. See issue #33 for the full migration plan.
 
 use core_ir::EdgeKind;
 use glam::Vec2;
+use std::any::Any;
 use std::collections::HashSet;
+
+pub mod gravity;
+
+pub use gravity::Gravity;
 
 /// Read-only snapshot of simulation state shared with every [`Force`] during
 /// a single simulation step.
@@ -75,7 +79,13 @@ pub struct ForceContext<'a> {
 /// force application across rayon threads. Within a single `apply` call,
 /// forces read only the shared context and write only into their slice of
 /// the `forces` buffer — no interior mutability required.
-pub trait Force: Send + Sync {
+///
+/// The `Any` super-trait allows [`crate::LayoutState`] to downcast boxed
+/// forces back to their concrete type. This is used internally to sync
+/// parameters from the legacy [`crate::ForceParams`] struct, and will later
+/// back the `force::<T>()` / `force_mut::<T>()` typed accessors used by the
+/// viz crate (see issue #33, Phase 3).
+pub trait Force: Any + Send + Sync {
     /// Short human-readable identifier, used for UI headers and debug logs.
     fn name(&self) -> &str;
 
@@ -93,4 +103,10 @@ pub trait Force: Send + Sync {
     /// - Add to `forces[i]` rather than overwrite — multiple forces stack.
     /// - Avoid reading or writing outside `0..ctx.node_count`.
     fn apply(&self, ctx: &ForceContext, forces: &mut [Vec2]);
+
+    /// Upcast to `&dyn Any` so callers can downcast to the concrete type.
+    fn as_any(&self) -> &dyn Any;
+
+    /// Upcast to `&mut dyn Any` so callers can downcast to the concrete type.
+    fn as_any_mut(&mut self) -> &mut dyn Any;
 }
