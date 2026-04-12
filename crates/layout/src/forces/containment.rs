@@ -2,7 +2,7 @@
 //! their shared centroid.
 //!
 //! Each non-hidden container with at least two visible children computes
-//! the centroid of those children and pulls every child toward it by
+//! the centroid of those children and pulls each child toward it by
 //! `strength * (centroid - position)`. Top-level containers (namespaces,
 //! translation units) use half strength so class-level containment wins
 //! the tug-of-war.
@@ -29,10 +29,6 @@ impl Containment {
 }
 
 impl Force for Containment {
-    fn name(&self) -> &str {
-        "containment"
-    }
-
     fn enabled(&self) -> bool {
         self.enabled
     }
@@ -92,102 +88,35 @@ impl Force for Containment {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use core_ir::EdgeKind;
-    use std::collections::HashSet;
-
-    fn mk_ctx<'a>(
-        positions: &'a [Vec2],
-        active: &'a [bool],
-        children_of: &'a [Vec<usize>],
-        containers: &'a HashSet<usize>,
-        expanded: &'a HashSet<usize>,
-        toplevel: &'a HashSet<usize>,
-        sizes: &'a [Vec2],
-        degrees: &'a [f32],
-        edge_pairs: &'a [(usize, usize, EdgeKind)],
-        visible_edge_kinds: &'a [EdgeKind],
-    ) -> ForceContext<'a> {
-        ForceContext {
-            positions,
-            sizes,
-            degrees,
-            active,
-            edge_pairs,
-            visible_edge_kinds,
-            children_of,
-            containers,
-            expanded,
-            toplevel_containers: toplevel,
-            node_count: positions.len(),
-        }
-    }
+    use crate::forces::test_utils::TestCtx;
 
     #[test]
     fn singleton_child_receives_no_force() {
-        // Container 0 with a single child 1 — needs two visible children
-        // to do anything.
-        let positions = vec![Vec2::ZERO, Vec2::new(10.0, 0.0)];
-        let active = vec![true, true];
-        let children_of: Vec<Vec<usize>> = vec![vec![1], vec![]];
-        let mut containers = HashSet::new();
-        containers.insert(0);
-        let expanded = HashSet::new();
-        let toplevel = HashSet::new();
-        let sizes = vec![Vec2::ZERO; 2];
-        let degrees = vec![1.0; 2];
-        let edge_pairs: Vec<(usize, usize, EdgeKind)> = vec![];
-        let visible: Vec<EdgeKind> = vec![];
+        // Container 0 with a single child 1 needs at least two visible
+        // children to produce any force.
+        let mut tc = TestCtx::new(vec![Vec2::ZERO, Vec2::new(10.0, 0.0)]);
+        tc.children_of[0] = vec![1];
+        tc.containers.insert(0);
 
-        let ctx = mk_ctx(
-            &positions,
-            &active,
-            &children_of,
-            &containers,
-            &expanded,
-            &toplevel,
-            &sizes,
-            &degrees,
-            &edge_pairs,
-            &visible,
-        );
         let mut forces = vec![Vec2::ZERO; 2];
-        Containment::new(1.0, true).apply(&ctx, &mut forces);
+        Containment::new(1.0, true).apply(&tc.view(), &mut forces);
         assert_eq!(forces, vec![Vec2::ZERO; 2]);
     }
 
     #[test]
     fn two_children_pulled_to_their_centroid() {
         // Container 0 contains children 1 and 2 symmetric around origin.
-        let positions = vec![
-            Vec2::new(100.0, 100.0), // container (unused by children pull)
+        let mut tc = TestCtx::new(vec![
+            Vec2::new(100.0, 100.0),
             Vec2::new(10.0, 0.0),
             Vec2::new(-10.0, 0.0),
-        ];
-        let active = vec![true, true, true];
-        let children_of: Vec<Vec<usize>> = vec![vec![1, 2], vec![], vec![]];
-        let mut containers = HashSet::new();
-        containers.insert(0);
-        let expanded = HashSet::new();
-        let toplevel = HashSet::new();
-        let sizes = vec![Vec2::ZERO; 3];
-        let degrees = vec![1.0; 3];
-        let edge_pairs: Vec<(usize, usize, EdgeKind)> = vec![];
-        let visible: Vec<EdgeKind> = vec![];
+        ]);
+        tc.children_of[0] = vec![1, 2];
+        tc.containers.insert(0);
 
-        let ctx = mk_ctx(
-            &positions,
-            &active,
-            &children_of,
-            &containers,
-            &expanded,
-            &toplevel,
-            &sizes,
-            &degrees,
-            &edge_pairs,
-            &visible,
-        );
         let mut forces = vec![Vec2::ZERO; 3];
-        Containment::new(1.0, true).apply(&ctx, &mut forces);
+        Containment::new(1.0, true).apply(&tc.view(), &mut forces);
+
         // Centroid of children = origin. Each child pulled toward origin
         // by 1.0 * displacement.
         assert_eq!(forces[0], Vec2::ZERO);
@@ -197,33 +126,17 @@ mod tests {
 
     #[test]
     fn toplevel_container_uses_half_strength() {
-        let positions = vec![Vec2::ZERO, Vec2::new(10.0, 0.0), Vec2::new(-10.0, 0.0)];
-        let active = vec![true, true, true];
-        let children_of: Vec<Vec<usize>> = vec![vec![1, 2], vec![], vec![]];
-        let mut containers = HashSet::new();
-        containers.insert(0);
-        let expanded = HashSet::new();
-        let mut toplevel = HashSet::new();
-        toplevel.insert(0);
-        let sizes = vec![Vec2::ZERO; 3];
-        let degrees = vec![1.0; 3];
-        let edge_pairs: Vec<(usize, usize, EdgeKind)> = vec![];
-        let visible: Vec<EdgeKind> = vec![];
+        let mut tc = TestCtx::new(vec![
+            Vec2::ZERO,
+            Vec2::new(10.0, 0.0),
+            Vec2::new(-10.0, 0.0),
+        ]);
+        tc.children_of[0] = vec![1, 2];
+        tc.containers.insert(0);
+        tc.toplevel_containers.insert(0);
 
-        let ctx = mk_ctx(
-            &positions,
-            &active,
-            &children_of,
-            &containers,
-            &expanded,
-            &toplevel,
-            &sizes,
-            &degrees,
-            &edge_pairs,
-            &visible,
-        );
         let mut forces = vec![Vec2::ZERO; 3];
-        Containment::new(1.0, true).apply(&ctx, &mut forces);
+        Containment::new(1.0, true).apply(&tc.view(), &mut forces);
         // Half strength → 0.5 * displacement.
         assert_eq!(forces[1], Vec2::new(-5.0, 0.0));
         assert_eq!(forces[2], Vec2::new(5.0, 0.0));
@@ -233,37 +146,18 @@ mod tests {
     fn hidden_child_excluded_from_centroid_and_application() {
         // Child 3 is hidden and way off to the side; it must not
         // participate in the centroid or receive a force.
-        let positions = vec![
+        let mut tc = TestCtx::new(vec![
             Vec2::ZERO,
             Vec2::new(10.0, 0.0),
             Vec2::new(-10.0, 0.0),
             Vec2::new(1000.0, 1000.0),
-        ];
-        let active = vec![true, true, true, false];
-        let children_of: Vec<Vec<usize>> = vec![vec![1, 2, 3], vec![], vec![], vec![]];
-        let mut containers = HashSet::new();
-        containers.insert(0);
-        let expanded = HashSet::new();
-        let toplevel = HashSet::new();
-        let sizes = vec![Vec2::ZERO; 4];
-        let degrees = vec![1.0; 4];
-        let edge_pairs: Vec<(usize, usize, EdgeKind)> = vec![];
-        let visible: Vec<EdgeKind> = vec![];
+        ]);
+        tc.active[3] = false;
+        tc.children_of[0] = vec![1, 2, 3];
+        tc.containers.insert(0);
 
-        let ctx = mk_ctx(
-            &positions,
-            &active,
-            &children_of,
-            &containers,
-            &expanded,
-            &toplevel,
-            &sizes,
-            &degrees,
-            &edge_pairs,
-            &visible,
-        );
         let mut forces = vec![Vec2::ZERO; 4];
-        Containment::new(1.0, true).apply(&ctx, &mut forces);
+        Containment::new(1.0, true).apply(&tc.view(), &mut forces);
 
         assert_eq!(forces[3], Vec2::ZERO);
         // Centroid computed from 1 and 2 only = (0, 0).

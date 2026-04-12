@@ -235,9 +235,7 @@ pub struct LayoutState {
     /// Per-node visibility flag. `active[i] == true` means node `i`
     /// participates in the simulation this step. Rebuilt from
     /// [`Self::collapse_hidden`] and [`Self::external_hidden`] by
-    /// [`Self::rebuild_active`]. Kept as a dense `Vec<bool>` so the hot
-    /// path can test visibility with an array lookup instead of a
-    /// `HashSet::contains` call (§1 of issue #33).
+    /// [`Self::rebuild_active`].
     active: Vec<bool>,
     /// Maps each node index to its parent container index (via Contains edges).
     parent_of: Vec<Option<usize>>,
@@ -260,9 +258,9 @@ pub struct LayoutState {
     /// Per-node bounding box sizes in world units. Used for size-aware
     /// repulsion (edge-to-edge distance instead of center-to-center).
     sizes: Vec<Vec2>,
-    /// Composable force pipeline. Forces are progressively extracted out of
-    /// `step_inner` into this list (see issue #33). On each step, every
-    /// enabled force accumulates contributions into the shared force buffer.
+    /// Composable force pipeline run each step. Every enabled force
+    /// accumulates contributions into a shared buffer that is then
+    /// integrated into velocities and positions.
     forces: Vec<Box<dyn forces::Force>>,
 }
 
@@ -366,11 +364,6 @@ impl LayoutState {
         let external_hidden = vec![false; n];
         let active = vec![true; n];
 
-        // Build the force pipeline. Forces are progressively extracted out
-        // of the inline code in `step_inner` (see issue #33). Each force
-        // carries its own enabled flag and tunable parameters, kept in sync
-        // with `ForceParams` via `sync_forces_from_params` until Phase 3
-        // removes the facade entirely.
         let force_pipeline: Vec<Box<dyn forces::Force>> = vec![
             Box::new(forces::Repulsion::new(
                 params.repulsion,
@@ -428,69 +421,47 @@ impl LayoutState {
         }
     }
 
-    /// Copy parameter values from the legacy [`ForceParams`] struct into
-    /// each extracted force. This keeps the existing `params_mut()` /
-    /// settings-load flow working while forces are progressively extracted.
-    /// Phase 3 of issue #33 will replace it with `export_params` /
-    /// `import_params` and remove `ForceParams` from `LayoutState`.
+    /// Copy parameter values from [`ForceParams`] into each pipeline
+    /// force. Runs once per `step_inner` call so UI-driven param edits
+    /// take effect immediately without plumbing a setter per field.
     fn sync_forces_from_params(&mut self) {
-        // Snapshot relevant scalars first — we can't hold `&self.params`
-        // while also mutably iterating `self.forces`. `edge_params` is
-        // cloned because `SpringAttraction` owns its own copy.
-        let gravity_strength = self.params.gravity;
-        let gravity_enabled = self.params.gravity_enabled;
-        let repulsion_strength = self.params.repulsion;
-        let repulsion_cutoff = self.params.repulsion_cutoff;
-        let repulsion_min_dist = self.params.min_dist;
-        let repulsion_enabled = self.params.repulsion_enabled;
-        let attraction_strength = self.params.attraction;
-        let attraction_ideal_length = self.params.ideal_length;
-        let attraction_min_dist = self.params.min_dist;
-        let attraction_enabled = self.params.attraction_enabled;
-        let attraction_edge_params = self.params.edge_params.clone();
-        let location_strength = self.params.location_strength;
-        let location_falloff = self.params.location_falloff;
-        let location_enabled = self.params.location_enabled;
-        let containment_strength = self.params.containment_strength;
-        let containment_enabled = self.params.containment_enabled;
-        let container_repulsion_strength = self.params.container_repulsion;
-        let container_repulsion_enabled = self.params.container_repulsion_enabled;
+        let p = self.params.clone();
         for force in self.forces.iter_mut() {
             let any = force.as_any_mut();
             if let Some(g) = any.downcast_mut::<forces::Gravity>() {
-                g.strength = gravity_strength;
-                g.enabled = gravity_enabled;
+                g.strength = p.gravity;
+                g.enabled = p.gravity_enabled;
                 continue;
             }
             if let Some(r) = any.downcast_mut::<forces::Repulsion>() {
-                r.strength = repulsion_strength;
-                r.cutoff = repulsion_cutoff;
-                r.min_dist = repulsion_min_dist;
-                r.enabled = repulsion_enabled;
+                r.strength = p.repulsion;
+                r.cutoff = p.repulsion_cutoff;
+                r.min_dist = p.min_dist;
+                r.enabled = p.repulsion_enabled;
                 continue;
             }
             if let Some(s) = any.downcast_mut::<forces::SpringAttraction>() {
-                s.global_attraction = attraction_strength;
-                s.global_ideal_length = attraction_ideal_length;
-                s.min_dist = attraction_min_dist;
-                s.enabled = attraction_enabled;
-                s.edge_params = attraction_edge_params.clone();
+                s.global_attraction = p.attraction;
+                s.global_ideal_length = p.ideal_length;
+                s.min_dist = p.min_dist;
+                s.enabled = p.attraction_enabled;
+                s.edge_params.clone_from(&p.edge_params);
                 continue;
             }
             if let Some(l) = any.downcast_mut::<forces::LocationAffinity>() {
-                l.strength = location_strength;
-                l.falloff = location_falloff;
-                l.enabled = location_enabled;
+                l.strength = p.location_strength;
+                l.falloff = p.location_falloff;
+                l.enabled = p.location_enabled;
                 continue;
             }
             if let Some(c) = any.downcast_mut::<forces::Containment>() {
-                c.strength = containment_strength;
-                c.enabled = containment_enabled;
+                c.strength = p.containment_strength;
+                c.enabled = p.containment_enabled;
                 continue;
             }
             if let Some(cr) = any.downcast_mut::<forces::ContainerRepulsion>() {
-                cr.strength = container_repulsion_strength;
-                cr.enabled = container_repulsion_enabled;
+                cr.strength = p.container_repulsion;
+                cr.enabled = p.container_repulsion_enabled;
                 continue;
             }
         }
@@ -528,8 +499,6 @@ impl LayoutState {
             return;
         }
 
-        // Push the latest tunable values from `self.params` into the
-        // force pipeline once per call.
         self.sync_forces_from_params();
 
         for _ in 0..n {

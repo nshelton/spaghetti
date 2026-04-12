@@ -7,10 +7,9 @@
 //! stays laid out relative to itself while the whole block slides.
 //!
 //! Containers are grouped by their shared parent (sibling groups) so
-//! unrelated containers at different tree levels can't repel each other,
-//! only direct siblings can. A grid indexed by maximum container extent
-//! keeps the per-group comparison to a 3×3 neighbourhood instead of
-//! `O(S²)` pairs.
+//! only direct siblings can repel each other. A grid indexed by the
+//! maximum container extent keeps per-group comparison to a 3×3
+//! neighbourhood instead of `O(S²)` pairs.
 
 use glam::Vec2;
 use std::any::Any;
@@ -22,13 +21,12 @@ use super::{Force, ForceContext};
 pub struct ContainerRepulsion {
     /// Whether this force is currently active.
     pub enabled: bool,
-    /// Overlap-depth coefficient. The force pushing each pair apart scales
-    /// linearly with `strength * overlap`.
+    /// Overlap-depth coefficient. The per-pair force scales linearly as
+    /// `strength * overlap`.
     pub strength: f32,
     /// Sibling groups: containers grouped by their shared parent.
-    /// `sibling_groups[i]` is a list of container indices whose direct
-    /// parent is the same. Top-level containers form a single group.
-    pub sibling_groups: Vec<Vec<usize>>,
+    /// Top-level containers form a single group.
+    sibling_groups: Vec<Vec<usize>>,
 }
 
 impl ContainerRepulsion {
@@ -44,10 +42,6 @@ impl ContainerRepulsion {
 }
 
 impl Force for ContainerRepulsion {
-    fn name(&self) -> &str {
-        "container_repulsion"
-    }
-
     fn enabled(&self) -> bool {
         self.enabled
     }
@@ -63,7 +57,6 @@ impl Force for ContainerRepulsion {
         let cr = self.strength;
 
         for group in &self.sibling_groups {
-            // Collect the expanded, visible containers in this group.
             let live_siblings: Vec<usize> = group
                 .iter()
                 .copied()
@@ -73,14 +66,12 @@ impl Force for ContainerRepulsion {
                 continue;
             }
 
-            // Grid-accelerated overlap detection: bucket containers by cell
-            // so we only check nearby pairs instead of all O(S²).
+            // Cell size = largest container extent so overlapping pairs
+            // are always in the same or adjacent cells.
             let max_extent = live_siblings
                 .iter()
                 .map(|&c| ctx.sizes[c].x.max(ctx.sizes[c].y))
                 .fold(0.0f32, f32::max);
-            // Cell size = largest container extent so overlapping pairs are
-            // always in the same or adjacent cells.
             let cell_size = max_extent.max(1.0);
             let inv_cell = 1.0 / cell_size;
 
@@ -91,7 +82,6 @@ impl Force for ContainerRepulsion {
                 grid.entry((cx, cy)).or_default().push(c);
             }
 
-            // Check each container against neighbours in a 3×3 cell window.
             for &a in &live_siblings {
                 let pos_a = ctx.positions[a];
                 let half_a = ctx.sizes[a] * 0.5;
@@ -105,19 +95,18 @@ impl Force for ContainerRepulsion {
                             continue;
                         };
                         for &b in bucket {
-                            // Avoid self-pairs and double-counting (a < b).
+                            // Avoid self-pairs and double-counting.
                             if b <= a {
                                 continue;
                             }
                             let pos_b = ctx.positions[b];
                             let half_b = ctx.sizes[b] * 0.5;
 
-                            // AABB overlap test on each axis.
                             let overlap_x = (half_a.x + half_b.x) - (pos_a.x - pos_b.x).abs();
                             let overlap_y = (half_a.y + half_b.y) - (pos_a.y - pos_b.y).abs();
 
                             if overlap_x <= 0.0 || overlap_y <= 0.0 {
-                                continue; // No overlap — skip.
+                                continue;
                             }
 
                             // Push apart along the axis of least overlap
@@ -129,7 +118,6 @@ impl Force for ContainerRepulsion {
                                 Vec2::new(0.0, delta.y.signum() * overlap_y * cr)
                             };
 
-                            // Rigid-body: move container + all descendants.
                             apply_force_to_subtree(a, f, forces, ctx.children_of, ctx.active);
                             apply_force_to_subtree(b, -f, forces, ctx.children_of, ctx.active);
                         }
@@ -149,8 +137,7 @@ impl Force for ContainerRepulsion {
 }
 
 /// Apply a force to a node and all its descendants (rigid-body
-/// translation). Walks the subtree via `children_of` without allocating.
-/// Descendants whose `active` flag is `false` are skipped.
+/// translation). Descendants whose `active` flag is `false` are skipped.
 fn apply_force_to_subtree(
     root: usize,
     force: Vec2,
@@ -159,7 +146,6 @@ fn apply_force_to_subtree(
     active: &[bool],
 ) {
     forces[root] += force;
-    // Use a manual stack to avoid recursion overhead.
     let mut stack: Vec<usize> = children_of[root].clone();
     while let Some(node) = stack.pop() {
         if active[node] {
@@ -172,136 +158,51 @@ fn apply_force_to_subtree(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use core_ir::EdgeKind;
-    use std::collections::HashSet;
-
-    fn mk_ctx<'a>(
-        positions: &'a [Vec2],
-        active: &'a [bool],
-        sizes: &'a [Vec2],
-        children_of: &'a [Vec<usize>],
-        containers: &'a HashSet<usize>,
-        expanded: &'a HashSet<usize>,
-        toplevel: &'a HashSet<usize>,
-        degrees: &'a [f32],
-        edge_pairs: &'a [(usize, usize, EdgeKind)],
-        visible_edge_kinds: &'a [EdgeKind],
-    ) -> ForceContext<'a> {
-        ForceContext {
-            positions,
-            sizes,
-            degrees,
-            active,
-            edge_pairs,
-            visible_edge_kinds,
-            children_of,
-            containers,
-            expanded,
-            toplevel_containers: toplevel,
-            node_count: positions.len(),
-        }
-    }
+    use crate::forces::test_utils::TestCtx;
 
     #[test]
     fn non_overlapping_siblings_unaffected() {
         // Two sibling containers 100 apart with half-size 10 — no overlap.
-        let positions = vec![Vec2::new(-50.0, 0.0), Vec2::new(50.0, 0.0)];
-        let active = vec![true, true];
-        let sizes = vec![Vec2::new(20.0, 20.0); 2];
-        let children_of: Vec<Vec<usize>> = vec![vec![], vec![]];
-        let containers = HashSet::from([0, 1]);
-        let expanded = HashSet::from([0, 1]);
-        let toplevel = HashSet::new();
-        let degrees = vec![1.0; 2];
-        let edge_pairs: Vec<(usize, usize, EdgeKind)> = vec![];
-        let visible: Vec<EdgeKind> = vec![];
+        let mut tc = TestCtx::new(vec![Vec2::new(-50.0, 0.0), Vec2::new(50.0, 0.0)]);
+        tc.sizes = vec![Vec2::new(20.0, 20.0); 2];
+        tc.containers.insert(0);
+        tc.containers.insert(1);
+        tc.expanded.insert(0);
+        tc.expanded.insert(1);
 
-        let ctx = mk_ctx(
-            &positions,
-            &active,
-            &sizes,
-            &children_of,
-            &containers,
-            &expanded,
-            &toplevel,
-            &degrees,
-            &edge_pairs,
-            &visible,
-        );
         let mut forces = vec![Vec2::ZERO; 2];
-        let sibling_groups = vec![vec![0, 1]];
-        ContainerRepulsion::new(1.0, sibling_groups, true).apply(&ctx, &mut forces);
+        ContainerRepulsion::new(1.0, vec![vec![0, 1]], true).apply(&tc.view(), &mut forces);
         assert_eq!(forces, vec![Vec2::ZERO; 2]);
     }
 
     #[test]
     fn overlapping_siblings_pushed_apart() {
         // Two expanded containers overlapping along the x axis.
-        // a at -5, b at +5, each 20 wide → centres 10 apart, extents
-        // touch across the full overlap zone.
-        let positions = vec![Vec2::new(-5.0, 0.0), Vec2::new(5.0, 0.0)];
-        let active = vec![true, true];
-        let sizes = vec![Vec2::new(20.0, 20.0); 2];
-        let children_of: Vec<Vec<usize>> = vec![vec![], vec![]];
-        let containers = HashSet::from([0, 1]);
-        let expanded = HashSet::from([0, 1]);
-        let toplevel = HashSet::new();
-        let degrees = vec![1.0; 2];
-        let edge_pairs: Vec<(usize, usize, EdgeKind)> = vec![];
-        let visible: Vec<EdgeKind> = vec![];
+        let mut tc = TestCtx::new(vec![Vec2::new(-5.0, 0.0), Vec2::new(5.0, 0.0)]);
+        tc.sizes = vec![Vec2::new(20.0, 20.0); 2];
+        tc.containers.insert(0);
+        tc.containers.insert(1);
+        tc.expanded.insert(0);
+        tc.expanded.insert(1);
 
-        let ctx = mk_ctx(
-            &positions,
-            &active,
-            &sizes,
-            &children_of,
-            &containers,
-            &expanded,
-            &toplevel,
-            &degrees,
-            &edge_pairs,
-            &visible,
-        );
         let mut forces = vec![Vec2::ZERO; 2];
-        let sibling_groups = vec![vec![0, 1]];
-        ContainerRepulsion::new(1.0, sibling_groups, true).apply(&ctx, &mut forces);
-        // Container a (at -x) pushed in -x, b (at +x) pushed in +x.
+        ContainerRepulsion::new(1.0, vec![vec![0, 1]], true).apply(&tc.view(), &mut forces);
+
         assert!(forces[0].x < 0.0);
         assert!(forces[1].x > 0.0);
-        // Newton's third law.
         assert!((forces[0] + forces[1]).length() < 1e-4);
     }
 
     #[test]
     fn collapsed_siblings_do_not_participate() {
-        // Same overlapping setup as the previous test, but neither
-        // container is expanded — force should be a no-op.
-        let positions = vec![Vec2::new(-5.0, 0.0), Vec2::new(5.0, 0.0)];
-        let active = vec![true, true];
-        let sizes = vec![Vec2::new(20.0, 20.0); 2];
-        let children_of: Vec<Vec<usize>> = vec![vec![], vec![]];
-        let containers = HashSet::from([0, 1]);
-        let expanded = HashSet::new(); // nothing expanded
-        let toplevel = HashSet::new();
-        let degrees = vec![1.0; 2];
-        let edge_pairs: Vec<(usize, usize, EdgeKind)> = vec![];
-        let visible: Vec<EdgeKind> = vec![];
+        // Same overlapping setup, but neither container is expanded.
+        let mut tc = TestCtx::new(vec![Vec2::new(-5.0, 0.0), Vec2::new(5.0, 0.0)]);
+        tc.sizes = vec![Vec2::new(20.0, 20.0); 2];
+        tc.containers.insert(0);
+        tc.containers.insert(1);
 
-        let ctx = mk_ctx(
-            &positions,
-            &active,
-            &sizes,
-            &children_of,
-            &containers,
-            &expanded,
-            &toplevel,
-            &degrees,
-            &edge_pairs,
-            &visible,
-        );
         let mut forces = vec![Vec2::ZERO; 2];
-        let sibling_groups = vec![vec![0, 1]];
-        ContainerRepulsion::new(1.0, sibling_groups, true).apply(&ctx, &mut forces);
+        ContainerRepulsion::new(1.0, vec![vec![0, 1]], true).apply(&tc.view(), &mut forces);
         assert_eq!(forces, vec![Vec2::ZERO; 2]);
     }
 
@@ -309,42 +210,26 @@ mod tests {
     fn force_applied_to_container_and_descendants() {
         // Container 0 has child 2; container 1 has child 3. Overlapping
         // siblings should have their subtrees translated rigidly.
-        let positions = vec![
+        let mut tc = TestCtx::new(vec![
             Vec2::new(-5.0, 0.0),
             Vec2::new(5.0, 0.0),
             Vec2::new(-5.0, 0.0),
             Vec2::new(5.0, 0.0),
-        ];
-        let active = vec![true; 4];
-        let sizes = vec![Vec2::new(20.0, 20.0); 4];
-        let children_of: Vec<Vec<usize>> = vec![vec![2], vec![3], vec![], vec![]];
-        let containers = HashSet::from([0, 1]);
-        let expanded = HashSet::from([0, 1]);
-        let toplevel = HashSet::new();
-        let degrees = vec![1.0; 4];
-        let edge_pairs: Vec<(usize, usize, EdgeKind)> = vec![];
-        let visible: Vec<EdgeKind> = vec![];
+        ]);
+        tc.sizes = vec![Vec2::new(20.0, 20.0); 4];
+        tc.children_of[0] = vec![2];
+        tc.children_of[1] = vec![3];
+        tc.containers.insert(0);
+        tc.containers.insert(1);
+        tc.expanded.insert(0);
+        tc.expanded.insert(1);
 
-        let ctx = mk_ctx(
-            &positions,
-            &active,
-            &sizes,
-            &children_of,
-            &containers,
-            &expanded,
-            &toplevel,
-            &degrees,
-            &edge_pairs,
-            &visible,
-        );
         let mut forces = vec![Vec2::ZERO; 4];
-        let sibling_groups = vec![vec![0, 1]];
-        ContainerRepulsion::new(1.0, sibling_groups, true).apply(&ctx, &mut forces);
+        ContainerRepulsion::new(1.0, vec![vec![0, 1]], true).apply(&tc.view(), &mut forces);
 
         // Container and its child get identical force vectors (rigid body).
         assert_eq!(forces[0], forces[2]);
         assert_eq!(forces[1], forces[3]);
-        // And the two subtrees get opposite pushes.
         assert!(forces[0].x < 0.0);
         assert!(forces[1].x > 0.0);
     }
