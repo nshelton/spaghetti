@@ -18,8 +18,16 @@ use std::any::Any;
 use std::collections::HashSet;
 
 pub mod gravity;
+pub mod repulsion;
 
 pub use gravity::Gravity;
+pub use repulsion::Repulsion;
+
+/// Threshold (in nodes) above which forces may parallelise their inner
+/// loops under rayon. For smaller graphs, the overhead of spawning work
+/// onto the thread pool outweighs the savings, so forces fall back to a
+/// serial implementation.
+pub(crate) const PARALLEL_THRESHOLD: usize = 500;
 
 /// Read-only snapshot of simulation state shared with every [`Force`] during
 /// a single simulation step.

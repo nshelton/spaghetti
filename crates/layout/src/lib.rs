@@ -12,7 +12,6 @@ pub mod forces;
 use core_ir::{EdgeKind, Graph, SymbolId, SymbolKind};
 use glam::Vec2;
 use indexmap::IndexMap;
-use rayon::prelude::*;
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::time::{Duration, Instant};
@@ -233,8 +232,13 @@ pub struct LayoutState {
     degrees: Vec<f32>,
     /// Total steps run so far, used for adaptive cooling.
     total_steps: u32,
-    /// Node indices that are hidden (excluded from all force computation).
-    hidden: HashSet<usize>,
+    /// Per-node visibility flag. `active[i] == true` means node `i`
+    /// participates in the simulation this step. Rebuilt from
+    /// [`Self::collapse_hidden`] and [`Self::external_hidden`] by
+    /// [`Self::rebuild_active`]. Kept as a dense `Vec<bool>` so the hot
+    /// path can test visibility with an array lookup instead of a
+    /// `HashSet::contains` call (§1 of issue #33).
+    active: Vec<bool>,
     /// Hierarchical directory groups for the location-affinity force.
     /// `dir_groups[depth][group_idx]` is a list of node indices sharing
     /// the same directory prefix at that depth.
@@ -252,10 +256,13 @@ pub struct LayoutState {
     toplevel_containers: HashSet<usize>,
     /// Which containers are currently expanded (children visible).
     expanded: HashSet<usize>,
-    /// Nodes hidden by collapse (tracked separately from file-tree hidden).
-    collapse_hidden: HashSet<usize>,
-    /// Nodes hidden by external callers (file-tree visibility).
-    external_hidden: HashSet<usize>,
+    /// Per-node collapse-hidden flag. Nodes marked `true` are currently
+    /// hidden by a collapsed ancestor container (tracked separately from
+    /// file-tree hidden).
+    collapse_hidden: Vec<bool>,
+    /// Per-node external-hidden flag. Nodes marked `true` are currently
+    /// hidden by an external caller (e.g. the file-tree visibility panel).
+    external_hidden: Vec<bool>,
     /// Per-node bounding box sizes in world units. Used for size-aware
     /// repulsion (edge-to-edge distance instead of center-to-center).
     sizes: Vec<Vec2>,
@@ -361,18 +368,27 @@ impl LayoutState {
         // simulation (visible, participate in forces) but are clamped
         // inside the collapsed container box each step.
         let expanded = HashSet::new();
-        let collapse_hidden = HashSet::new();
-        let hidden = HashSet::new();
+
+        // Visibility bookkeeping: both "hidden" sources start empty, so
+        // every node is active at construction time.
+        let collapse_hidden = vec![false; n];
+        let external_hidden = vec![false; n];
+        let active = vec![true; n];
 
         // Build the force pipeline. Forces are progressively extracted out
         // of the inline code in `step_inner` (see issue #33). Each force
         // carries its own enabled flag and tunable parameters, kept in sync
         // with `ForceParams` via `sync_forces_from_params` until Phase 3
         // removes the facade entirely.
-        let force_pipeline: Vec<Box<dyn forces::Force>> = vec![Box::new(forces::Gravity::new(
-            params.gravity,
-            params.gravity_enabled,
-        ))];
+        let force_pipeline: Vec<Box<dyn forces::Force>> = vec![
+            Box::new(forces::Repulsion::new(
+                params.repulsion,
+                params.repulsion_cutoff,
+                params.min_dist,
+                params.repulsion_enabled,
+            )),
+            Box::new(forces::Gravity::new(params.gravity, params.gravity_enabled)),
+        ];
 
         Self {
             ids,
@@ -385,7 +401,7 @@ impl LayoutState {
             params,
             degrees,
             total_steps: 0,
-            hidden,
+            active,
             dir_groups,
             max_dir_depth,
             parent_of,
@@ -394,7 +410,7 @@ impl LayoutState {
             toplevel_containers,
             expanded,
             collapse_hidden,
-            external_hidden: HashSet::new(),
+            external_hidden,
             sizes: vec![Vec2::new(120.0, 30.0); n],
             sibling_groups,
             forces: force_pipeline,
@@ -407,12 +423,27 @@ impl LayoutState {
     /// Phase 3 of issue #33 will replace it with `export_params` /
     /// `import_params` and remove `ForceParams` from `LayoutState`.
     fn sync_forces_from_params(&mut self) {
+        // Snapshot relevant scalars first — we can't hold `&self.params`
+        // while also mutably iterating `self.forces`.
         let gravity_strength = self.params.gravity;
         let gravity_enabled = self.params.gravity_enabled;
+        let repulsion_strength = self.params.repulsion;
+        let repulsion_cutoff = self.params.repulsion_cutoff;
+        let repulsion_min_dist = self.params.min_dist;
+        let repulsion_enabled = self.params.repulsion_enabled;
         for force in self.forces.iter_mut() {
-            if let Some(g) = force.as_any_mut().downcast_mut::<forces::Gravity>() {
+            let any = force.as_any_mut();
+            if let Some(g) = any.downcast_mut::<forces::Gravity>() {
                 g.strength = gravity_strength;
                 g.enabled = gravity_enabled;
+                continue;
+            }
+            if let Some(r) = any.downcast_mut::<forces::Repulsion>() {
+                r.strength = repulsion_strength;
+                r.cutoff = repulsion_cutoff;
+                r.min_dist = repulsion_min_dist;
+                r.enabled = repulsion_enabled;
+                continue;
             }
         }
     }
@@ -443,9 +474,6 @@ impl LayoutState {
     fn step_inner(&mut self, n: u32, early_stop: bool) {
         /// Energy threshold below which batch layout stops early.
         const EARLY_STOP_ENERGY: f32 = 0.5;
-        /// Threshold below which we use serial computation (rayon overhead not
-        /// worth it for small graphs).
-        const PARALLEL_THRESHOLD: usize = 500;
 
         let len = self.positions.len();
         if len == 0 {
@@ -463,77 +491,9 @@ impl LayoutState {
                 break;
             }
 
-            // --- Repulsive forces via grid-based cutoff ---
-            let mut forces = if p.repulsion_enabled {
-                let cutoff = p.repulsion_cutoff;
-                let cutoff_sq = cutoff * cutoff;
-                let inv_cutoff = 1.0 / cutoff;
-                let repulsion = p.repulsion;
-                let min_dist = p.min_dist;
-
-                // Build spatial grid: assign each node to a cell (skip hidden).
-                let cell_keys: Vec<(i32, i32)> = self
-                    .positions
-                    .iter()
-                    .map(|pos| {
-                        let cx = (pos.x * inv_cutoff).floor() as i32;
-                        let cy = (pos.y * inv_cutoff).floor() as i32;
-                        (cx, cy)
-                    })
-                    .collect();
-
-                let mut grid: HashMap<(i32, i32), Vec<usize>> = HashMap::with_capacity(len / 4 + 1);
-                for (i, &key) in cell_keys.iter().enumerate() {
-                    if !self.hidden.contains(&i) {
-                        grid.entry(key).or_default().push(i);
-                    }
-                }
-
-                let positions_ref = &self.positions;
-                let grid_ref = &grid;
-                let hidden_ref = &self.hidden;
-
-                if len >= PARALLEL_THRESHOLD {
-                    (0..len)
-                        .into_par_iter()
-                        .map(|i| {
-                            if hidden_ref.contains(&i) {
-                                return Vec2::ZERO;
-                            }
-                            compute_repulsion_for_node(
-                                i,
-                                positions_ref,
-                                grid_ref,
-                                &cell_keys,
-                                cutoff_sq,
-                                inv_cutoff,
-                                repulsion,
-                                min_dist,
-                            )
-                        })
-                        .collect()
-                } else {
-                    (0..len)
-                        .map(|i| {
-                            if hidden_ref.contains(&i) {
-                                return Vec2::ZERO;
-                            }
-                            compute_repulsion_for_node(
-                                i,
-                                positions_ref,
-                                grid_ref,
-                                &cell_keys,
-                                cutoff_sq,
-                                inv_cutoff,
-                                repulsion,
-                                min_dist,
-                            )
-                        })
-                        .collect()
-                }
-            } else {
-                vec![Vec2::ZERO; len]
-            };
+            // Fresh accumulator for this iteration. Repulsion now runs as
+            // a `Force` further down instead of seeding this buffer itself.
+            let mut forces = vec![Vec2::ZERO; len];
 
             // Attractive forces along visible edges only (per-edge-kind params).
             //
@@ -545,7 +505,7 @@ impl LayoutState {
                     if !self.visible_edge_kinds.contains(&kind) {
                         continue;
                     }
-                    if self.hidden.contains(&from) || self.hidden.contains(&to) {
+                    if !self.active[from] || !self.active[to] {
                         continue;
                     }
                     let (attr, rest_len) = if let Some(ep) = p.edge_params.get(&kind) {
@@ -568,7 +528,7 @@ impl LayoutState {
             // use half strength so class-level containment dominates.
             if p.containment_enabled && p.containment_strength > 0.0 {
                 for &c in &self.containers {
-                    if self.hidden.contains(&c) {
+                    if !self.active[c] {
                         continue;
                     }
                     let children = &self.children_of[c];
@@ -578,7 +538,7 @@ impl LayoutState {
                     let mut centroid = Vec2::ZERO;
                     let mut count = 0u32;
                     for &child in children {
-                        if !self.hidden.contains(&child) {
+                        if self.active[child] {
                             centroid += self.positions[child];
                             count += 1;
                         }
@@ -594,7 +554,7 @@ impl LayoutState {
                         p.containment_strength
                     };
                     for &child in children {
-                        if !self.hidden.contains(&child) {
+                        if self.active[child] {
                             forces[child] += (centroid - self.positions[child]) * strength;
                         }
                     }
@@ -623,7 +583,7 @@ impl LayoutState {
                         let mut centroid = Vec2::ZERO;
                         let mut count = 0u32;
                         for &idx in group {
-                            if !self.hidden.contains(&idx) {
+                            if self.active[idx] {
                                 centroid += self.positions[idx];
                                 count += 1;
                             }
@@ -634,7 +594,7 @@ impl LayoutState {
                         centroid /= count as f32;
 
                         for &idx in group {
-                            if !self.hidden.contains(&idx) {
+                            if self.active[idx] {
                                 forces[idx] += (centroid - self.positions[idx]) * strength;
                             }
                         }
@@ -645,19 +605,15 @@ impl LayoutState {
             // --- Extracted forces pipeline (issue #33) ---
             //
             // Forces that have been migrated out of this inline code run
-            // through the trait-based pipeline. Currently: gravity. Future
-            // extractions (repulsion, spring attraction, etc.) will append
-            // to `self.forces` and delete more of the inline code.
-            //
-            // `active` is rebuilt per-step from the current hidden set. Step
-            // 1c of the refactor will replace this with a persistent
-            // `Vec<bool>` on `LayoutState` (see the §1 optimization).
-            let active: Vec<bool> = (0..len).map(|i| !self.hidden.contains(&i)).collect();
+            // through the trait-based pipeline. Currently: repulsion,
+            // gravity. Future extractions (spring attraction, containment,
+            // etc.) will append to `self.forces` and delete more of the
+            // inline code below.
             let ctx = forces::ForceContext {
                 positions: &self.positions,
                 sizes: &self.sizes,
                 degrees: &self.degrees,
-                active: &active,
+                active: &self.active,
                 edge_pairs: &self.edge_pairs,
                 visible_edge_kinds: &self.visible_edge_kinds,
                 children_of: &self.children_of,
@@ -680,18 +636,18 @@ impl LayoutState {
                 let cr = p.container_repulsion;
                 for group in &self.sibling_groups {
                     // Collect the expanded, visible containers in this group.
-                    let active: Vec<usize> = group
+                    let live_siblings: Vec<usize> = group
                         .iter()
                         .copied()
-                        .filter(|&c| !self.hidden.contains(&c) && self.expanded.contains(&c))
+                        .filter(|&c| self.active[c] && self.expanded.contains(&c))
                         .collect();
-                    if active.len() < 2 {
+                    if live_siblings.len() < 2 {
                         continue;
                     }
 
                     // Grid-accelerated overlap detection: bucket containers by
                     // cell so we only check nearby pairs instead of all O(S²).
-                    let max_extent = active
+                    let max_extent = live_siblings
                         .iter()
                         .map(|&c| self.sizes[c].x.max(self.sizes[c].y))
                         .fold(0.0f32, f32::max);
@@ -701,14 +657,14 @@ impl LayoutState {
                     let inv_cell = 1.0 / cell_size;
 
                     let mut grid: HashMap<(i32, i32), Vec<usize>> = HashMap::new();
-                    for &c in &active {
+                    for &c in &live_siblings {
                         let cx = (self.positions[c].x * inv_cell).floor() as i32;
                         let cy = (self.positions[c].y * inv_cell).floor() as i32;
                         grid.entry((cx, cy)).or_default().push(c);
                     }
 
                     // Check each container against neighbours in a 3×3 cell window.
-                    for &a in &active {
+                    for &a in &live_siblings {
                         let pos_a = self.positions[a];
                         let half_a = self.sizes[a] * 0.5;
                         let ax = (pos_a.x * inv_cell).floor() as i32;
@@ -753,14 +709,14 @@ impl LayoutState {
                                         f,
                                         &mut forces,
                                         &self.children_of,
-                                        &self.hidden,
+                                        &self.active,
                                     );
                                     apply_force_to_subtree(
                                         b,
                                         -f,
                                         &mut forces,
                                         &self.children_of,
-                                        &self.hidden,
+                                        &self.active,
                                     );
                                 }
                             }
@@ -785,7 +741,7 @@ impl LayoutState {
                 .zip(forces.iter())
                 .enumerate()
             {
-                if self.hidden.contains(&i) {
+                if !self.active[i] {
                     *vel = Vec2::ZERO;
                     continue;
                 }
@@ -813,12 +769,12 @@ impl LayoutState {
             // Clamp ALL descendants of collapsed containers inside a
             // fixed box around the parent position.
             for &c in &self.containers {
-                if self.expanded.contains(&c) || self.hidden.contains(&c) {
+                if self.expanded.contains(&c) || !self.active[c] {
                     continue;
                 }
                 let center = self.positions[c];
                 for &d in &self.all_descendants_idx(c) {
-                    if self.hidden.contains(&d) {
+                    if !self.active[d] {
                         continue;
                     }
                     let pos = &mut self.positions[d];
@@ -962,19 +918,25 @@ impl LayoutState {
     /// This merges with collapse-hidden state — nodes hidden by either
     /// mechanism are excluded.
     pub fn set_hidden(&mut self, ids: &[SymbolId]) {
-        self.external_hidden.clear();
+        for slot in self.external_hidden.iter_mut() {
+            *slot = false;
+        }
         for id in ids {
             if let Some(&idx) = self.id_to_idx.get(id) {
-                self.external_hidden.insert(idx);
+                self.external_hidden[idx] = true;
             }
         }
-        self.rebuild_hidden();
+        self.rebuild_active();
         self.reheat();
     }
 
-    /// Rebuild the effective hidden set from collapse + external sources.
-    fn rebuild_hidden(&mut self) {
-        self.hidden = &self.collapse_hidden | &self.external_hidden;
+    /// Rebuild the [`Self::active`] flag from the collapse + external
+    /// hidden sources. A node is active iff neither mechanism has marked
+    /// it hidden.
+    fn rebuild_active(&mut self) {
+        for (i, active) in self.active.iter_mut().enumerate() {
+            *active = !self.collapse_hidden[i] && !self.external_hidden[i];
+        }
     }
 
     /// Collapse a container node: all descendants stay in the simulation
@@ -1136,65 +1098,24 @@ fn build_sibling_groups(
 }
 
 /// Apply a force to a node and all its descendants (rigid-body translation).
-/// Walks the subtree via `children_of` without allocating.
+/// Walks the subtree via `children_of` without allocating. Descendants
+/// whose `active` flag is `false` are skipped.
 fn apply_force_to_subtree(
     root: usize,
     force: Vec2,
     forces: &mut [Vec2],
     children_of: &[Vec<usize>],
-    hidden: &HashSet<usize>,
+    active: &[bool],
 ) {
     forces[root] += force;
     // Use a manual stack to avoid recursion overhead.
     let mut stack: Vec<usize> = children_of[root].clone();
     while let Some(node) = stack.pop() {
-        if !hidden.contains(&node) {
+        if active[node] {
             forces[node] += force;
             stack.extend_from_slice(&children_of[node]);
         }
     }
-}
-
-/// Compute point-based Coulomb repulsive force on node `i` from its 3×3
-/// grid neighbourhood. Center-to-center distance, no size awareness.
-#[allow(clippy::too_many_arguments)]
-fn compute_repulsion_for_node(
-    i: usize,
-    positions: &[Vec2],
-    grid: &HashMap<(i32, i32), Vec<usize>>,
-    cell_keys: &[(i32, i32)],
-    cutoff_sq: f32,
-    inv_cutoff: f32,
-    repulsion: f32,
-    min_dist: f32,
-) -> Vec2 {
-    let _ = inv_cutoff; // used for grid key computation at call site
-    let pos_i = positions[i];
-    let (cx, cy) = cell_keys[i];
-    let mut force = Vec2::ZERO;
-
-    // Scan 3×3 neighbourhood (including own cell)
-    for dx in -1..=1i32 {
-        for dy in -1..=1i32 {
-            let nx = cx.wrapping_add(dx);
-            let ny = cy.wrapping_add(dy);
-            if let Some(cell) = grid.get(&(nx, ny)) {
-                for &j in cell {
-                    if j == i {
-                        continue;
-                    }
-                    let delta = pos_i - positions[j];
-                    let dist_sq = delta.length_squared();
-                    if dist_sq > cutoff_sq || dist_sq < 1e-10 {
-                        continue;
-                    }
-                    let dist = dist_sq.sqrt().max(min_dist);
-                    force += delta.normalize_or_zero() * (repulsion / (dist * dist));
-                }
-            }
-        }
-    }
-    force
 }
 
 /// Build hierarchical directory groups from the graph's file table.
