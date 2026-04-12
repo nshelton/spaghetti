@@ -172,14 +172,22 @@ impl SpaghettiApp {
 
                     // Node types: toggleable color swatches that also control filtering.
                     ui.label("Node Types");
+                    let mut node_counts: std::collections::HashMap<core_ir::SymbolKind, usize> =
+                        std::collections::HashMap::new();
+                    for sym in self.graph.graph.symbols.values() {
+                        *node_counts.entry(sym.kind).or_insert(0) += 1;
+                    }
                     let mut node_filter_changed = false;
                     for &kind in &ALL_SYMBOL_KINDS {
+                        let count = node_counts.get(&kind).copied().unwrap_or(0);
                         let kind_name = format!("{kind:?}");
+                        let label = format!("{kind_name} ({count})");
                         let enabled = self.filters.node_filter.is_enabled(kind);
                         if toggle_swatch(
                             ui,
                             &mut self.render.render.node_colors,
                             &kind_name,
+                            &label,
                             enabled,
                         ) {
                             self.filters.node_filter.toggle(kind);
@@ -210,14 +218,22 @@ impl SpaghettiApp {
                         attraction: 0.01,
                     };
 
+                    let mut edge_counts: std::collections::HashMap<core_ir::EdgeKind, usize> =
+                        std::collections::HashMap::new();
+                    for edge in &self.graph.graph.edges {
+                        *edge_counts.entry(edge.kind).or_insert(0) += 1;
+                    }
                     let mut edge_filter_changed = false;
                     for &kind in &ALL_EDGE_KINDS {
+                        let count = edge_counts.get(&kind).copied().unwrap_or(0);
                         let kind_name = format!("{kind:?}");
+                        let label = format!("{kind_name} ({count})");
                         let enabled = self.filters.edge_filter.is_enabled(kind);
                         if toggle_swatch(
                             ui,
                             &mut self.render.render.edge_colors,
                             &kind_name,
+                            &label,
                             enabled,
                         ) {
                             self.filters.edge_filter.toggle(kind);
@@ -522,6 +538,7 @@ fn toggle_swatch(
     ui: &mut egui::Ui,
     colors: &mut std::collections::HashMap<String, crate::settings::Rgb>,
     name: &str,
+    label: &str,
     enabled: bool,
 ) -> bool {
     let rgb = colors.entry(name.to_string()).or_insert([80, 80, 80]);
@@ -547,7 +564,7 @@ fn toggle_swatch(
     ui.painter().text(
         rect.center(),
         egui::Align2::CENTER_CENTER,
-        name,
+        label,
         egui::FontId::proportional(12.0),
         text_color,
     );
