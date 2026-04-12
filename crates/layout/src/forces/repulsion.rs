@@ -64,9 +64,7 @@ impl Force for Repulsion {
         let min_dist = self.min_dist;
         let len = ctx.node_count;
 
-        // Bucket active nodes into a flat spatial grid keyed by `cutoff`.
-        // The grid falls back to a hashmap if active-node positions are
-        // pathologically spread out.
+        // Bucket active nodes into a spatial grid keyed by `cutoff`.
         let grid = SpatialGrid::build(
             cutoff,
             ctx.positions.iter().enumerate().filter_map(|(i, &pos)| {

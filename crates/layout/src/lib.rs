@@ -444,9 +444,7 @@ impl LayoutState {
     }
 
     /// Snapshot the current tunable parameters into a [`ForceParams`]
-    /// struct for serialization to `spaghetti_settings.json`. Reads
-    /// each value from its canonical home: integration params come from
-    /// `self`, force-specific params come from the pipeline entries.
+    /// struct for serialization to `spaghetti_settings.json`.
     pub fn export_params(&self) -> ForceParams {
         let mut out = ForceParams {
             damping: self.damping,
@@ -485,9 +483,7 @@ impl LayoutState {
         out
     }
 
-    /// Apply a [`ForceParams`] snapshot to the simulation, writing
-    /// each value directly into its canonical home (integration params
-    /// on `self`, force params on the pipeline entries).
+    /// Apply a [`ForceParams`] snapshot to the simulation.
     pub fn import_params(&mut self, params: &ForceParams) {
         self.damping = params.damping;
         self.max_velocity = params.max_velocity;
@@ -603,10 +599,18 @@ impl LayoutState {
     /// force and velocity magnitudes, skips hidden nodes, and holds pinned
     /// nodes at their fixed positions. Increments `total_steps`.
     ///
-    /// Above [`forces::PARALLEL_THRESHOLD`] nodes the per-node update runs
-    /// under rayon: each iteration writes exactly one position/velocity
-    /// slot, so the work parallelises without contention.
+    /// Per-node work here is a handful of arithmetic ops plus one
+    /// hash-map lookup for pin state — much cheaper than any `Force`
+    /// inner loop, so the parallel path only kicks in on much larger
+    /// graphs than [`forces::PARALLEL_THRESHOLD`]. Below that, rayon's
+    /// setup cost dominates.
     fn integrate(&mut self, forces: &[Vec2]) {
+        /// Node-count threshold above which integration runs under
+        /// rayon. Much larger than the force-apply threshold because
+        /// per-node integrate work is O(1) constants rather than
+        /// O(neighbourhood).
+        const INTEGRATE_PARALLEL_THRESHOLD: usize = 5000;
+
         let cooling = (1.0 - (self.total_steps as f32 / 300.0).min(0.95)).max(0.05);
         let effective_damping = self.damping * cooling;
         let max_vel = self.max_velocity * cooling;
@@ -627,8 +631,6 @@ impl LayoutState {
         let ids: &[SymbolId] = &self.ids;
         let pins = &self.pins;
 
-        // Per-node integration step, shared between the serial and
-        // parallel paths so the math stays identical.
         let integrate_one = |i: usize, pos: &mut Vec2, vel: &mut Vec2, force: Vec2| {
             if !active[i] {
                 *vel = Vec2::ZERO;
@@ -654,7 +656,7 @@ impl LayoutState {
             *pos += *vel;
         };
 
-        if n >= forces::PARALLEL_THRESHOLD {
+        if n >= INTEGRATE_PARALLEL_THRESHOLD {
             positions
                 .par_iter_mut()
                 .zip(velocities.par_iter_mut())
@@ -764,7 +766,8 @@ impl LayoutState {
     }
 
     /// Partially reset the cooling schedule so parameter changes take visible
-    /// effect. Call after modifying [`ForceParams`] via [`params_mut`](Self::params_mut).
+    /// effect. Call after tuning a force via
+    /// [`force_mut`](Self::force_mut) or [`import_params`](Self::import_params).
     pub fn reheat(&mut self) {
         self.total_steps = self.total_steps.saturating_sub(100);
     }

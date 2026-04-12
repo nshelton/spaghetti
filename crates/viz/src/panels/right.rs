@@ -255,7 +255,7 @@ impl SpaghettiApp {
                                         .changed();
                                     changed |= ui
                                         .add(
-                                            egui::Slider::new(&mut ep.attraction, 0.0..=2.0)
+                                            egui::Slider::new(&mut ep.attraction, 0.0..=100.0)
                                                 .text("Attract"),
                                         )
                                         .changed();
@@ -282,261 +282,96 @@ impl SpaghettiApp {
                     ui.heading("Layout Forces");
                     ui.separator();
 
-                    // Repulsion
-                    {
-                        let mut enabled = self
-                            .simulation
-                            .layout_state
-                            .force::<layout::forces::Repulsion>()
-                            .is_some_and(|r| r.enabled);
-                        let mut strength = self
-                            .simulation
-                            .layout_state
-                            .force::<layout::forces::Repulsion>()
-                            .map_or(0.0, |r| r.strength);
-                        let id = ui.make_persistent_id("force_repulsion");
-                        egui::collapsing_header::CollapsingState::load_with_default_open(
-                            ui.ctx(),
-                            id,
-                            false,
-                        )
-                        .show_header(ui, |ui| {
-                            if ui.checkbox(&mut enabled, "Repulsion").changed() {
-                                changed = true;
-                            }
-                        })
-                        .body(|ui| {
-                            if !enabled {
-                                ui.disable();
-                            }
-                            changed |= ui
+                    let state = &mut self.simulation.layout_state;
+
+                    force_section::<layout::forces::Repulsion>(
+                        ui,
+                        state,
+                        "force_repulsion",
+                        "Repulsion",
+                        &mut changed,
+                        |ui, r, changed| {
+                            *changed |= ui
                                 .add(
-                                    egui::Slider::new(&mut strength, 100.0..=1_000_000.0)
+                                    egui::Slider::new(&mut r.strength, 100.0..=1_000_000.0)
                                         .logarithmic(true)
                                         .text("Strength"),
                                 )
                                 .changed();
-                        });
-                        if let Some(r) = self
-                            .simulation
-                            .layout_state
-                            .force_mut::<layout::forces::Repulsion>()
-                        {
-                            r.enabled = enabled;
-                            r.strength = strength;
-                        }
-                    }
+                        },
+                    );
 
-                    // Edge Springs (attraction). Per-kind sliders live in the
-                    // Edge Types section above; this block is just the on/off.
-                    {
-                        let mut enabled = self
-                            .simulation
-                            .layout_state
-                            .force::<layout::forces::SpringAttraction>()
-                            .is_some_and(|s| s.enabled);
-                        let id = ui.make_persistent_id("force_attraction");
-                        egui::collapsing_header::CollapsingState::load_with_default_open(
-                            ui.ctx(),
-                            id,
-                            false,
-                        )
-                        .show_header(ui, |ui| {
-                            if ui.checkbox(&mut enabled, "Edge Springs").changed() {
-                                changed = true;
-                            }
-                        })
-                        .body(|ui| {
-                            if !enabled {
-                                ui.disable();
-                            }
+                    // Edge Springs: per-kind sliders live in the Edge Types
+                    // section above; this block is just the on/off checkbox.
+                    force_section::<layout::forces::SpringAttraction>(
+                        ui,
+                        state,
+                        "force_attraction",
+                        "Edge Springs",
+                        &mut changed,
+                        |ui, _, _| {
                             ui.label("Per-edge-kind sliders are above in Edge Types.");
-                        });
-                        if let Some(s) = self
-                            .simulation
-                            .layout_state
-                            .force_mut::<layout::forces::SpringAttraction>()
-                        {
-                            s.enabled = enabled;
-                        }
-                    }
+                        },
+                    );
 
-                    // Gravity
-                    {
-                        let mut enabled = self
-                            .simulation
-                            .layout_state
-                            .force::<layout::forces::Gravity>()
-                            .is_some_and(|g| g.enabled);
-                        let mut strength = self
-                            .simulation
-                            .layout_state
-                            .force::<layout::forces::Gravity>()
-                            .map_or(0.0, |g| g.strength);
-                        let id = ui.make_persistent_id("force_gravity");
-                        egui::collapsing_header::CollapsingState::load_with_default_open(
-                            ui.ctx(),
-                            id,
-                            false,
-                        )
-                        .show_header(ui, |ui| {
-                            if ui.checkbox(&mut enabled, "Gravity").changed() {
-                                changed = true;
-                            }
-                        })
-                        .body(|ui| {
-                            if !enabled {
-                                ui.disable();
-                            }
-                            changed |= ui
-                                .add(egui::Slider::new(&mut strength, 0.0..=0.1).text("Strength"))
+                    force_section::<layout::forces::Gravity>(
+                        ui,
+                        state,
+                        "force_gravity",
+                        "Gravity",
+                        &mut changed,
+                        |ui, g, changed| {
+                            *changed |= ui
+                                .add(egui::Slider::new(&mut g.strength, 0.0..=0.1).text("Strength"))
                                 .changed();
-                        });
-                        if let Some(g) = self
-                            .simulation
-                            .layout_state
-                            .force_mut::<layout::forces::Gravity>()
-                        {
-                            g.enabled = enabled;
-                            g.strength = strength;
-                        }
-                    }
+                        },
+                    );
 
-                    // Location Affinity
-                    {
-                        let mut enabled = self
-                            .simulation
-                            .layout_state
-                            .force::<layout::forces::LocationAffinity>()
-                            .is_some_and(|l| l.enabled);
-                        let mut strength = self
-                            .simulation
-                            .layout_state
-                            .force::<layout::forces::LocationAffinity>()
-                            .map_or(0.0, |l| l.strength);
-                        let mut falloff = self
-                            .simulation
-                            .layout_state
-                            .force::<layout::forces::LocationAffinity>()
-                            .map_or(0.0, |l| l.falloff);
-                        let id = ui.make_persistent_id("force_location");
-                        egui::collapsing_header::CollapsingState::load_with_default_open(
-                            ui.ctx(),
-                            id,
-                            false,
-                        )
-                        .show_header(ui, |ui| {
-                            if ui.checkbox(&mut enabled, "Location Affinity").changed() {
-                                changed = true;
-                            }
-                        })
-                        .body(|ui| {
-                            if !enabled {
-                                ui.disable();
-                            }
-                            changed |= ui
-                                .add(egui::Slider::new(&mut strength, 0.0..=2.0).text("Strength"))
+                    force_section::<layout::forces::LocationAffinity>(
+                        ui,
+                        state,
+                        "force_location",
+                        "Location Affinity",
+                        &mut changed,
+                        |ui, l, changed| {
+                            *changed |= ui
+                                .add(egui::Slider::new(&mut l.strength, 0.0..=2.0).text("Strength"))
                                 .changed();
-                            changed |= ui
-                                .add(egui::Slider::new(&mut falloff, 0.0..=1.0).text("Falloff"))
+                            *changed |= ui
+                                .add(egui::Slider::new(&mut l.falloff, 0.0..=1.0).text("Falloff"))
                                 .changed();
-                        });
-                        if let Some(l) = self
-                            .simulation
-                            .layout_state
-                            .force_mut::<layout::forces::LocationAffinity>()
-                        {
-                            l.enabled = enabled;
-                            l.strength = strength;
-                            l.falloff = falloff;
-                        }
-                    }
+                        },
+                    );
 
-                    // Containment
-                    {
-                        let mut enabled = self
-                            .simulation
-                            .layout_state
-                            .force::<layout::forces::Containment>()
-                            .is_some_and(|c| c.enabled);
-                        let mut strength = self
-                            .simulation
-                            .layout_state
-                            .force::<layout::forces::Containment>()
-                            .map_or(0.0, |c| c.strength);
-                        let id = ui.make_persistent_id("force_containment");
-                        egui::collapsing_header::CollapsingState::load_with_default_open(
-                            ui.ctx(),
-                            id,
-                            false,
-                        )
-                        .show_header(ui, |ui| {
-                            if ui.checkbox(&mut enabled, "Containment").changed() {
-                                changed = true;
-                            }
-                        })
-                        .body(|ui| {
-                            if !enabled {
-                                ui.disable();
-                            }
-                            changed |= ui
-                                .add(egui::Slider::new(&mut strength, 0.0..=2.0).text("Strength"))
+                    force_section::<layout::forces::Containment>(
+                        ui,
+                        state,
+                        "force_containment",
+                        "Containment",
+                        &mut changed,
+                        |ui, c, changed| {
+                            *changed |= ui
+                                .add(egui::Slider::new(&mut c.strength, 0.0..=2.0).text("Strength"))
                                 .changed();
-                        });
-                        if let Some(c) = self
-                            .simulation
-                            .layout_state
-                            .force_mut::<layout::forces::Containment>()
-                        {
-                            c.enabled = enabled;
-                            c.strength = strength;
-                        }
-                    }
+                        },
+                    );
 
-                    // Container Repulsion (gap-based)
-                    {
-                        let mut enabled = self
-                            .simulation
-                            .layout_state
-                            .force::<layout::forces::ContainerRepulsion>()
-                            .is_some_and(|cr| cr.enabled);
-                        let mut strength = self
-                            .simulation
-                            .layout_state
-                            .force::<layout::forces::ContainerRepulsion>()
-                            .map_or(0.0, |cr| cr.strength);
-                        let id = ui.make_persistent_id("force_container_repulsion");
-                        egui::collapsing_header::CollapsingState::load_with_default_open(
-                            ui.ctx(),
-                            id,
-                            false,
-                        )
-                        .show_header(ui, |ui| {
-                            if ui.checkbox(&mut enabled, "Container Repulsion").changed() {
-                                changed = true;
-                            }
-                        })
-                        .body(|ui| {
-                            if !enabled {
-                                ui.disable();
-                            }
-                            changed |= ui
+                    force_section::<layout::forces::ContainerRepulsion>(
+                        ui,
+                        state,
+                        "force_container_repulsion",
+                        "Container Repulsion",
+                        &mut changed,
+                        |ui, cr, changed| {
+                            *changed |= ui
                                 .add(
-                                    egui::Slider::new(&mut strength, 10.0..=100_000.0)
+                                    egui::Slider::new(&mut cr.strength, 10.0..=100_000.0)
                                         .logarithmic(true)
                                         .text("Strength"),
                                 )
                                 .changed();
-                        });
-                        if let Some(cr) = self
-                            .simulation
-                            .layout_state
-                            .force_mut::<layout::forces::ContainerRepulsion>()
-                        {
-                            cr.enabled = enabled;
-                            cr.strength = strength;
-                        }
-                    }
+                        },
+                    );
 
                     ui.add_space(16.0);
 
@@ -650,4 +485,42 @@ fn toggle_swatch(
     });
 
     response.clicked()
+}
+
+/// Draw a collapsing header for a single layout force.
+///
+/// Reads the force's `enabled` flag from the pipeline, renders a
+/// checkbox + body, then writes the flag back. The `body` closure
+/// receives a fresh mutable borrow of the concrete force and a change
+/// flag it should set when any slider moves a value. Returns without
+/// drawing anything if the pipeline has no force of type `T`.
+fn force_section<T: layout::forces::Force>(
+    ui: &mut egui::Ui,
+    state: &mut layout::LayoutState,
+    id_str: &str,
+    label: &str,
+    changed: &mut bool,
+    body: impl FnOnce(&mut egui::Ui, &mut T, &mut bool),
+) {
+    let Some(mut enabled) = state.force::<T>().map(|f| f.enabled()) else {
+        return;
+    };
+    let id = ui.make_persistent_id(id_str);
+    egui::collapsing_header::CollapsingState::load_with_default_open(ui.ctx(), id, false)
+        .show_header(ui, |ui| {
+            if ui.checkbox(&mut enabled, label).changed() {
+                *changed = true;
+            }
+        })
+        .body(|ui| {
+            if !enabled {
+                ui.disable();
+            }
+            if let Some(f) = state.force_mut::<T>() {
+                body(ui, f, changed);
+            }
+        });
+    if let Some(f) = state.force_mut::<T>() {
+        f.set_enabled(enabled);
+    }
 }
