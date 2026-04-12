@@ -7,6 +7,8 @@
 //! - [`LayoutState`]: incremental simulation driven frame-by-frame, with
 //!   support for pinning nodes (interactive dragging).
 
+pub mod forces;
+
 use core_ir::{EdgeKind, Graph, SymbolId, SymbolKind};
 use glam::Vec2;
 use indexmap::IndexMap;
