@@ -18,10 +18,12 @@ use std::any::Any;
 use std::collections::HashSet;
 
 pub mod gravity;
+pub mod location_affinity;
 pub mod repulsion;
 pub mod spring_attraction;
 
 pub use gravity::Gravity;
+pub use location_affinity::LocationAffinity;
 pub use repulsion::Repulsion;
 pub use spring_attraction::SpringAttraction;
 

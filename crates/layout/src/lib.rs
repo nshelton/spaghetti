@@ -239,12 +239,6 @@ pub struct LayoutState {
     /// path can test visibility with an array lookup instead of a
     /// `HashSet::contains` call (§1 of issue #33).
     active: Vec<bool>,
-    /// Hierarchical directory groups for the location-affinity force.
-    /// `dir_groups[depth][group_idx]` is a list of node indices sharing
-    /// the same directory prefix at that depth.
-    dir_groups: Vec<Vec<Vec<usize>>>,
-    /// Maximum directory depth across all nodes (cached for force scaling).
-    max_dir_depth: usize,
     /// Maps each node index to its parent container index (via Contains edges).
     parent_of: Vec<Option<usize>>,
     /// Maps each container node index to its children indices.
@@ -394,6 +388,13 @@ impl LayoutState {
                 params.edge_params.clone(),
                 params.attraction_enabled,
             )),
+            Box::new(forces::LocationAffinity::new(
+                params.location_strength,
+                params.location_falloff,
+                dir_groups,
+                max_dir_depth,
+                params.location_enabled,
+            )),
             Box::new(forces::Gravity::new(params.gravity, params.gravity_enabled)),
         ];
 
@@ -409,8 +410,6 @@ impl LayoutState {
             degrees,
             total_steps: 0,
             active,
-            dir_groups,
-            max_dir_depth,
             parent_of,
             children_of,
             containers,
@@ -444,6 +443,9 @@ impl LayoutState {
         let attraction_min_dist = self.params.min_dist;
         let attraction_enabled = self.params.attraction_enabled;
         let attraction_edge_params = self.params.edge_params.clone();
+        let location_strength = self.params.location_strength;
+        let location_falloff = self.params.location_falloff;
+        let location_enabled = self.params.location_enabled;
         for force in self.forces.iter_mut() {
             let any = force.as_any_mut();
             if let Some(g) = any.downcast_mut::<forces::Gravity>() {
@@ -464,6 +466,12 @@ impl LayoutState {
                 s.min_dist = attraction_min_dist;
                 s.enabled = attraction_enabled;
                 s.edge_params = attraction_edge_params.clone();
+                continue;
+            }
+            if let Some(l) = any.downcast_mut::<forces::LocationAffinity>() {
+                l.strength = location_strength;
+                l.falloff = location_falloff;
+                l.enabled = location_enabled;
                 continue;
             }
         }
@@ -554,54 +562,13 @@ impl LayoutState {
                 }
             }
 
-            // Location-affinity force: pull nodes toward their directory
-            // group centroids at each depth level.
-            if p.location_enabled && p.location_strength > 0.0 && !self.dir_groups.is_empty() {
-                let max_d = self.max_dir_depth;
-                for (depth, groups_at_depth) in self.dir_groups.iter().enumerate() {
-                    // Deeper = more specific = stronger. Scale so the deepest
-                    // level gets full strength and shallower levels decay.
-                    let level_scale = if max_d > 0 {
-                        p.location_falloff.powi((max_d - depth) as i32)
-                    } else {
-                        1.0
-                    };
-                    let strength = p.location_strength * level_scale;
-                    if strength < 1e-6 {
-                        continue;
-                    }
-
-                    for group in groups_at_depth {
-                        // Compute centroid of visible nodes in this group.
-                        let mut centroid = Vec2::ZERO;
-                        let mut count = 0u32;
-                        for &idx in group {
-                            if self.active[idx] {
-                                centroid += self.positions[idx];
-                                count += 1;
-                            }
-                        }
-                        if count < 2 {
-                            continue;
-                        }
-                        centroid /= count as f32;
-
-                        for &idx in group {
-                            if self.active[idx] {
-                                forces[idx] += (centroid - self.positions[idx]) * strength;
-                            }
-                        }
-                    }
-                }
-            }
-
             // --- Extracted forces pipeline (issue #33) ---
             //
             // Forces that have been migrated out of this inline code run
             // through the trait-based pipeline. Currently: repulsion,
-            // spring attraction, gravity. Future extractions (containment,
-            // location affinity, container repulsion) will append to
-            // `self.forces` and delete more of the inline code below.
+            // spring attraction, location affinity, gravity. Future
+            // extractions (containment, container repulsion) will append
+            // to `self.forces` and delete more of the inline code below.
             let ctx = forces::ForceContext {
                 positions: &self.positions,
                 sizes: &self.sizes,
