@@ -7,6 +7,8 @@
 //! - [`LayoutState`]: incremental simulation driven frame-by-frame, with
 //!   support for pinning nodes (interactive dragging).
 
+pub mod forces;
+
 use core_ir::{EdgeKind, Graph, SymbolId, SymbolKind};
 use glam::Vec2;
 use indexmap::IndexMap;
@@ -225,20 +227,21 @@ pub struct LayoutState {
     visible_edge_kinds: Vec<EdgeKind>,
     id_to_idx: IndexMap<SymbolId, usize>,
     pins: IndexMap<SymbolId, Vec2>,
-    params: ForceParams,
+    /// Velocity damping factor applied each step (lower = more damping).
+    pub damping: f32,
+    /// Maximum velocity magnitude per node per step. Prevents wild
+    /// overshooting when forces are large.
+    pub max_velocity: f32,
     /// Per-node edge degree (number of edges touching this node).
     /// Used to normalize spring forces on high-degree hubs.
     degrees: Vec<f32>,
     /// Total steps run so far, used for adaptive cooling.
     total_steps: u32,
-    /// Node indices that are hidden (excluded from all force computation).
-    hidden: HashSet<usize>,
-    /// Hierarchical directory groups for the location-affinity force.
-    /// `dir_groups[depth][group_idx]` is a list of node indices sharing
-    /// the same directory prefix at that depth.
-    dir_groups: Vec<Vec<Vec<usize>>>,
-    /// Maximum directory depth across all nodes (cached for force scaling).
-    max_dir_depth: usize,
+    /// Per-node visibility flag. `active[i] == true` means node `i`
+    /// participates in the simulation this step. Rebuilt from
+    /// [`Self::collapse_hidden`] and [`Self::external_hidden`] by
+    /// [`Self::rebuild_active`].
+    active: Vec<bool>,
     /// Maps each node index to its parent container index (via Contains edges).
     parent_of: Vec<Option<usize>>,
     /// Maps each container node index to its children indices.
@@ -250,16 +253,20 @@ pub struct LayoutState {
     toplevel_containers: HashSet<usize>,
     /// Which containers are currently expanded (children visible).
     expanded: HashSet<usize>,
-    /// Nodes hidden by collapse (tracked separately from file-tree hidden).
-    collapse_hidden: HashSet<usize>,
-    /// Nodes hidden by external callers (file-tree visibility).
-    external_hidden: HashSet<usize>,
+    /// Per-node collapse-hidden flag. Nodes marked `true` are currently
+    /// hidden by a collapsed ancestor container (tracked separately from
+    /// file-tree hidden).
+    collapse_hidden: Vec<bool>,
+    /// Per-node external-hidden flag. Nodes marked `true` are currently
+    /// hidden by an external caller (e.g. the file-tree visibility panel).
+    external_hidden: Vec<bool>,
     /// Per-node bounding box sizes in world units. Used for size-aware
     /// repulsion (edge-to-edge distance instead of center-to-center).
     sizes: Vec<Vec2>,
-    /// Groups of sibling container indices (containers sharing the same parent).
-    /// Container repulsion only acts within each sibling group.
-    sibling_groups: Vec<Vec<usize>>,
+    /// Composable force pipeline run each step. Every enabled force
+    /// accumulates contributions into a shared buffer that is then
+    /// integrated into velocities and positions.
+    forces: Vec<Box<dyn forces::Force>>,
 }
 
 impl LayoutState {
@@ -355,8 +362,45 @@ impl LayoutState {
         // simulation (visible, participate in forces) but are clamped
         // inside the collapsed container box each step.
         let expanded = HashSet::new();
-        let collapse_hidden = HashSet::new();
-        let hidden = HashSet::new();
+
+        // Visibility bookkeeping: both "hidden" sources start empty, so
+        // every node is active at construction time.
+        let collapse_hidden = vec![false; n];
+        let external_hidden = vec![false; n];
+        let active = vec![true; n];
+
+        let force_pipeline: Vec<Box<dyn forces::Force>> = vec![
+            Box::new(forces::Repulsion::new(
+                params.repulsion,
+                params.repulsion_cutoff,
+                params.min_dist,
+                params.repulsion_enabled,
+            )),
+            Box::new(forces::SpringAttraction::new(
+                params.attraction,
+                params.ideal_length,
+                params.min_dist,
+                params.edge_params.clone(),
+                params.attraction_enabled,
+            )),
+            Box::new(forces::Containment::new(
+                params.containment_strength,
+                params.containment_enabled,
+            )),
+            Box::new(forces::ContainerRepulsion::new(
+                params.container_repulsion,
+                sibling_groups,
+                params.container_repulsion_enabled,
+            )),
+            Box::new(forces::LocationAffinity::new(
+                params.location_strength,
+                params.location_falloff,
+                dir_groups,
+                max_dir_depth,
+                params.location_enabled,
+            )),
+            Box::new(forces::Gravity::new(params.gravity, params.gravity_enabled)),
+        ];
 
         Self {
             ids,
@@ -366,21 +410,121 @@ impl LayoutState {
             visible_edge_kinds,
             id_to_idx,
             pins: IndexMap::new(),
-            params,
+            damping: params.damping,
+            max_velocity: params.max_velocity,
             degrees,
             total_steps: 0,
-            hidden,
-            dir_groups,
-            max_dir_depth,
+            active,
             parent_of,
             children_of,
             containers,
             toplevel_containers,
             expanded,
             collapse_hidden,
-            external_hidden: HashSet::new(),
+            external_hidden,
             sizes: vec![Vec2::new(120.0, 30.0); n],
-            sibling_groups,
+            forces: force_pipeline,
+        }
+    }
+
+    /// Borrow the pipeline force of type `T`, if present. Each force
+    /// type is unique in the pipeline, so the result effectively
+    /// identifies "the" force of that type.
+    pub fn force<T: forces::Force>(&self) -> Option<&T> {
+        self.forces
+            .iter()
+            .find_map(|f| f.as_any().downcast_ref::<T>())
+    }
+
+    /// Mutably borrow the pipeline force of type `T`, if present.
+    pub fn force_mut<T: forces::Force>(&mut self) -> Option<&mut T> {
+        self.forces
+            .iter_mut()
+            .find_map(|f| f.as_any_mut().downcast_mut::<T>())
+    }
+
+    /// Snapshot the current tunable parameters into a [`ForceParams`]
+    /// struct for serialization to `spaghetti_settings.json`.
+    pub fn export_params(&self) -> ForceParams {
+        let mut out = ForceParams {
+            damping: self.damping,
+            max_velocity: self.max_velocity,
+            ..ForceParams::default()
+        };
+        if let Some(r) = self.force::<forces::Repulsion>() {
+            out.repulsion = r.strength;
+            out.repulsion_cutoff = r.cutoff;
+            out.min_dist = r.min_dist;
+            out.repulsion_enabled = r.enabled;
+        }
+        if let Some(s) = self.force::<forces::SpringAttraction>() {
+            out.attraction = s.global_attraction;
+            out.ideal_length = s.global_ideal_length;
+            out.attraction_enabled = s.enabled;
+            out.edge_params.clone_from(&s.edge_params);
+        }
+        if let Some(g) = self.force::<forces::Gravity>() {
+            out.gravity = g.strength;
+            out.gravity_enabled = g.enabled;
+        }
+        if let Some(l) = self.force::<forces::LocationAffinity>() {
+            out.location_strength = l.strength;
+            out.location_falloff = l.falloff;
+            out.location_enabled = l.enabled;
+        }
+        if let Some(c) = self.force::<forces::Containment>() {
+            out.containment_strength = c.strength;
+            out.containment_enabled = c.enabled;
+        }
+        if let Some(cr) = self.force::<forces::ContainerRepulsion>() {
+            out.container_repulsion = cr.strength;
+            out.container_repulsion_enabled = cr.enabled;
+        }
+        out
+    }
+
+    /// Apply a [`ForceParams`] snapshot to the simulation.
+    pub fn import_params(&mut self, params: &ForceParams) {
+        self.damping = params.damping;
+        self.max_velocity = params.max_velocity;
+        for force in self.forces.iter_mut() {
+            let any = force.as_any_mut();
+            if let Some(g) = any.downcast_mut::<forces::Gravity>() {
+                g.strength = params.gravity;
+                g.enabled = params.gravity_enabled;
+                continue;
+            }
+            if let Some(r) = any.downcast_mut::<forces::Repulsion>() {
+                r.strength = params.repulsion;
+                r.cutoff = params.repulsion_cutoff;
+                r.min_dist = params.min_dist;
+                r.enabled = params.repulsion_enabled;
+                continue;
+            }
+            if let Some(s) = any.downcast_mut::<forces::SpringAttraction>() {
+                s.global_attraction = params.attraction;
+                s.global_ideal_length = params.ideal_length;
+                s.min_dist = params.min_dist;
+                s.enabled = params.attraction_enabled;
+                s.edge_params.clone_from(&params.edge_params);
+                continue;
+            }
+            if let Some(l) = any.downcast_mut::<forces::LocationAffinity>() {
+                l.strength = params.location_strength;
+                l.falloff = params.location_falloff;
+                l.enabled = params.location_enabled;
+                continue;
+            }
+            if let Some(c) = any.downcast_mut::<forces::Containment>() {
+                c.strength = params.containment_strength;
+                c.enabled = params.containment_enabled;
+                continue;
+            }
+            if let Some(cr) = any.downcast_mut::<forces::ContainerRepulsion>() {
+                cr.strength = params.container_repulsion;
+                cr.enabled = params.container_repulsion_enabled;
+                continue;
+            }
         }
     }
 
@@ -410,381 +554,151 @@ impl LayoutState {
     fn step_inner(&mut self, n: u32, early_stop: bool) {
         /// Energy threshold below which batch layout stops early.
         const EARLY_STOP_ENERGY: f32 = 0.5;
-        /// Threshold below which we use serial computation (rayon overhead not
-        /// worth it for small graphs).
-        const PARALLEL_THRESHOLD: usize = 500;
 
         let len = self.positions.len();
         if len == 0 {
             return;
         }
-        let p = &self.params;
 
         for _ in 0..n {
             if early_stop && self.energy() < EARLY_STOP_ENERGY {
                 break;
             }
 
-            // --- Repulsive forces via grid-based cutoff ---
-            let mut forces = if p.repulsion_enabled {
-                let cutoff = p.repulsion_cutoff;
-                let cutoff_sq = cutoff * cutoff;
-                let inv_cutoff = 1.0 / cutoff;
-                let repulsion = p.repulsion;
-                let min_dist = p.min_dist;
-
-                // Build spatial grid: assign each node to a cell (skip hidden).
-                let cell_keys: Vec<(i32, i32)> = self
-                    .positions
-                    .iter()
-                    .map(|pos| {
-                        let cx = (pos.x * inv_cutoff).floor() as i32;
-                        let cy = (pos.y * inv_cutoff).floor() as i32;
-                        (cx, cy)
-                    })
-                    .collect();
-
-                let mut grid: HashMap<(i32, i32), Vec<usize>> = HashMap::with_capacity(len / 4 + 1);
-                for (i, &key) in cell_keys.iter().enumerate() {
-                    if !self.hidden.contains(&i) {
-                        grid.entry(key).or_default().push(i);
-                    }
-                }
-
-                let positions_ref = &self.positions;
-                let grid_ref = &grid;
-                let hidden_ref = &self.hidden;
-
-                if len >= PARALLEL_THRESHOLD {
-                    (0..len)
-                        .into_par_iter()
-                        .map(|i| {
-                            if hidden_ref.contains(&i) {
-                                return Vec2::ZERO;
-                            }
-                            compute_repulsion_for_node(
-                                i,
-                                positions_ref,
-                                grid_ref,
-                                &cell_keys,
-                                cutoff_sq,
-                                inv_cutoff,
-                                repulsion,
-                                min_dist,
-                            )
-                        })
-                        .collect()
-                } else {
-                    (0..len)
-                        .map(|i| {
-                            if hidden_ref.contains(&i) {
-                                return Vec2::ZERO;
-                            }
-                            compute_repulsion_for_node(
-                                i,
-                                positions_ref,
-                                grid_ref,
-                                &cell_keys,
-                                cutoff_sq,
-                                inv_cutoff,
-                                repulsion,
-                                min_dist,
-                            )
-                        })
-                        .collect()
-                }
-            } else {
-                vec![Vec2::ZERO; len]
+            // Accumulate all forces into a fresh buffer.
+            let mut forces = vec![Vec2::ZERO; len];
+            let ctx = forces::ForceContext {
+                positions: &self.positions,
+                sizes: &self.sizes,
+                degrees: &self.degrees,
+                active: &self.active,
+                edge_pairs: &self.edge_pairs,
+                visible_edge_kinds: &self.visible_edge_kinds,
+                children_of: &self.children_of,
+                containers: &self.containers,
+                expanded: &self.expanded,
+                toplevel_containers: &self.toplevel_containers,
+                node_count: len,
             };
-
-            // Attractive forces along visible edges only (per-edge-kind params).
-            //
-            // Linear spring, but each endpoint's force is divided by
-            // sqrt(degree) so hub nodes (many connections) don't get
-            // yanked across the canvas by the sum of all their edges.
-            if p.attraction_enabled {
-                for &(from, to, kind) in &self.edge_pairs {
-                    if !self.visible_edge_kinds.contains(&kind) {
-                        continue;
-                    }
-                    if self.hidden.contains(&from) || self.hidden.contains(&to) {
-                        continue;
-                    }
-                    let (attr, rest_len) = if let Some(ep) = p.edge_params.get(&kind) {
-                        (ep.attraction, ep.target_distance)
-                    } else {
-                        (p.attraction, p.ideal_length)
-                    };
-                    let delta = self.positions[to] - self.positions[from];
-                    let dist = delta.length().max(p.min_dist);
-                    let displacement = attr * (dist - rest_len);
-                    let dir = delta.normalize_or_zero();
-                    // Scale by 1/sqrt(degree) at each endpoint so hubs stay calm.
-                    forces[from] += dir * displacement / self.degrees[from].sqrt();
-                    forces[to] -= dir * displacement / self.degrees[to].sqrt();
+            for force in &self.forces {
+                if force.enabled() {
+                    force.apply(&ctx, &mut forces);
                 }
             }
 
-            // Containment force: each container pulls its DIRECT children
-            // toward their centroid. Top-level containers (TU/Namespace)
-            // use half strength so class-level containment dominates.
-            if p.containment_enabled && p.containment_strength > 0.0 {
-                for &c in &self.containers {
-                    if self.hidden.contains(&c) {
-                        continue;
-                    }
-                    let children = &self.children_of[c];
-                    if children.len() < 2 {
-                        continue;
-                    }
-                    let mut centroid = Vec2::ZERO;
-                    let mut count = 0u32;
-                    for &child in children {
-                        if !self.hidden.contains(&child) {
-                            centroid += self.positions[child];
-                            count += 1;
-                        }
-                    }
-                    if count < 2 {
-                        continue;
-                    }
-                    centroid /= count as f32;
+            // Integrate velocity/position, then clamp descendants of
+            // collapsed containers inside their parent's bounding box.
+            self.integrate(&forces);
+            self.clamp_collapsed();
+        }
+    }
 
-                    let strength = if self.toplevel_containers.contains(&c) {
-                        p.containment_strength * 0.5
-                    } else {
-                        p.containment_strength
-                    };
-                    for &child in children {
-                        if !self.hidden.contains(&child) {
-                            forces[child] += (centroid - self.positions[child]) * strength;
-                        }
-                    }
-                }
+    /// Update velocities and positions from an accumulated force buffer.
+    ///
+    /// Applies adaptive cooling (damping decays over time), clamps per-node
+    /// force and velocity magnitudes, skips hidden nodes, and holds pinned
+    /// nodes at their fixed positions. Increments `total_steps`.
+    ///
+    /// Per-node work here is a handful of arithmetic ops plus one
+    /// hash-map lookup for pin state — much cheaper than any `Force`
+    /// inner loop, so the parallel path only kicks in on much larger
+    /// graphs than [`forces::PARALLEL_THRESHOLD`]. Below that, rayon's
+    /// setup cost dominates.
+    fn integrate(&mut self, forces: &[Vec2]) {
+        /// Node-count threshold above which integration runs under
+        /// rayon. Much larger than the force-apply threshold because
+        /// per-node integrate work is O(1) constants rather than
+        /// O(neighbourhood).
+        const INTEGRATE_PARALLEL_THRESHOLD: usize = 5000;
+
+        let cooling = (1.0 - (self.total_steps as f32 / 300.0).min(0.95)).max(0.05);
+        let effective_damping = self.damping * cooling;
+        let max_vel = self.max_velocity * cooling;
+        let max_force = self.max_velocity * 2.0;
+        self.total_steps += 1;
+
+        let n = self.positions.len();
+        if n == 0 {
+            return;
+        }
+
+        // Split `self` into disjoint field borrows so the parallel loop
+        // can hold mutable borrows on positions/velocities while sharing
+        // `active`, `ids`, and `pins` across worker threads.
+        let positions = &mut self.positions;
+        let velocities = &mut self.velocities;
+        let active: &[bool] = &self.active;
+        let ids: &[SymbolId] = &self.ids;
+        let pins = &self.pins;
+
+        let integrate_one = |i: usize, pos: &mut Vec2, vel: &mut Vec2, force: Vec2| {
+            if !active[i] {
+                *vel = Vec2::ZERO;
+                return;
             }
-
-            // Location-affinity force: pull nodes toward their directory
-            // group centroids at each depth level.
-            if p.location_enabled && p.location_strength > 0.0 && !self.dir_groups.is_empty() {
-                let max_d = self.max_dir_depth;
-                for (depth, groups_at_depth) in self.dir_groups.iter().enumerate() {
-                    // Deeper = more specific = stronger. Scale so the deepest
-                    // level gets full strength and shallower levels decay.
-                    let level_scale = if max_d > 0 {
-                        p.location_falloff.powi((max_d - depth) as i32)
-                    } else {
-                        1.0
-                    };
-                    let strength = p.location_strength * level_scale;
-                    if strength < 1e-6 {
-                        continue;
-                    }
-
-                    for group in groups_at_depth {
-                        // Compute centroid of visible nodes in this group.
-                        let mut centroid = Vec2::ZERO;
-                        let mut count = 0u32;
-                        for &idx in group {
-                            if !self.hidden.contains(&idx) {
-                                centroid += self.positions[idx];
-                                count += 1;
-                            }
-                        }
-                        if count < 2 {
-                            continue;
-                        }
-                        centroid /= count as f32;
-
-                        for &idx in group {
-                            if !self.hidden.contains(&idx) {
-                                forces[idx] += (centroid - self.positions[idx]) * strength;
-                            }
-                        }
-                    }
-                }
+            if let Some(&pin_pos) = pins.get(&ids[i]) {
+                *pos = pin_pos;
+                *vel = Vec2::ZERO;
+                return;
             }
-
-            // Gravity: gentle pull toward the centroid (skip hidden)
-            if p.gravity_enabled && p.gravity > 0.0 {
-                let mut centroid = Vec2::ZERO;
-                let mut visible_count = 0u32;
-                for (i, pos) in self.positions.iter().enumerate() {
-                    if !self.hidden.contains(&i) {
-                        centroid += *pos;
-                        visible_count += 1;
-                    }
-                }
-                if visible_count > 0 {
-                    centroid /= visible_count as f32;
-                    for (i, (force, pos)) in
-                        forces.iter_mut().zip(self.positions.iter()).enumerate()
-                    {
-                        if !self.hidden.contains(&i) {
-                            *force += (centroid - *pos) * p.gravity;
-                        }
-                    }
-                }
+            // Clamp force magnitude to prevent explosive acceleration
+            // when nodes are very close or container overlaps are large.
+            let mut f = force;
+            let f_mag = f.length();
+            if f_mag > max_force {
+                f *= max_force / f_mag;
             }
-
-            // Container overlap resolution: push sibling containers apart
-            // only when their bounding boxes actually overlap. Force is
-            // proportional to overlap depth so containers separate just
-            // enough to stop intersecting, then stop receiving force.
-            if p.container_repulsion_enabled && p.container_repulsion > 0.0 {
-                let cr = p.container_repulsion;
-                for group in &self.sibling_groups {
-                    // Collect the expanded, visible containers in this group.
-                    let active: Vec<usize> = group
-                        .iter()
-                        .copied()
-                        .filter(|&c| !self.hidden.contains(&c) && self.expanded.contains(&c))
-                        .collect();
-                    if active.len() < 2 {
-                        continue;
-                    }
-
-                    // Grid-accelerated overlap detection: bucket containers by
-                    // cell so we only check nearby pairs instead of all O(S²).
-                    let max_extent = active
-                        .iter()
-                        .map(|&c| self.sizes[c].x.max(self.sizes[c].y))
-                        .fold(0.0f32, f32::max);
-                    // Cell size = largest container extent so overlapping pairs
-                    // are always in the same or adjacent cells.
-                    let cell_size = max_extent.max(1.0);
-                    let inv_cell = 1.0 / cell_size;
-
-                    let mut grid: HashMap<(i32, i32), Vec<usize>> = HashMap::new();
-                    for &c in &active {
-                        let cx = (self.positions[c].x * inv_cell).floor() as i32;
-                        let cy = (self.positions[c].y * inv_cell).floor() as i32;
-                        grid.entry((cx, cy)).or_default().push(c);
-                    }
-
-                    // Check each container against neighbours in a 3×3 cell window.
-                    for &a in &active {
-                        let pos_a = self.positions[a];
-                        let half_a = self.sizes[a] * 0.5;
-                        let ax = (pos_a.x * inv_cell).floor() as i32;
-                        let ay = (pos_a.y * inv_cell).floor() as i32;
-
-                        for dx in -1i32..=1 {
-                            for dy in -1i32..=1 {
-                                let key = (ax.wrapping_add(dx), ay.wrapping_add(dy));
-                                let Some(bucket) = grid.get(&key) else {
-                                    continue;
-                                };
-                                for &b in bucket {
-                                    // Avoid self-pairs and double-counting (a < b).
-                                    if b <= a {
-                                        continue;
-                                    }
-                                    let pos_b = self.positions[b];
-                                    let half_b = self.sizes[b] * 0.5;
-
-                                    // AABB overlap test on each axis.
-                                    let overlap_x =
-                                        (half_a.x + half_b.x) - (pos_a.x - pos_b.x).abs();
-                                    let overlap_y =
-                                        (half_a.y + half_b.y) - (pos_a.y - pos_b.y).abs();
-
-                                    if overlap_x <= 0.0 || overlap_y <= 0.0 {
-                                        continue; // No overlap — skip.
-                                    }
-
-                                    // Push apart along the axis of least overlap
-                                    // (minimum penetration direction).
-                                    let delta = pos_a - pos_b;
-                                    let f = if overlap_x < overlap_y {
-                                        Vec2::new(delta.x.signum() * overlap_x * cr, 0.0)
-                                    } else {
-                                        Vec2::new(0.0, delta.y.signum() * overlap_y * cr)
-                                    };
-
-                                    // Rigid-body: move container + all descendants.
-                                    apply_force_to_subtree(
-                                        a,
-                                        f,
-                                        &mut forces,
-                                        &self.children_of,
-                                        &self.hidden,
-                                    );
-                                    apply_force_to_subtree(
-                                        b,
-                                        -f,
-                                        &mut forces,
-                                        &self.children_of,
-                                        &self.hidden,
-                                    );
-                                }
-                            }
-                        }
-                    }
-                }
+            *vel = (*vel + f) * effective_damping;
+            let speed = vel.length();
+            if speed > max_vel {
+                *vel *= max_vel / speed;
             }
+            *pos += *vel;
+        };
 
-            // Adaptive cooling: damping decreases over time so the layout
-            // progressively freezes into place.
-            let cooling = (1.0 - (self.total_steps as f32 / 300.0).min(0.95)).max(0.05);
-            let effective_damping = p.damping * cooling;
-            let max_vel = p.max_velocity * cooling;
-            self.total_steps += 1;
-
-            // Update velocities and positions (skip pinned and hidden nodes)
-            for (i, (((id, pos), vel), force)) in self
-                .ids
-                .iter()
-                .zip(self.positions.iter_mut())
-                .zip(self.velocities.iter_mut())
+        if n >= INTEGRATE_PARALLEL_THRESHOLD {
+            positions
+                .par_iter_mut()
+                .zip(velocities.par_iter_mut())
+                .zip(forces.par_iter())
+                .enumerate()
+                .for_each(|(i, ((pos, vel), force))| {
+                    integrate_one(i, pos, vel, *force);
+                });
+        } else {
+            for (i, ((pos, vel), force)) in positions
+                .iter_mut()
+                .zip(velocities.iter_mut())
                 .zip(forces.iter())
                 .enumerate()
             {
-                if self.hidden.contains(&i) {
-                    *vel = Vec2::ZERO;
-                    continue;
-                }
-                if let Some(&pin_pos) = self.pins.get(id) {
-                    *pos = pin_pos;
-                    *vel = Vec2::ZERO;
-                } else {
-                    // Clamp force magnitude to prevent explosive acceleration
-                    // when nodes are very close or container overlaps are large.
-                    let mut f = *force;
-                    let f_mag = f.length();
-                    let max_force = p.max_velocity * 2.0;
-                    if f_mag > max_force {
-                        f *= max_force / f_mag;
-                    }
-                    *vel = (*vel + f) * effective_damping;
-                    let speed = vel.length();
-                    if speed > max_vel {
-                        *vel *= max_vel / speed;
-                    }
-                    *pos += *vel;
-                }
+                integrate_one(i, pos, vel, *force);
             }
+        }
+    }
 
-            // Clamp ALL descendants of collapsed containers inside a
-            // fixed box around the parent position.
-            for &c in &self.containers {
-                if self.expanded.contains(&c) || self.hidden.contains(&c) {
+    /// Clamp every descendant of a collapsed (non-expanded) container
+    /// inside a fixed-size box around the container's current position.
+    /// Expanded containers let their descendants move freely.
+    fn clamp_collapsed(&mut self) {
+        for &c in &self.containers {
+            if self.expanded.contains(&c) || !self.active[c] {
+                continue;
+            }
+            let center = self.positions[c];
+            for &d in &self.all_descendants_idx(c) {
+                if !self.active[d] {
                     continue;
                 }
-                let center = self.positions[c];
-                for &d in &self.all_descendants_idx(c) {
-                    if self.hidden.contains(&d) {
-                        continue;
-                    }
-                    let pos = &mut self.positions[d];
-                    pos.x = pos.x.clamp(
-                        center.x - COLLAPSED_HALF_SIZE.x,
-                        center.x + COLLAPSED_HALF_SIZE.x,
-                    );
-                    pos.y = pos.y.clamp(
-                        center.y - COLLAPSED_HALF_SIZE.y,
-                        center.y + COLLAPSED_HALF_SIZE.y,
-                    );
-                }
+                let pos = &mut self.positions[d];
+                pos.x = pos.x.clamp(
+                    center.x - COLLAPSED_HALF_SIZE.x,
+                    center.x + COLLAPSED_HALF_SIZE.x,
+                );
+                pos.y = pos.y.clamp(
+                    center.y - COLLAPSED_HALF_SIZE.y,
+                    center.y + COLLAPSED_HALF_SIZE.y,
+                );
             }
         }
     }
@@ -851,18 +765,9 @@ impl LayoutState {
         self.velocities.iter().map(|v| v.length_squared()).sum()
     }
 
-    /// Shared reference to the current force parameters.
-    pub fn params(&self) -> &ForceParams {
-        &self.params
-    }
-
-    /// Mutable reference to the force parameters for live-tweaking.
-    pub fn params_mut(&mut self) -> &mut ForceParams {
-        &mut self.params
-    }
-
     /// Partially reset the cooling schedule so parameter changes take visible
-    /// effect. Call after modifying [`ForceParams`] via [`params_mut`](Self::params_mut).
+    /// effect. Call after tuning a force via
+    /// [`force_mut`](Self::force_mut) or [`import_params`](Self::import_params).
     pub fn reheat(&mut self) {
         self.total_steps = self.total_steps.saturating_sub(100);
     }
@@ -916,19 +821,25 @@ impl LayoutState {
     /// This merges with collapse-hidden state — nodes hidden by either
     /// mechanism are excluded.
     pub fn set_hidden(&mut self, ids: &[SymbolId]) {
-        self.external_hidden.clear();
+        for slot in self.external_hidden.iter_mut() {
+            *slot = false;
+        }
         for id in ids {
             if let Some(&idx) = self.id_to_idx.get(id) {
-                self.external_hidden.insert(idx);
+                self.external_hidden[idx] = true;
             }
         }
-        self.rebuild_hidden();
+        self.rebuild_active();
         self.reheat();
     }
 
-    /// Rebuild the effective hidden set from collapse + external sources.
-    fn rebuild_hidden(&mut self) {
-        self.hidden = &self.collapse_hidden | &self.external_hidden;
+    /// Rebuild the [`Self::active`] flag from the collapse + external
+    /// hidden sources. A node is active iff neither mechanism has marked
+    /// it hidden.
+    fn rebuild_active(&mut self) {
+        for (i, active) in self.active.iter_mut().enumerate() {
+            *active = !self.collapse_hidden[i] && !self.external_hidden[i];
+        }
     }
 
     /// Collapse a container node: all descendants stay in the simulation
@@ -1087,68 +998,6 @@ fn build_sibling_groups(
     }
     // Only keep groups with at least 2 siblings (single containers can't repel).
     by_parent.into_values().filter(|g| g.len() >= 2).collect()
-}
-
-/// Apply a force to a node and all its descendants (rigid-body translation).
-/// Walks the subtree via `children_of` without allocating.
-fn apply_force_to_subtree(
-    root: usize,
-    force: Vec2,
-    forces: &mut [Vec2],
-    children_of: &[Vec<usize>],
-    hidden: &HashSet<usize>,
-) {
-    forces[root] += force;
-    // Use a manual stack to avoid recursion overhead.
-    let mut stack: Vec<usize> = children_of[root].clone();
-    while let Some(node) = stack.pop() {
-        if !hidden.contains(&node) {
-            forces[node] += force;
-            stack.extend_from_slice(&children_of[node]);
-        }
-    }
-}
-
-/// Compute point-based Coulomb repulsive force on node `i` from its 3×3
-/// grid neighbourhood. Center-to-center distance, no size awareness.
-#[allow(clippy::too_many_arguments)]
-fn compute_repulsion_for_node(
-    i: usize,
-    positions: &[Vec2],
-    grid: &HashMap<(i32, i32), Vec<usize>>,
-    cell_keys: &[(i32, i32)],
-    cutoff_sq: f32,
-    inv_cutoff: f32,
-    repulsion: f32,
-    min_dist: f32,
-) -> Vec2 {
-    let _ = inv_cutoff; // used for grid key computation at call site
-    let pos_i = positions[i];
-    let (cx, cy) = cell_keys[i];
-    let mut force = Vec2::ZERO;
-
-    // Scan 3×3 neighbourhood (including own cell)
-    for dx in -1..=1i32 {
-        for dy in -1..=1i32 {
-            let nx = cx.wrapping_add(dx);
-            let ny = cy.wrapping_add(dy);
-            if let Some(cell) = grid.get(&(nx, ny)) {
-                for &j in cell {
-                    if j == i {
-                        continue;
-                    }
-                    let delta = pos_i - positions[j];
-                    let dist_sq = delta.length_squared();
-                    if dist_sq > cutoff_sq || dist_sq < 1e-10 {
-                        continue;
-                    }
-                    let dist = dist_sq.sqrt().max(min_dist);
-                    force += delta.normalize_or_zero() * (repulsion / (dist * dist));
-                }
-            }
-        }
-    }
-    force
 }
 
 /// Build hierarchical directory groups from the graph's file table.

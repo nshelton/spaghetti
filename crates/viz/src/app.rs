@@ -262,7 +262,9 @@ impl SpaghettiApp {
             ),
             zoom: settings.view.camera_zoom,
         };
-        *self.simulation.layout_state.params_mut() = settings.force_params.clone();
+        self.simulation
+            .layout_state
+            .import_params(&settings.force_params);
         self.filters.pending_dir_visibility = settings.view.dir_visibility.clone();
     }
 
@@ -273,7 +275,7 @@ impl SpaghettiApp {
         self.indexing.recent_projects.retain(|p| p != &path);
         self.indexing.recent_projects.insert(0, path.clone());
         self.indexing.recent_projects.truncate(5);
-        let params = self.simulation.layout_state.params().clone();
+        let params = self.simulation.layout_state.export_params();
 
         let (progress_tx, progress_rx) = std::sync::mpsc::channel();
         let (cancel_tx, cancel_rx) = std::sync::mpsc::channel::<()>();
@@ -470,7 +472,7 @@ impl eframe::App for SpaghettiApp {
 
     fn on_exit(&mut self) {
         let settings = crate::settings::AppSettings {
-            force_params: self.simulation.layout_state.params().clone(),
+            force_params: self.simulation.layout_state.export_params(),
             render: self.render.render.clone(),
             view: self.view_settings(),
             recent_projects: self.indexing.recent_projects.clone(),
