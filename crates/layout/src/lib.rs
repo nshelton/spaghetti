@@ -528,27 +528,17 @@ impl LayoutState {
             return;
         }
 
-        // Push the latest tunable values from `self.params` into any
-        // already-extracted forces before stepping.
+        // Push the latest tunable values from `self.params` into the
+        // force pipeline once per call.
         self.sync_forces_from_params();
-
-        let p = &self.params;
 
         for _ in 0..n {
             if early_stop && self.energy() < EARLY_STOP_ENERGY {
                 break;
             }
 
-            // Fresh accumulator for this iteration. Repulsion now runs as
-            // a `Force` further down instead of seeding this buffer itself.
+            // Accumulate all forces into a fresh buffer.
             let mut forces = vec![Vec2::ZERO; len];
-
-            // --- Force pipeline ---
-            //
-            // All forces now run through the trait-based pipeline:
-            // repulsion, spring attraction, containment, container
-            // repulsion, location affinity, gravity. step_inner is down
-            // to ctx setup → accumulate → integrate → clamp.
             let ctx = forces::ForceContext {
                 positions: &self.positions,
                 sizes: &self.sizes,
@@ -568,68 +558,83 @@ impl LayoutState {
                 }
             }
 
-            // Adaptive cooling: damping decreases over time so the layout
-            // progressively freezes into place.
-            let cooling = (1.0 - (self.total_steps as f32 / 300.0).min(0.95)).max(0.05);
-            let effective_damping = p.damping * cooling;
-            let max_vel = p.max_velocity * cooling;
-            self.total_steps += 1;
+            // Integrate velocity/position, then clamp descendants of
+            // collapsed containers inside their parent's bounding box.
+            self.integrate(&forces);
+            self.clamp_collapsed();
+        }
+    }
 
-            // Update velocities and positions (skip pinned and hidden nodes)
-            for (i, (((id, pos), vel), force)) in self
-                .ids
-                .iter()
-                .zip(self.positions.iter_mut())
-                .zip(self.velocities.iter_mut())
-                .zip(forces.iter())
-                .enumerate()
-            {
-                if !self.active[i] {
-                    *vel = Vec2::ZERO;
-                    continue;
-                }
-                if let Some(&pin_pos) = self.pins.get(id) {
-                    *pos = pin_pos;
-                    *vel = Vec2::ZERO;
-                } else {
-                    // Clamp force magnitude to prevent explosive acceleration
-                    // when nodes are very close or container overlaps are large.
-                    let mut f = *force;
-                    let f_mag = f.length();
-                    let max_force = p.max_velocity * 2.0;
-                    if f_mag > max_force {
-                        f *= max_force / f_mag;
-                    }
-                    *vel = (*vel + f) * effective_damping;
-                    let speed = vel.length();
-                    if speed > max_vel {
-                        *vel *= max_vel / speed;
-                    }
-                    *pos += *vel;
-                }
+    /// Update velocities and positions from an accumulated force buffer.
+    ///
+    /// Applies adaptive cooling (damping decays over time), clamps per-node
+    /// force and velocity magnitudes, skips hidden nodes, and holds pinned
+    /// nodes at their fixed positions. Increments `total_steps`.
+    fn integrate(&mut self, forces: &[Vec2]) {
+        let p = &self.params;
+        // Adaptive cooling: damping decreases over time so the layout
+        // progressively freezes into place.
+        let cooling = (1.0 - (self.total_steps as f32 / 300.0).min(0.95)).max(0.05);
+        let effective_damping = p.damping * cooling;
+        let max_vel = p.max_velocity * cooling;
+        let max_force = p.max_velocity * 2.0;
+        self.total_steps += 1;
+
+        for (i, (((id, pos), vel), force)) in self
+            .ids
+            .iter()
+            .zip(self.positions.iter_mut())
+            .zip(self.velocities.iter_mut())
+            .zip(forces.iter())
+            .enumerate()
+        {
+            if !self.active[i] {
+                *vel = Vec2::ZERO;
+                continue;
             }
+            if let Some(&pin_pos) = self.pins.get(id) {
+                *pos = pin_pos;
+                *vel = Vec2::ZERO;
+            } else {
+                // Clamp force magnitude to prevent explosive acceleration
+                // when nodes are very close or container overlaps are large.
+                let mut f = *force;
+                let f_mag = f.length();
+                if f_mag > max_force {
+                    f *= max_force / f_mag;
+                }
+                *vel = (*vel + f) * effective_damping;
+                let speed = vel.length();
+                if speed > max_vel {
+                    *vel *= max_vel / speed;
+                }
+                *pos += *vel;
+            }
+        }
+    }
 
-            // Clamp ALL descendants of collapsed containers inside a
-            // fixed box around the parent position.
-            for &c in &self.containers {
-                if self.expanded.contains(&c) || !self.active[c] {
+    /// Clamp every descendant of a collapsed (non-expanded) container
+    /// inside a fixed-size box around the container's current position.
+    /// Expanded containers let their descendants move freely.
+    fn clamp_collapsed(&mut self) {
+        for &c in &self.containers {
+            if self.expanded.contains(&c) || !self.active[c] {
+                continue;
+            }
+            let center = self.positions[c];
+            for &d in &self.all_descendants_idx(c) {
+                if !self.active[d] {
                     continue;
                 }
-                let center = self.positions[c];
-                for &d in &self.all_descendants_idx(c) {
-                    if !self.active[d] {
-                        continue;
-                    }
-                    let pos = &mut self.positions[d];
-                    pos.x = pos.x.clamp(
-                        center.x - COLLAPSED_HALF_SIZE.x,
-                        center.x + COLLAPSED_HALF_SIZE.x,
-                    );
-                    pos.y = pos.y.clamp(
-                        center.y - COLLAPSED_HALF_SIZE.y,
-                        center.y + COLLAPSED_HALF_SIZE.y,
-                    );
-                }
+                let pos = &mut self.positions[d];
+                pos.x = pos.x.clamp(
+                    center.x - COLLAPSED_HALF_SIZE.x,
+                    center.x + COLLAPSED_HALF_SIZE.x,
+                );
+                pos.y = pos.y.clamp(
+                    center.y - COLLAPSED_HALF_SIZE.y,
+                    center.y + COLLAPSED_HALF_SIZE.y,
+                );
             }
         }
     }
