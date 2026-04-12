@@ -15,6 +15,7 @@ use std::collections::HashSet;
 pub mod container_repulsion;
 pub mod containment;
 pub mod gravity;
+pub(crate) mod grid;
 pub mod location_affinity;
 pub mod repulsion;
 pub mod spring_attraction;

@@ -14,8 +14,8 @@
 use glam::Vec2;
 use rayon::prelude::*;
 use std::any::Any;
-use std::collections::HashMap;
 
+use super::grid::SpatialGrid;
 use super::{Force, ForceContext, PARALLEL_THRESHOLD};
 
 /// Grid-based point-Coulomb repulsion.
@@ -60,29 +60,23 @@ impl Force for Repulsion {
 
         let cutoff = self.cutoff;
         let cutoff_sq = cutoff * cutoff;
-        let inv_cutoff = 1.0 / cutoff;
         let strength = self.strength;
         let min_dist = self.min_dist;
         let len = ctx.node_count;
 
-        // Cell key for every position. Hidden nodes get a key but aren't
-        // inserted into the grid, so they can't contribute force.
-        let cell_keys: Vec<(i32, i32)> = ctx
-            .positions
-            .iter()
-            .map(|pos| {
-                let cx = (pos.x * inv_cutoff).floor() as i32;
-                let cy = (pos.y * inv_cutoff).floor() as i32;
-                (cx, cy)
-            })
-            .collect();
-
-        let mut grid: HashMap<(i32, i32), Vec<usize>> = HashMap::with_capacity(len / 4 + 1);
-        for (i, &key) in cell_keys.iter().enumerate() {
-            if ctx.active[i] {
-                grid.entry(key).or_default().push(i);
-            }
-        }
+        // Bucket active nodes into a flat spatial grid keyed by `cutoff`.
+        // The grid falls back to a hashmap if active-node positions are
+        // pathologically spread out.
+        let grid = SpatialGrid::build(
+            cutoff,
+            ctx.positions.iter().enumerate().filter_map(|(i, &pos)| {
+                if ctx.active[i] {
+                    Some((i, pos))
+                } else {
+                    None
+                }
+            }),
+        );
 
         let positions = ctx.positions;
         let active = ctx.active;
@@ -100,7 +94,7 @@ impl Force for Repulsion {
                         return;
                     }
                     *force += compute_repulsion_for_node(
-                        i, positions, grid_ref, &cell_keys, cutoff_sq, strength, min_dist,
+                        i, positions, grid_ref, cutoff_sq, strength, min_dist,
                     );
                 });
         } else {
@@ -109,7 +103,7 @@ impl Force for Repulsion {
                     continue;
                 }
                 *force += compute_repulsion_for_node(
-                    i, positions, grid_ref, &cell_keys, cutoff_sq, strength, min_dist,
+                    i, positions, grid_ref, cutoff_sq, strength, min_dist,
                 );
             }
         }
@@ -124,42 +118,33 @@ impl Force for Repulsion {
     }
 }
 
-/// Compute point-Coulomb repulsive force on node `i` from its 3×3 grid
-/// neighbourhood. Center-to-center distance, no size awareness.
-#[allow(clippy::too_many_arguments)]
+/// Point-Coulomb repulsive force on node `i` from the 3×3 cell
+/// neighbourhood of its current position. Center-to-center distance,
+/// no size awareness.
 fn compute_repulsion_for_node(
     i: usize,
     positions: &[Vec2],
-    grid: &HashMap<(i32, i32), Vec<usize>>,
-    cell_keys: &[(i32, i32)],
+    grid: &SpatialGrid,
     cutoff_sq: f32,
     strength: f32,
     min_dist: f32,
 ) -> Vec2 {
     let pos_i = positions[i];
-    let (cx, cy) = cell_keys[i];
+    let query_cell = grid.cell_of(pos_i);
     let mut force = Vec2::ZERO;
 
-    for dx in -1..=1i32 {
-        for dy in -1..=1i32 {
-            let nx = cx.wrapping_add(dx);
-            let ny = cy.wrapping_add(dy);
-            if let Some(cell) = grid.get(&(nx, ny)) {
-                for &j in cell {
-                    if j == i {
-                        continue;
-                    }
-                    let delta = pos_i - positions[j];
-                    let dist_sq = delta.length_squared();
-                    if dist_sq > cutoff_sq || dist_sq < 1e-10 {
-                        continue;
-                    }
-                    let dist = dist_sq.sqrt().max(min_dist);
-                    force += delta.normalize_or_zero() * (strength / (dist * dist));
-                }
-            }
+    grid.for_each_in_neighborhood(query_cell, |j| {
+        if j == i {
+            return;
         }
-    }
+        let delta = pos_i - positions[j];
+        let dist_sq = delta.length_squared();
+        if dist_sq > cutoff_sq || dist_sq < 1e-10 {
+            return;
+        }
+        let dist = dist_sq.sqrt().max(min_dist);
+        force += delta.normalize_or_zero() * (strength / (dist * dist));
+    });
     force
 }
 

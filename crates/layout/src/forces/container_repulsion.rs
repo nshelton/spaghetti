@@ -7,14 +7,16 @@
 //! stays laid out relative to itself while the whole block slides.
 //!
 //! Containers are grouped by their shared parent (sibling groups) so
-//! only direct siblings can repel each other. A grid indexed by the
-//! maximum container extent keeps per-group comparison to a 3×3
+//! only direct siblings can repel each other. A [`SpatialGrid`] indexed
+//! by the maximum container extent keeps per-group comparison to a 3×3
 //! neighbourhood instead of `O(S²)` pairs.
+//!
+//! [`SpatialGrid`]: super::grid::SpatialGrid
 
 use glam::Vec2;
 use std::any::Any;
-use std::collections::HashMap;
 
+use super::grid::SpatialGrid;
 use super::{Force, ForceContext};
 
 /// Sibling-container AABB overlap resolution.
@@ -73,56 +75,43 @@ impl Force for ContainerRepulsion {
                 .map(|&c| ctx.sizes[c].x.max(ctx.sizes[c].y))
                 .fold(0.0f32, f32::max);
             let cell_size = max_extent.max(1.0);
-            let inv_cell = 1.0 / cell_size;
-
-            let mut grid: HashMap<(i32, i32), Vec<usize>> = HashMap::new();
-            for &c in &live_siblings {
-                let cx = (ctx.positions[c].x * inv_cell).floor() as i32;
-                let cy = (ctx.positions[c].y * inv_cell).floor() as i32;
-                grid.entry((cx, cy)).or_default().push(c);
-            }
+            let grid = SpatialGrid::build(
+                cell_size,
+                live_siblings.iter().map(|&i| (i, ctx.positions[i])),
+            );
 
             for &a in &live_siblings {
                 let pos_a = ctx.positions[a];
                 let half_a = ctx.sizes[a] * 0.5;
-                let ax = (pos_a.x * inv_cell).floor() as i32;
-                let ay = (pos_a.y * inv_cell).floor() as i32;
+                let query_cell = grid.cell_of(pos_a);
 
-                for dx in -1i32..=1 {
-                    for dy in -1i32..=1 {
-                        let key = (ax.wrapping_add(dx), ay.wrapping_add(dy));
-                        let Some(bucket) = grid.get(&key) else {
-                            continue;
-                        };
-                        for &b in bucket {
-                            // Avoid self-pairs and double-counting.
-                            if b <= a {
-                                continue;
-                            }
-                            let pos_b = ctx.positions[b];
-                            let half_b = ctx.sizes[b] * 0.5;
-
-                            let overlap_x = (half_a.x + half_b.x) - (pos_a.x - pos_b.x).abs();
-                            let overlap_y = (half_a.y + half_b.y) - (pos_a.y - pos_b.y).abs();
-
-                            if overlap_x <= 0.0 || overlap_y <= 0.0 {
-                                continue;
-                            }
-
-                            // Push apart along the axis of least overlap
-                            // (minimum penetration direction).
-                            let delta = pos_a - pos_b;
-                            let f = if overlap_x < overlap_y {
-                                Vec2::new(delta.x.signum() * overlap_x * cr, 0.0)
-                            } else {
-                                Vec2::new(0.0, delta.y.signum() * overlap_y * cr)
-                            };
-
-                            apply_force_to_subtree(a, f, forces, ctx.children_of, ctx.active);
-                            apply_force_to_subtree(b, -f, forces, ctx.children_of, ctx.active);
-                        }
+                grid.for_each_in_neighborhood(query_cell, |b| {
+                    // Avoid self-pairs and double-counting.
+                    if b <= a {
+                        return;
                     }
-                }
+                    let pos_b = ctx.positions[b];
+                    let half_b = ctx.sizes[b] * 0.5;
+
+                    let overlap_x = (half_a.x + half_b.x) - (pos_a.x - pos_b.x).abs();
+                    let overlap_y = (half_a.y + half_b.y) - (pos_a.y - pos_b.y).abs();
+
+                    if overlap_x <= 0.0 || overlap_y <= 0.0 {
+                        return;
+                    }
+
+                    // Push apart along the axis of least overlap
+                    // (minimum penetration direction).
+                    let delta = pos_a - pos_b;
+                    let f = if overlap_x < overlap_y {
+                        Vec2::new(delta.x.signum() * overlap_x * cr, 0.0)
+                    } else {
+                        Vec2::new(0.0, delta.y.signum() * overlap_y * cr)
+                    };
+
+                    apply_force_to_subtree(a, f, forces, ctx.children_of, ctx.active);
+                    apply_force_to_subtree(b, -f, forces, ctx.children_of, ctx.active);
+                });
             }
         }
     }
