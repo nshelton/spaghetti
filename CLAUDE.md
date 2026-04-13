@@ -18,6 +18,11 @@ On macOS you also need: `export LIBCLANG_PATH=$(brew --prefix llvm)/lib`
 
 This is idempotent and fast if libclang is already present. **Cloud / CI agents must run this before any cargo command.**
 
+On macOS the viz crate's `build.rs` bakes `$LIBCLANG_PATH` into the
+binary as an `LC_RPATH` entry, so you do **not** need to set
+`DYLD_FALLBACK_LIBRARY_PATH` at runtime — the release binary finds
+`libclang.dylib` on its own.
+
 ## Architecture
 
 ```
