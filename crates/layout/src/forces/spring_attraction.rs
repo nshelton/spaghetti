@@ -7,18 +7,18 @@
 //! `target_distance`) let call and inheritance edges have different
 //! stiffnesses from the global fallback.
 //!
-//! On large graphs (≥ [`PARALLEL_THRESHOLD`] nodes) the per-edge loop
-//! runs under rayon. Multiple edges can touch the same endpoint, so the
-//! parallel path accumulates into per-thread local buffers and reduces
-//! them at the end to avoid data races on the shared `forces` slice.
+//! The edge loop is serial and writes directly into the shared `forces`
+//! accumulator. Per-edge work is tiny, so even on large graphs the
+//! single-threaded cost is a few milliseconds — well under the point
+//! where rayon's task-spawn + per-thread buffer allocation overhead
+//! starts paying off.
 
 use core_ir::EdgeKind;
 use glam::Vec2;
-use rayon::prelude::*;
 use std::any::Any;
 use std::collections::HashMap;
 
-use super::{Force, ForceContext, PARALLEL_THRESHOLD};
+use super::{Force, ForceContext};
 use crate::EdgeKindParams;
 
 /// Linear-spring attraction along visible edges.
@@ -104,41 +104,16 @@ impl Force for SpringAttraction {
     }
 
     fn apply(&self, ctx: &ForceContext, forces: &mut [Vec2]) {
-        if ctx.edge_pairs.is_empty() {
-            return;
-        }
-        let len = ctx.node_count;
-
-        if len >= PARALLEL_THRESHOLD {
-            // Multiple edges can touch the same endpoint, so each worker
-            // accumulates into a thread-local buffer and reduces at the
-            // end to avoid data races on `forces`.
-            let local_forces: Vec<Vec2> = ctx
-                .edge_pairs
-                .par_iter()
-                .fold(
-                    || vec![Vec2::ZERO; len],
-                    |mut local, &(from, to, kind)| {
-                        self.accumulate_edge(ctx, &mut local, from, to, kind);
-                        local
-                    },
-                )
-                .reduce(
-                    || vec![Vec2::ZERO; len],
-                    |mut acc, partial| {
-                        for (a, b) in acc.iter_mut().zip(partial.iter()) {
-                            *a += *b;
-                        }
-                        acc
-                    },
-                );
-            for (force, contrib) in forces.iter_mut().zip(local_forces.iter()) {
-                *force += *contrib;
-            }
-        } else {
-            for &(from, to, kind) in ctx.edge_pairs {
-                self.accumulate_edge(ctx, forces, from, to, kind);
-            }
+        // Serial single-pass accumulation into the shared `forces`
+        // slice. Per-edge work is tiny (~50-100 ns), so even at 200k
+        // edges this is <20 ms single-thread — well below the point
+        // where rayon's task-spawn + per-thread buffer allocation
+        // starts paying off. The previous `par_iter().fold(|| vec![...])`
+        // path allocated one N-sized `Vec<Vec2>` per rayon chunk, which
+        // at 57k nodes × ~16 chunks was ~16 MB of allocator churn per
+        // step.
+        for &(from, to, kind) in ctx.edge_pairs {
+            self.accumulate_edge(ctx, forces, from, to, kind);
         }
     }
 

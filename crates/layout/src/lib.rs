@@ -196,7 +196,7 @@ impl Default for ForceParams {
             ideal_length: 150.0,
             max_velocity: 50.0,
             min_dist: 1.0,
-            repulsion_cutoff: 500.0,
+            repulsion_cutoff: 250.0,
             gravity: 0.5,
             edge_params,
             location_strength: default_location_strength(),
