@@ -65,11 +65,15 @@ examples/
 ## Running
 
 ```bash
-# Requires libclang
+# Requires libclang. First run: pass a compile_commands.json path.
 LIBCLANG_PATH=$(brew --prefix llvm)/lib cargo run -p viz -- examples/tiny-cpp/compile_commands.json
+
+# Subsequent runs: the last-opened project is restored from
+# `spaghetti_settings.json`, so no CLI argument is needed.
+LIBCLANG_PATH=$(brew --prefix llvm)/lib cargo run -p viz
 ```
 
-Expected result: a window showing classes (Shape, Circle, Square), methods, fields, and `main` with inheritance, call, contains, overrides, and field-access edges. The force-directed layout animates into place over ~1-2 seconds. A file-tree panel on the left allows filtering by directory; a details panel on the right shows selected symbol info.
+Expected result (for `examples/tiny-cpp`): a window showing classes (Shape, Circle, Square), methods, fields, and `main` with inheritance, call, contains, overrides, and field-access edges. The force-directed layout animates into place over ~1-2 seconds. A file-tree panel on the left allows filtering by directory; a details panel on the right shows selected symbol info.
 
 ## libclang Setup
 
@@ -150,7 +154,7 @@ To verify the project is healthy:
 LIBCLANG_PATH=$(brew --prefix llvm)/lib cargo check --workspace && cargo test --workspace && cargo run -p viz -- examples/tiny-cpp/compile_commands.json
 ```
 
-All three should succeed and a window should appear showing the indexed graph with animated layout.
+All three should succeed and a window should appear showing the indexed graph with animated layout. If a project is already saved in `spaghetti_settings.json`, the CLI argument is optional — it is only needed to switch projects or on a fresh install.
 
 ## Handoff Rule
 
