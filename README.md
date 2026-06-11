@@ -1,4 +1,8 @@
 <img width="2932" height="1899" alt="Screenshot 2026-04-11 at 3 18 20 PM" src="https://github.com/user-attachments/assets/c4399bae-1fd1-4824-92be-a3a6193c0466" />
+
+> Call graph for a module of the linux kernel
+
+
 # spaghetti
 
 A cross-platform desktop visualizer for code structure and dataflow. Point it at a C++ project's `compile_commands.json` and get an interactive, zoomable graph of classes, methods, and their relationships.
@@ -21,6 +25,8 @@ LIBCLANG_PATH=$(brew --prefix llvm)/lib cargo run -p viz -- examples/tiny-cpp/co
 Expected result: a window showing classes (Shape, Circle, Square), methods, and `main` with inheritance, call, contains, and overrides edges. Nodes animate into place via force-directed layout.
 
 <img width="2641" height="1898" alt="Screenshot 2026-04-11 at 2 49 34 PM" src="https://github.com/user-attachments/assets/8f17c690-548c-4b72-b686-76186de2c9e6" />
+
+> Class containers with data members (yellow) and read - write patterns (red-blue) from a part of the linux kernel
 
 ## Features
 
