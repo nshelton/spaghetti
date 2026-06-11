@@ -559,44 +559,44 @@ fn visit_cursor(cursor: &clang::Entity, graph: &mut Graph, base_dir: &Path) {
             }
         }
 
-        EntityKind::InclusionDirective => {
+        EntityKind::InclusionDirective
             // Emit Includes edges between TranslationUnit symbols.
             // The inclusion directive's file location tells us which TU
             // contains the #include, and get_file() gives us the included file.
-            if is_in_project(cursor, base_dir) {
-                if let Some(included_file) = cursor.get_file() {
-                    let included_path = included_file.get_path();
-                    let included_str = included_path
-                        .strip_prefix(base_dir)
-                        .unwrap_or(&included_path)
-                        .to_string_lossy();
+            if is_in_project(cursor, base_dir) =>
+        {
+            if let Some(included_file) = cursor.get_file() {
+                let included_path = included_file.get_path();
+                let included_str = included_path
+                    .strip_prefix(base_dir)
+                    .unwrap_or(&included_path)
+                    .to_string_lossy();
 
-                    // Determine the including file from the cursor's location.
-                    if let Some(loc) = cursor.get_location() {
-                        let file_loc = loc.get_file_location();
-                        if let Some(src_file) = file_loc.file {
-                            let src_path = src_file.get_path();
-                            let src_str = src_path
-                                .strip_prefix(base_dir)
-                                .unwrap_or(&src_path)
-                                .to_string_lossy();
+                // Determine the including file from the cursor's location.
+                if let Some(loc) = cursor.get_location() {
+                    let file_loc = loc.get_file_location();
+                    if let Some(src_file) = file_loc.file {
+                        let src_path = src_file.get_path();
+                        let src_str = src_path
+                            .strip_prefix(base_dir)
+                            .unwrap_or(&src_path)
+                            .to_string_lossy();
 
-                            let src_id =
-                                SymbolId::from_parts(&src_str, SymbolKind::TranslationUnit);
-                            let inc_id =
-                                SymbolId::from_parts(&included_str, SymbolKind::TranslationUnit);
+                        let src_id =
+                            SymbolId::from_parts(&src_str, SymbolKind::TranslationUnit);
+                        let inc_id =
+                            SymbolId::from_parts(&included_str, SymbolKind::TranslationUnit);
 
-                            // Ensure both TU symbols exist.
-                            ensure_tu_symbol(graph, src_id, &src_str);
-                            ensure_tu_symbol(graph, inc_id, &included_str);
+                        // Ensure both TU symbols exist.
+                        ensure_tu_symbol(graph, src_id, &src_str);
+                        ensure_tu_symbol(graph, inc_id, &included_str);
 
-                            graph.add_edge(Edge {
-                                from: src_id,
-                                to: inc_id,
-                                kind: EdgeKind::Includes,
-                                location: None,
-                            });
-                        }
+                        graph.add_edge(Edge {
+                            from: src_id,
+                            to: inc_id,
+                            kind: EdgeKind::Includes,
+                            location: None,
+                        });
                     }
                 }
             }
