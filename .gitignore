@@ -5,3 +5,6 @@ Cargo.lock
 *.swo
 *~
 .DS_Store
+
+# macOS AppleDouble metadata (exFAT/network volumes)
+._*
