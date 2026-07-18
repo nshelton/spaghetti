@@ -71,7 +71,12 @@ impl SpaghettiApp {
         };
 
         let mut app = Self {
-            graph: GraphState { graph, file_tree },
+            graph: GraphState {
+                base: graph.clone(),
+                graph,
+                split_shared_types: view.split_shared_types,
+                file_tree,
+            },
             interaction: InteractionState {
                 selection: None,
                 hovered: None,
@@ -109,7 +114,53 @@ impl SpaghettiApp {
         app.filters
             .sync_hidden_to_layout(&app.graph, &mut app.simulation);
         app.simulation.update_node_sizes(&app.graph.graph);
+        if app.graph.split_shared_types {
+            app.rebuild_display_graph();
+        }
         app
+    }
+
+    /// Re-derive the displayed graph after the split-shared-types mode
+    /// changes: rebuild the file tree and layout engine, carry over positions
+    /// of surviving nodes, and seed new clones near their container.
+    pub(crate) fn rebuild_display_graph(&mut self) {
+        let old_positions = self.simulation.layout_state.positions();
+        self.graph.rebuild_display();
+
+        let vis = self.graph.file_tree.visibility_map();
+        self.graph.file_tree = FileTree::from_graph(&self.graph.graph);
+        self.graph.file_tree.apply_visibility(&vis);
+
+        let params = self.simulation.layout_state.params().clone();
+        self.simulation.layout_state = LayoutState::new(&self.graph.graph, 42, params);
+
+        // Deterministic jitter keeps seeded clones from stacking exactly on
+        // their container (coincident nodes stall repulsion).
+        for &id in self.graph.graph.symbols.keys() {
+            if let Some(&pos) = old_positions.0.get(&id) {
+                self.simulation.layout_state.set_position(id, pos);
+            } else if let Some(parent) = self.simulation.layout_state.parent_of(id) {
+                if let Some(&ppos) = old_positions.0.get(&parent) {
+                    let jitter = glam::Vec2::new(
+                        (id.0 & 0xFF) as f32 / 255.0 - 0.5,
+                        ((id.0 >> 8) & 0xFF) as f32 / 255.0 - 0.5,
+                    ) * 40.0;
+                    self.simulation.layout_state.set_position(id, ppos + jitter);
+                }
+            }
+        }
+        self.simulation.layout_state.reheat();
+
+        self.filters
+            .sync_hidden_symbols(&self.graph, &mut self.simulation);
+        self.simulation.positions = self.simulation.layout_state.positions();
+        self.simulation.container_rects.clear();
+        self.interaction.dragging = None;
+        if let Some(sel) = self.interaction.selection {
+            if !self.graph.graph.symbols.contains_key(&sel) {
+                self.interaction.selection = None;
+            }
+        }
     }
 
     /// Snapshot the current view state for serialization.
@@ -122,6 +173,7 @@ impl SpaghettiApp {
             show_console: self.console.show_console,
             console_level: format!("{}", self.console.console_level_filter),
             hide_edgeless: self.filters.hide_edgeless,
+            split_shared_types: self.graph.split_shared_types,
             dir_visibility: self.graph.file_tree.visibility_map(),
         }
     }
@@ -264,6 +316,10 @@ impl SpaghettiApp {
         };
         *self.simulation.layout_state.params_mut() = settings.force_params.clone();
         self.filters.pending_dir_visibility = settings.view.dir_visibility.clone();
+        if self.graph.split_shared_types != settings.view.split_shared_types {
+            self.graph.split_shared_types = settings.view.split_shared_types;
+            self.rebuild_display_graph();
+        }
     }
 
     /// Start indexing a file in a background thread.
@@ -292,23 +348,36 @@ impl SpaghettiApp {
             }
 
             let tx = progress_tx.clone();
-            let result =
-                frontend_clang::index_project_with_progress(&path, move |current, total, file| {
-                    if cancel_rx.try_recv().is_ok() {
-                        return false;
-                    }
-                    let _ = tx.send(ProgressMessage::Progress { current, total });
-                    let _ = tx.send(ProgressMessage::Status(format!(
-                        "Indexing TU {}/{}: {}",
-                        current + 1,
+            let result = frontend_clang::index_project_with_progress(&path, move |progress| {
+                if cancel_rx.try_recv().is_ok() {
+                    return false;
+                }
+                match progress {
+                    frontend_clang::IndexProgress::Parse {
+                        current,
                         total,
                         file,
-                    )));
-                    true
-                });
+                    } => {
+                        let _ = tx.send(ProgressMessage::Progress { current, total });
+                        let _ = tx.send(ProgressMessage::Status(format!(
+                            "Indexing TU {}/{}: {}",
+                            current + 1,
+                            total,
+                            file,
+                        )));
+                    }
+                    frontend_clang::IndexProgress::Merge { current, total } => {
+                        if current == 0 {
+                            let _ = tx.send(ProgressMessage::Status("Merging graphs…".into()));
+                        }
+                        let _ = tx.send(ProgressMessage::SubProgress { current, total });
+                    }
+                }
+                true
+            });
 
             match result {
-                Ok(graph) => {
+                Ok(mut graph) => {
                     if graph.symbol_count() == 0 && graph.edge_count() == 0 {
                         let _ = progress_tx.send(ProgressMessage::Cancelled);
                         return;
@@ -320,6 +389,33 @@ impl SpaghettiApp {
                         graph.edge_count()
                     )));
 
+                    // ISPC pass: picks up the .ispc entries the clang
+                    // frontend skips. Fast (pure tree-sitter), so no
+                    // cancellation.
+                    let _ = progress_tx.send(ProgressMessage::Status("ISPC pass…".into()));
+                    let ispc_result =
+                        frontend_ispc::index_project_with_progress(&path, |current, total, _| {
+                            let _ =
+                                progress_tx.send(ProgressMessage::SubProgress { current, total });
+                            true
+                        });
+                    match ispc_result {
+                        Ok(ispc_graph) if ispc_graph.symbol_count() > 0 => {
+                            let _ = progress_tx.send(ProgressMessage::Log(format!(
+                                "ISPC: {} symbols, {} edges",
+                                ispc_graph.symbol_count(),
+                                ispc_graph.edge_count()
+                            )));
+                            graph.merge(ispc_graph);
+                        }
+                        Ok(_) => {}
+                        Err(e) => {
+                            let _ = progress_tx
+                                .send(ProgressMessage::Log(format!("ISPC indexing failed: {e}")));
+                        }
+                    }
+
+                    let _ = progress_tx.send(ProgressMessage::Status("Building layout…".into()));
                     let layout_state = layout::LayoutState::new(&graph, 42, params);
 
                     let _ = progress_tx.send(ProgressMessage::Done {
@@ -366,10 +462,19 @@ impl SpaghettiApp {
                 } => {
                     let mut vis = self.filters.pending_dir_visibility.clone();
                     vis.extend(self.graph.file_tree.visibility_map());
-                    self.graph.file_tree = FileTree::from_graph(&graph);
+                    self.graph.base = *graph;
+                    self.graph.rebuild_display();
+                    self.graph.file_tree = FileTree::from_graph(&self.graph.graph);
                     self.graph.file_tree.apply_visibility(&vis);
-                    self.graph.graph = *graph;
-                    self.simulation.layout_state = *layout_state;
+                    // The background thread laid out the base graph; when
+                    // split mode is on the displayed graph differs, so
+                    // rebuild the layout for it here.
+                    self.simulation.layout_state = if self.graph.split_shared_types {
+                        let params = layout_state.params().clone();
+                        LayoutState::new(&self.graph.graph, 42, params)
+                    } else {
+                        *layout_state
+                    };
                     self.filters
                         .sync_hidden_symbols(&self.graph, &mut self.simulation);
                     self.simulation.positions = self.simulation.layout_state.positions();
@@ -432,6 +537,18 @@ impl SpaghettiApp {
                             ui.spinner();
                         }
 
+                        // Secondary bar (green): merge / ISPC phases.
+                        if let Some(frac) = state.sub_fraction() {
+                            let bar = egui::ProgressBar::new(frac)
+                                .fill(egui::Color32::from_rgb(0x3a, 0x9e, 0x4c))
+                                .text(format!(
+                                    "{}/{}",
+                                    state.sub_current,
+                                    state.sub_total.unwrap_or(0)
+                                ));
+                            ui.add(bar);
+                        }
+
                         if !state.messages.is_empty() {
                             ui.separator();
                             egui::ScrollArea::vertical()
@@ -492,6 +609,68 @@ mod tests {
         assert!(!app.indexing.indexing);
         assert!(!app.console.show_console);
         assert!(app.interaction.selection.is_none());
+    }
+
+    #[test]
+    fn split_mode_toggle_rebuilds_display_graph() {
+        use core_ir::{Edge, EdgeKind, Symbol, SymbolId, SymbolKind};
+
+        let mut g = Graph::new();
+        let mut add = |name: &str, kind: SymbolKind| {
+            let id = SymbolId::from_parts(name, kind);
+            g.add_symbol(Symbol {
+                id,
+                kind,
+                name: name.to_owned(),
+                qualified_name: name.to_owned(),
+                location: None,
+                module: None,
+                attrs: Default::default(),
+            });
+            id
+        };
+        let foo = add("Foo", SymbolKind::Struct);
+        let bar = add("Bar", SymbolKind::Struct);
+        let vec3 = add("vec3", SymbolKind::Struct);
+        let fa = add("Foo::a", SymbolKind::Field);
+        let bb = add("Bar::b", SymbolKind::Field);
+        for (from, to, kind) in [
+            (foo, fa, EdgeKind::Contains),
+            (bar, bb, EdgeKind::Contains),
+            (fa, vec3, EdgeKind::HasType),
+            (bb, vec3, EdgeKind::HasType),
+        ] {
+            g.add_edge(Edge {
+                from,
+                to,
+                kind,
+                location: None,
+            });
+        }
+
+        let layout_state = LayoutState::new(&g, 42, layout::ForceParams::default());
+        let log_buffer = Arc::new(Mutex::new(LogBuffer::new()));
+        let mut app = SpaghettiApp::new(
+            g,
+            layout_state,
+            log_buffer,
+            crate::settings::RenderSettings::default(),
+            ViewSettings::default(),
+        );
+        assert_eq!(app.graph.graph.symbol_count(), 5);
+
+        app.graph.split_shared_types = true;
+        app.rebuild_display_graph();
+        // Two clones added; base untouched.
+        assert_eq!(app.graph.graph.symbol_count(), 7);
+        assert_eq!(app.graph.base.symbol_count(), 5);
+        let clone_id = SymbolId::from_parts("vec3@Foo", SymbolKind::Struct);
+        assert!(app.graph.graph.symbols.contains_key(&clone_id));
+        assert!(app.simulation.positions.0.contains_key(&clone_id));
+
+        app.graph.split_shared_types = false;
+        app.rebuild_display_graph();
+        assert_eq!(app.graph.graph.symbol_count(), 5);
     }
 
     #[test]

@@ -10,6 +10,7 @@ path = "src/main.rs"
 [dependencies]
 core-ir = { workspace = true }
 frontend-clang = { workspace = true }
+frontend-ispc = { workspace = true }
 layout = { workspace = true }
 query = { workspace = true }
 eframe = { workspace = true }

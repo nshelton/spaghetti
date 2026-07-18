@@ -48,6 +48,9 @@ pub struct ViewSettings {
     /// Whether to hide nodes with no edges.
     #[serde(default)]
     pub hide_edgeless: bool,
+    /// Whether shared field types are duplicated per containing struct.
+    #[serde(default)]
+    pub split_shared_types: bool,
     /// File-tree directory visibility overrides keyed by full directory path
     /// (e.g. `"shapes"`, `"shapes/internals"`). Missing keys default to visible.
     #[serde(default)]
@@ -80,6 +83,7 @@ impl Default for ViewSettings {
             show_console: false,
             console_level: default_console_level(),
             hide_edgeless: false,
+            split_shared_types: false,
             dir_visibility: HashMap::new(),
         }
     }
@@ -105,6 +109,10 @@ pub struct RenderSettings {
     /// Node opacity (0.0 = invisible, 1.0 = fully opaque).
     #[serde(default = "default_node_opacity")]
     pub node_opacity: f32,
+    /// Whether to draw text labels (node names, container titles).
+    /// Off by default — text layout is expensive on large graphs.
+    #[serde(default)]
+    pub show_labels: bool,
 }
 
 fn default_edge_opacity() -> f32 {
@@ -147,6 +155,7 @@ impl Default for RenderSettings {
             circle_radius: 5.0,
             edge_opacity: default_edge_opacity(),
             node_opacity: default_node_opacity(),
+            show_labels: false,
         }
     }
 }
