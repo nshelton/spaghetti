@@ -53,3 +53,15 @@ frontend-clang = { path = "crates/frontend-clang" }
 frontend-ispc = { path = "crates/frontend-ispc" }
 layout = { path = "crates/layout" }
 query = { path = "crates/query" }
+
+# Debug builds are unusable on 100k-node graphs without optimized
+# dependencies (egui tessellation, serde cache loads). "*" covers external
+# deps only, so hot workspace crates get explicit overrides.
+[profile.dev.package."*"]
+opt-level = 2
+
+[profile.dev.package.layout]
+opt-level = 2
+
+[profile.dev.package.core-ir]
+opt-level = 2
