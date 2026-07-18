@@ -620,3 +620,75 @@ fn test_multiple_pins_stable() {
         );
     }
 }
+
+/// Regression: container repulsion applies rigid-body subtree forces, which
+/// do not conserve momentum when sibling subtrees differ in size. Without
+/// net-momentum cancellation the whole graph self-propels off to the side.
+#[test]
+fn test_no_global_drift_with_asymmetric_containers() {
+    let mut g = Graph::new();
+    let a = make_symbol("BigTU", SymbolKind::TranslationUnit);
+    let b = make_symbol("SmallTU", SymbolKind::TranslationUnit);
+    let (a_id, b_id) = (a.id, b.id);
+    g.add_symbol(a);
+    g.add_symbol(b);
+
+    let mut first_big_child = None;
+    for i in 0..30 {
+        let s = make_symbol(&format!("big_fn_{i}"), SymbolKind::Function);
+        let sid = s.id;
+        if first_big_child.is_none() {
+            first_big_child = Some(sid);
+        }
+        g.add_symbol(s);
+        g.add_edge(Edge {
+            from: a_id,
+            to: sid,
+            kind: EdgeKind::Contains,
+            location: None,
+        });
+    }
+    let s = make_symbol("small_fn", SymbolKind::Function);
+    let b_child = s.id;
+    g.add_symbol(s);
+    g.add_edge(Edge {
+        from: b_id,
+        to: b_child,
+        kind: EdgeKind::Contains,
+        location: None,
+    });
+    // A spring between the subtrees keeps pulling them back into overlap,
+    // so momentum injection would be sustained, not a one-off impulse.
+    g.add_edge(Edge {
+        from: first_big_child.unwrap(),
+        to: b_child,
+        kind: EdgeKind::Calls,
+        location: None,
+    });
+
+    let params = ForceParams {
+        gravity_enabled: false,
+        ..Default::default()
+    };
+    let mut state = LayoutState::new(&g, 42, params);
+    state.expand(a_id);
+    state.expand(b_id);
+    // Give A a huge box with B inside it: the overlap takes hundreds of
+    // steps to resolve, so the momentum injection is sustained.
+    state.set_sizes(&[(a_id, Vec2::new(2000.0, 2000.0))]);
+    state.set_position(a_id, Vec2::new(0.0, 0.0));
+    state.set_position(b_id, Vec2::new(10.0, 0.0));
+
+    state.step(600);
+
+    let positions = state.positions();
+    let mut centroid = Vec2::ZERO;
+    for pos in positions.0.values() {
+        centroid += *pos;
+    }
+    centroid /= positions.0.len() as f32;
+    assert!(
+        centroid.length() < 400.0,
+        "graph drifted away: centroid at {centroid:?}"
+    );
+}

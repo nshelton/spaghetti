@@ -9,6 +9,8 @@ pub enum ProgressMessage {
     Status(String),
     /// Update the progress bar (current out of total).
     Progress { current: usize, total: usize },
+    /// Update the secondary progress bar (merge / ISPC phases).
+    SubProgress { current: usize, total: usize },
     /// Append a log line to the progress overlay.
     Log(String),
     /// Indexing completed successfully.
@@ -32,6 +34,10 @@ pub struct ProgressState {
     pub current: usize,
     /// Total items (for progress bar), if known.
     pub total: Option<usize>,
+    /// Secondary progress count (merge / ISPC phases).
+    pub sub_current: usize,
+    /// Secondary total, if a secondary phase has started.
+    pub sub_total: Option<usize>,
     /// Scrollable log messages from the background thread.
     pub messages: Vec<String>,
 }
@@ -43,6 +49,8 @@ impl ProgressState {
             status: status.to_string(),
             current: 0,
             total: None,
+            sub_current: 0,
+            sub_total: None,
             messages: Vec::new(),
         }
     }
@@ -62,6 +70,11 @@ impl ProgressState {
                 self.total = Some(*total);
                 true
             }
+            ProgressMessage::SubProgress { current, total } => {
+                self.sub_current = *current;
+                self.sub_total = Some(*total);
+                true
+            }
             ProgressMessage::Log(line) => {
                 self.messages.push(line.clone());
                 true
@@ -79,6 +92,17 @@ impl ProgressState {
                 1.0
             } else {
                 self.current as f32 / t as f32
+            }
+        })
+    }
+
+    /// Secondary progress fraction, or `None` if no secondary phase started.
+    pub fn sub_fraction(&self) -> Option<f32> {
+        self.sub_total.map(|t| {
+            if t == 0 {
+                1.0
+            } else {
+                self.sub_current as f32 / t as f32
             }
         })
     }
@@ -103,6 +127,13 @@ mod tests {
         assert_eq!(state.current, 3);
         assert_eq!(state.total, Some(10));
         assert!((state.fraction().unwrap() - 0.3).abs() < f32::EPSILON);
+
+        assert!(state.apply(&ProgressMessage::SubProgress {
+            current: 5,
+            total: 20
+        }));
+        assert_eq!(state.sub_current, 5);
+        assert!((state.sub_fraction().unwrap() - 0.25).abs() < f32::EPSILON);
 
         assert!(state.apply(&ProgressMessage::Log("parsed foo.cpp".into())));
         assert_eq!(state.messages.len(), 1);

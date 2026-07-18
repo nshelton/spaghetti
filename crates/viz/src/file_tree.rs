@@ -100,7 +100,7 @@ impl FileTree {
 
     /// Apply saved directory visibility. Keys are slash-joined directory paths
     /// (e.g. `"shapes"`, `"shapes/internals"`). Directories not present in the
-    /// map keep their default (visible). Stale paths are silently ignored.
+    /// map keep their default (hidden). Stale paths are silently ignored.
     pub fn apply_visibility(&mut self, saved: &HashMap<String, bool>) {
         for dir in &mut self.roots {
             apply_visibility_recursive(dir, "", saved);
@@ -108,7 +108,7 @@ impl FileTree {
     }
 
     /// Export current directory visibility as a path-keyed map.
-    /// Only records directories that are hidden (to keep the file small).
+    /// Only records directories that are visible (to keep the file small).
     pub fn visibility_map(&self) -> HashMap<String, bool> {
         let mut map = HashMap::new();
         for dir in &self.roots {
@@ -182,8 +182,10 @@ impl DirBuilder {
             .map(|(name, builder)| {
                 let (children_dirs, files) = builder.build();
                 DirNode {
+                    // Default hidden: nothing renders until directories are
+                    // explicitly checked, so huge graphs start cheap.
                     name,
-                    visible: true,
+                    visible: false,
                     children_dirs,
                     files,
                 }
@@ -279,9 +281,9 @@ fn collect_visibility_recursive(dir: &DirNode, parent_path: &str, map: &mut Hash
     } else {
         format!("{parent_path}/{}", dir.name)
     };
-    // Only store non-default (hidden) directories to keep the file compact.
-    if !dir.visible {
-        map.insert(path.clone(), false);
+    // Only store non-default (visible) directories to keep the file compact.
+    if dir.visible {
+        map.insert(path.clone(), true);
     }
     for child in &dir.children_dirs {
         collect_visibility_recursive(child, &path, map);

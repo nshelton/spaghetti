@@ -152,6 +152,14 @@ impl SpaghettiApp {
                         &mut self.render.render.circle_mode,
                         "Circle mode",
                     );
+                    crate::widgets::toggle_button(
+                        ui,
+                        &mut self.render.render.show_labels,
+                        "Labels",
+                    );
+                    if ui.button("Reset camera").clicked() {
+                        self.render.camera = crate::camera::Camera2D::default();
+                    }
                     if self.render.render.circle_mode {
                         ui.add(
                             egui::Slider::new(&mut self.render.render.circle_radius, 1.0..=50.0)
@@ -196,6 +204,16 @@ impl SpaghettiApp {
                     {
                         self.filters
                             .sync_hidden_to_layout(&self.graph, &mut self.simulation);
+                    }
+                    if ui
+                        .checkbox(&mut self.graph.split_shared_types, "Split shared types")
+                        .on_hover_text(
+                            "Duplicate shared field types (e.g. vec3) into each \
+                             struct that contains them, instead of one hub node",
+                        )
+                        .changed()
+                    {
+                        self.rebuild_display_graph();
                     }
 
                     // Edge types: toggleable color swatches with per-kind force sliders.

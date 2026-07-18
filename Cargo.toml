@@ -3,6 +3,7 @@ resolver = "2"
 members = [
     "crates/core-ir",
     "crates/frontend-clang",
+    "crates/frontend-ispc",
     "crates/layout",
     "crates/query",
     "crates/viz",
@@ -39,8 +40,28 @@ rfd = "0.15"
 # Hashing
 seahash = "4"
 
+# Shell-quoted command parsing (JSON compilation database `command` field)
+shlex = "1"
+
+# ISPC parsing (frontend-ispc vendors the grammar, cc compiles it)
+tree-sitter = "0.25"
+cc = "1"
+
 # Internal crates
 core-ir = { path = "crates/core-ir" }
 frontend-clang = { path = "crates/frontend-clang" }
+frontend-ispc = { path = "crates/frontend-ispc" }
 layout = { path = "crates/layout" }
 query = { path = "crates/query" }
+
+# Debug builds are unusable on 100k-node graphs without optimized
+# dependencies (egui tessellation, serde cache loads). "*" covers external
+# deps only, so hot workspace crates get explicit overrides.
+[profile.dev.package."*"]
+opt-level = 2
+
+[profile.dev.package.layout]
+opt-level = 2
+
+[profile.dev.package.core-ir]
+opt-level = 2

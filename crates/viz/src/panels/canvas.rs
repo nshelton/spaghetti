@@ -1,5 +1,7 @@
 //! Central canvas panel: node and edge rendering, pan/zoom, dragging, selection.
 
+use std::collections::HashMap;
+
 use egui::{Color32, Rect, Stroke, StrokeKind, Vec2};
 use glam::Vec2 as GVec2;
 
@@ -8,6 +10,13 @@ use core_ir::{SymbolId, SymbolKind};
 use crate::app::{SpaghettiApp, ENERGY_THRESHOLD};
 use crate::camera::{NODE_HEIGHT, NODE_WIDTH};
 use crate::fps::paint_fps_overlay;
+
+// Per-frame draw budgets. egui accumulates the whole frame into one mesh, and
+// an unbounded graph (100k+ nodes on screen) can exceed wgpu's 256 MB max
+// buffer size and panic. Items beyond the cap are skipped and a note is shown.
+const MAX_EDGES_DRAWN: usize = 50_000;
+const MAX_NODES_DRAWN: usize = 50_000;
+const MAX_LABELS_DRAWN: usize = 2_000;
 
 /// World-space padding for top-level containers (Namespace, TranslationUnit).
 const TOPLEVEL_CONTAINER_PADDING: f32 = 50.0;
@@ -208,8 +217,38 @@ impl SpaghettiApp {
             // LOD thresholds based on zoom level.
             let circle_mode = self.render.render.circle_mode;
             let circle_radius = self.render.render.circle_radius;
-            let draw_labels = !circle_mode && self.render.camera.zoom >= 0.4;
+            let show_labels = self.render.render.show_labels;
+            let draw_labels = show_labels && !circle_mode && self.render.camera.zoom >= 0.4;
             let draw_rects = !circle_mode && self.render.camera.zoom >= 0.15;
+
+            // Per-kind color caches: node_color/edge_color format!() the kind
+            // name per call, which is an allocation per drawn item per frame
+            // without these.
+            let mut node_colors: HashMap<std::mem::Discriminant<SymbolKind>, Color32> =
+                HashMap::new();
+            let mut edge_colors: HashMap<std::mem::Discriminant<core_ir::EdgeKind>, Color32> =
+                HashMap::new();
+
+            // --- 0. Origin axes: world x=0 and y=0, for orientation ---
+            let origin = self
+                .render
+                .camera
+                .world_to_screen(GVec2::ZERO, canvas_center);
+            let axis_stroke = Stroke::new(1.0, Color32::from_gray(70));
+            painter.line_segment(
+                [
+                    egui::Pos2::new(response.rect.left(), origin.y),
+                    egui::Pos2::new(response.rect.right(), origin.y),
+                ],
+                axis_stroke,
+            );
+            painter.line_segment(
+                [
+                    egui::Pos2::new(origin.x, response.rect.top()),
+                    egui::Pos2::new(origin.x, response.rect.bottom()),
+                ],
+                axis_stroke,
+            );
 
             // --- 1. Draw container backgrounds (expanded = dynamic bbox, collapsed = fixed box) ---
             self.simulation.container_rects.clear();
@@ -325,33 +364,19 @@ impl SpaghettiApp {
             }
 
             // --- 2. Draw edges (direct, no rerouting) ---
+            let mut edges_drawn = 0usize;
+            let mut edges_truncated = false;
             for edge in &self.graph.graph.edges {
+                if edges_drawn >= MAX_EDGES_DRAWN {
+                    edges_truncated = true;
+                    break;
+                }
                 if !active_kinds.contains(&edge.kind) {
                     continue;
                 }
 
-                if self.filters.hidden_symbols.contains(&edge.from)
-                    || self.filters.hidden_symbols.contains(&edge.to)
-                {
-                    continue;
-                }
-
-                let from_visible_kind = self
-                    .graph
-                    .graph
-                    .symbols
-                    .get(&edge.from)
-                    .is_some_and(|s| self.filters.node_filter.is_enabled(s.kind));
-                let to_visible_kind = self
-                    .graph
-                    .graph
-                    .symbols
-                    .get(&edge.to)
-                    .is_some_and(|s| self.filters.node_filter.is_enabled(s.kind));
-                if !from_visible_kind || !to_visible_kind {
-                    continue;
-                }
-
+                // Cheapest rejections first: positions and viewport, then the
+                // per-endpoint filter lookups.
                 let from_pos = self.simulation.positions.0.get(&edge.from);
                 let to_pos = self.simulation.positions.0.get(&edge.to);
                 if let (Some(&from), Some(&to)) = (from_pos, to_pos) {
@@ -367,14 +392,37 @@ impl SpaghettiApp {
                         continue;
                     }
 
+                    if self.filters.hidden_symbols.contains(&edge.from)
+                        || self.filters.hidden_symbols.contains(&edge.to)
+                    {
+                        continue;
+                    }
+
+                    let from_visible_kind = self
+                        .graph
+                        .graph
+                        .symbols
+                        .get(&edge.from)
+                        .is_some_and(|s| self.filters.node_filter.is_enabled(s.kind));
+                    let to_visible_kind = self
+                        .graph
+                        .graph
+                        .symbols
+                        .get(&edge.to)
+                        .is_some_and(|s| self.filters.node_filter.is_enabled(s.kind));
+                    if !from_visible_kind || !to_visible_kind {
+                        continue;
+                    }
+
                     let screen_from = self.render.camera.world_to_screen(from, canvas_center);
                     let screen_to = self.render.camera.world_to_screen(to, canvas_center);
 
-                    let color = with_alpha(
-                        self.render.render.edge_color(edge.kind),
-                        self.render.render.edge_opacity,
-                    );
+                    let base = *edge_colors
+                        .entry(std::mem::discriminant(&edge.kind))
+                        .or_insert_with(|| self.render.render.edge_color(edge.kind));
+                    let color = with_alpha(base, self.render.render.edge_opacity);
                     painter.line_segment([screen_from, screen_to], Stroke::new(1.5, color));
+                    edges_drawn += 1;
                 }
             }
 
@@ -413,7 +461,13 @@ impl SpaghettiApp {
                 NODE_WIDTH * self.render.camera.zoom,
                 NODE_HEIGHT * self.render.camera.zoom,
             );
+            let mut nodes_drawn = 0usize;
+            let mut nodes_truncated = false;
             for (id, sym) in &self.graph.graph.symbols {
+                if nodes_drawn >= MAX_NODES_DRAWN {
+                    nodes_truncated = true;
+                    break;
+                }
                 if self.filters.hidden_symbols.contains(id) {
                     continue;
                 }
@@ -435,10 +489,10 @@ impl SpaghettiApp {
                     }
 
                     let screen_pos = self.render.camera.world_to_screen(world_pos, canvas_center);
-                    let base = with_alpha(
-                        self.render.render.node_color(sym.kind),
-                        self.render.render.node_opacity,
-                    );
+                    let kind_color = *node_colors
+                        .entry(std::mem::discriminant(&sym.kind))
+                        .or_insert_with(|| self.render.render.node_color(sym.kind));
+                    let base = with_alpha(kind_color, self.render.render.node_opacity);
 
                     // Skip rendering container nodes as individual rects —
                     // their box is drawn in the container background pass.
@@ -506,11 +560,12 @@ impl SpaghettiApp {
                         let r = if is_hovered { base_r + 1.5 } else { base_r };
                         painter.circle_filled(screen_pos, r, color);
                     }
+                    nodes_drawn += 1;
                 }
             }
 
             // --- 4. Draw ALL labels on top (container titles + node labels) ---
-            if self.render.camera.zoom >= 0.15 {
+            if show_labels && self.render.camera.zoom >= 0.15 {
                 // Container titles.
                 for &(id, rect) in &self.simulation.container_rects {
                     if let Some(sym) = self.graph.graph.symbols.get(&id) {
@@ -529,7 +584,11 @@ impl SpaghettiApp {
                 // Node labels.
                 if draw_labels {
                     let font = egui::FontId::proportional(12.0 * self.render.camera.zoom);
+                    let mut labels_drawn = 0usize;
                     for (id, sym) in &self.graph.graph.symbols {
+                        if labels_drawn >= MAX_LABELS_DRAWN {
+                            break;
+                        }
                         if self.filters.hidden_symbols.contains(id)
                             || !self.filters.node_filter.is_enabled(sym.kind)
                             || self.simulation.layout_state.is_container(*id)
@@ -558,9 +617,23 @@ impl SpaghettiApp {
                                 font.clone(),
                                 Color32::WHITE,
                             );
+                            labels_drawn += 1;
                         }
                     }
                 }
+            }
+
+            if nodes_truncated || edges_truncated {
+                painter.text(
+                    response.rect.left_top() + Vec2::new(8.0, 8.0),
+                    egui::Align2::LEFT_TOP,
+                    format!(
+                        "render budget: showing {nodes_drawn} nodes / {edges_drawn} edges — \
+                         filter directories or edge kinds to see the rest"
+                    ),
+                    egui::FontId::proportional(12.0),
+                    Color32::from_gray(200),
+                );
             }
 
             // FPS overlay

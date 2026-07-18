@@ -11,14 +11,15 @@ Built in Rust with [eframe](https://github.com/emilk/egui/tree/master/crates/efr
 ```
 compile_commands.json
         |
-        v
-  frontend-clang ──> core-ir <── query
-                        |
-                        v
-                     layout (LayoutState — incremental)
-                        |
-                        v
-                       viz  (eframe app, binary = spaghetti)
+        ├──> frontend-clang ─┐
+        |                    v
+        └──> frontend-ispc > core-ir <── query
+                                |
+                                v
+                             layout (LayoutState — incremental)
+                                |
+                                v
+                               viz  (eframe app, binary = spaghetti)
 ```
 
 ## Crates
@@ -45,6 +46,21 @@ Indexes C++ projects using libclang and emits a `core-ir::Graph`.
 - Filters to project-local symbols only (skips standard library internals)
 - Deduplicates edges across translation units
 - Integration tests gated behind the `clang-tests` feature
+- Skips entries whose source file is missing and non-C/C++ sources (e.g. `.ispc`)
+
+### frontend-ispc
+
+Indexes ISPC kernels (`.ispc` entries in `compile_commands.json`) using a
+vendored tree-sitter grammar and emits a `core-ir::Graph`. The viz app runs it
+after the clang pass and merges the two graphs.
+
+- Syntax-level only: no preprocessor, no type resolution
+- Emits `Function`, `Struct`, `Field`, and `TranslationUnit` symbols
+- Emits `Calls` (matched by callee name), `Contains`, and `Includes` edges
+- Quoted `#include` targets that resolve next to the including file get
+  `Includes` edges; `.isph`/`.ispc` targets are parsed transitively
+- Grammar vendored under `grammar/` (see its README for provenance); compiled
+  by `build.rs`, so there is no external dependency at runtime
 
 ### layout
 

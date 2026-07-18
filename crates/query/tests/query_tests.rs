@@ -1,7 +1,7 @@
 //! Tests for query functions.
 
-use core_ir::{Edge, EdgeKind, Graph, Symbol, SymbolId, SymbolKind};
-use query::{callers_of, find_by_name, subgraph_around};
+use core_ir::{Edge, EdgeKind, Graph, Location, Symbol, SymbolId, SymbolKind};
+use query::{callers_of, find_by_name, split_shared_types, subgraph_around};
 
 fn make_symbol(name: &str, kind: SymbolKind) -> Symbol {
     Symbol {
@@ -408,4 +408,155 @@ fn test_cap008_self_call() {
         callers.contains(&t),
         "target calls itself — it should appear in its own callers list"
     );
+}
+
+// ---------------------------------------------------------------------------
+// split_shared_types
+// ---------------------------------------------------------------------------
+
+/// Foo { vec3 a; vec3 b; }  Bar { vec3 c; }  Baz { Unique u; }
+/// plus a container-less field `loose` of type vec3.
+fn split_test_graph() -> Graph {
+    let mut g = Graph::new();
+    let foo_file = g.files.intern("src/foo.h");
+    let math_file = g.files.intern("src/math.h");
+
+    let mut foo = make_symbol("Foo", SymbolKind::Struct);
+    foo.location = Some(Location {
+        file: foo_file,
+        line: 1,
+        col: 1,
+    });
+    let mut vec3 = make_symbol("vec3", SymbolKind::Struct);
+    vec3.location = Some(Location {
+        file: math_file,
+        line: 1,
+        col: 1,
+    });
+    let bar = make_symbol("Bar", SymbolKind::Struct);
+    let baz = make_symbol("Baz", SymbolKind::Struct);
+    let unique = make_symbol("Unique", SymbolKind::Struct);
+    let fa = make_symbol("Foo::a", SymbolKind::Field);
+    let fb = make_symbol("Foo::b", SymbolKind::Field);
+    let bc = make_symbol("Bar::c", SymbolKind::Field);
+    let bu = make_symbol("Baz::u", SymbolKind::Field);
+    let loose = make_symbol("loose", SymbolKind::Field);
+
+    let contains = [
+        (foo.id, fa.id),
+        (foo.id, fb.id),
+        (bar.id, bc.id),
+        (baz.id, bu.id),
+    ];
+    let has_type = [
+        (fa.id, vec3.id),
+        (fb.id, vec3.id),
+        (bc.id, vec3.id),
+        (bu.id, unique.id),
+        (loose.id, vec3.id),
+    ];
+
+    for s in [foo, bar, baz, vec3, unique, fa, fb, bc, bu, loose] {
+        g.add_symbol(s);
+    }
+    for (from, to) in contains {
+        g.add_edge(Edge {
+            from,
+            to,
+            kind: EdgeKind::Contains,
+            location: None,
+        });
+    }
+    for (from, to) in has_type {
+        g.add_edge(Edge {
+            from,
+            to,
+            kind: EdgeKind::HasType,
+            location: None,
+        });
+    }
+    g
+}
+
+#[test]
+fn test_split_creates_clone_per_container() {
+    let g = split_test_graph();
+    let out = split_shared_types(&g);
+
+    // vec3 is referenced from Foo and Bar → one clone each, with
+    // deterministic IDs derived from "type@container".
+    let foo_clone = SymbolId::from_parts("vec3@Foo", SymbolKind::Struct);
+    let bar_clone = SymbolId::from_parts("vec3@Bar", SymbolKind::Struct);
+    assert!(out.symbols.contains_key(&foo_clone));
+    assert!(out.symbols.contains_key(&bar_clone));
+    assert_eq!(out.symbol_count(), g.symbol_count() + 2);
+
+    // Clones keep the display name and inherit the container's location.
+    let clone = &out.symbols[&foo_clone];
+    let foo = &out.symbols[&SymbolId::from_parts("Foo", SymbolKind::Struct)];
+    assert_eq!(clone.name, "vec3");
+    assert_eq!(clone.location, foo.location);
+
+    // Each clone is nested in its container via Contains.
+    let foo_id = SymbolId::from_parts("Foo", SymbolKind::Struct);
+    assert!(out
+        .edges
+        .iter()
+        .any(|e| e.from == foo_id && e.to == foo_clone && e.kind == EdgeKind::Contains));
+}
+
+#[test]
+fn test_split_retargets_fan_in() {
+    let g = split_test_graph();
+    let out = split_shared_types(&g);
+
+    let vec3_id = SymbolId::from_parts("vec3", SymbolKind::Struct);
+    let foo_clone = SymbolId::from_parts("vec3@Foo", SymbolKind::Struct);
+    let fa = SymbolId::from_parts("Foo::a", SymbolKind::Field);
+    let fb = SymbolId::from_parts("Foo::b", SymbolKind::Field);
+
+    // Both Foo fields point at the same per-Foo clone.
+    for field in [fa, fb] {
+        assert!(out
+            .edges
+            .iter()
+            .any(|e| e.from == field && e.to == foo_clone && e.kind == EdgeKind::HasType));
+    }
+
+    // The container-less field keeps its edge to the original; that is the
+    // only HasType fan-in the original retains.
+    let loose = SymbolId::from_parts("loose", SymbolKind::Field);
+    let into_original: Vec<_> = out
+        .edges
+        .iter()
+        .filter(|e| e.to == vec3_id && e.kind == EdgeKind::HasType)
+        .collect();
+    assert_eq!(into_original.len(), 1);
+    assert_eq!(into_original[0].from, loose);
+
+    // The original type node itself survives.
+    assert!(out.symbols.contains_key(&vec3_id));
+}
+
+#[test]
+fn test_split_leaves_single_container_types_alone() {
+    let g = split_test_graph();
+    let out = split_shared_types(&g);
+
+    // Unique is only referenced from Baz → not split, edge untouched.
+    let unique_id = SymbolId::from_parts("Unique", SymbolKind::Struct);
+    let bu = SymbolId::from_parts("Baz::u", SymbolKind::Field);
+    assert!(out
+        .edges
+        .iter()
+        .any(|e| e.from == bu && e.to == unique_id && e.kind == EdgeKind::HasType));
+    assert!(!out
+        .symbols
+        .contains_key(&SymbolId::from_parts("Unique@Baz", SymbolKind::Struct)));
+}
+
+#[test]
+fn test_split_is_deterministic() {
+    let g = split_test_graph();
+    assert_eq!(split_shared_types(&g), split_shared_types(&g));
 }

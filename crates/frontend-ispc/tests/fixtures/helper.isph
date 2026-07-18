@@ -1,0 +1,11 @@
+// Test fixture header: structs and inline functions live in headers.
+#define PI 3.14159265f
+
+struct Material {
+    float roughness;
+};
+
+inline float clampf(float x)
+{
+    return min(max(x, 0.0f), 1.0f);
+}

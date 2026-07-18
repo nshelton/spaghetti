@@ -23,14 +23,15 @@ This is idempotent and fast if libclang is already present. **Cloud / CI agents 
 ```
 compile_commands.json
         │
-        ▼
-  frontend-clang ──► core-ir ◄── query
-                        │
-                        ▼
-                     layout
-                        │
-                        ▼
-                       viz  (eframe app, binary = `spaghetti`)
+        ├──► frontend-clang ─┐
+        │                    ▼
+        └──► frontend-ispc ► core-ir ◄── query
+                                │
+                                ▼
+                             layout
+                                │
+                                ▼
+                               viz  (eframe app, binary = `spaghetti`)
 ```
 
 `core-ir` is the stable contract. Everything depends on it; it depends on nothing in the workspace. Frontends must not leak language-specific types (e.g. `clang::*`) into their public API.
@@ -41,8 +42,9 @@ compile_commands.json
 crates/
   core-ir/         # language-agnostic graph types, serde
   frontend-clang/  # libclang → core-ir, with per-TU disk cache
+  frontend-ispc/   # tree-sitter → core-ir for .ispc kernels (vendored grammar)
   layout/          # force-directed positions (batch + incremental)
-  query/           # subgraph / search / callers-of
+  query/           # subgraph / search / callers-of / split-shared-types
   viz/             # the eframe binary (target name: spaghetti)
     src/
       panels/      # modular UI: canvas, left (file tree + filters),
@@ -125,19 +127,23 @@ This list exists because scope creep kills this kind of project. If you find you
 ## Current Status
 
 ### Clang Frontend
-The clang frontend emits all `SymbolKind` variants defined in `core-ir`: `Class`, `Struct`, `Function`, `Method`, `Field`, `Namespace`, `TemplateInstantiation`, and `TranslationUnit`. It also emits all `EdgeKind` variants: `Calls`, `Inherits`, `Contains`, `Overrides`, `ReadsField`, `WritesField`, `Includes`, `Instantiates`, and `HasType`. A per-TU disk cache (`.spaghetti-cache/`, seahash-keyed) skips re-parsing unchanged translation units.
+The clang frontend emits all `SymbolKind` variants defined in `core-ir`: `Class`, `Struct`, `Function`, `Method`, `Field`, `Namespace`, `TemplateInstantiation`, and `TranslationUnit`. It also emits all `EdgeKind` variants: `Calls`, `Inherits`, `Contains`, `Overrides`, `ReadsField`, `WritesField`, `Includes`, `Instantiates`, and `HasType`. A per-TU disk cache (`.spaghetti-cache/`, seahash-keyed) skips re-parsing unchanged translation units, and a whole-project merged-graph cache layer (`merged_*.json`, keyed by all per-TU keys) makes fully-warm reopens near-instant by skipping per-TU loads and merging entirely.
+
+### ISPC Frontend
+`frontend-ispc` indexes `.ispc` entries from `compile_commands.json` with a vendored tree-sitter grammar (no external dependency; `build.rs` compiles it). Syntax-level only — no preprocessor or type resolution. Emits `Function`/`Struct`/`Field`/`TranslationUnit` symbols and `Calls` (by callee name), `Contains`, and `Includes` edges. Quoted-include `.isph` headers are parsed transitively. The viz app runs it after the clang pass and merges both graphs.
 
 ### Layout
-The layout uses an incremental force-directed simulation (`LayoutState`) driven frame-by-frame with budgeted stepping (respects a per-frame time budget). Supports node dragging/pinning, per-edge-kind tunable `ForceParams`, location-affinity forces (nodes in the same directory attract), and grid-based spatial bucketing for repulsion optimization on large graphs. Rayon parallelism kicks in at 500+ nodes.
+The layout uses an incremental force-directed simulation (`LayoutState`) driven frame-by-frame with budgeted stepping (respects a per-frame time budget). Supports node dragging/pinning, per-edge-kind tunable `ForceParams`, and location-affinity forces (nodes in the same directory attract). Repulsion uses a Barnes-Hut quadtree (`quadtree.rs`, O(n log n), exact truncated-Coulomb at leaves) with Rayon parallelism at 500+ nodes; net momentum is cancelled each step so subtree forces can't make the graph drift, and gravity anchors the layout at the world origin. Initial scatter scales with √n so startup density stays bounded. ~45 ms/step on an 86k-node graph (release).
 
 ### Viz
 - **Camera** (`camera.rs`): pan, zoom, auto-fit (F key), coordinate transforms, hit-testing.
 - **Modular panels** (`panels/`): canvas, left (file tree + edge kind filters + search), right (selected symbol details + rendering controls), console (log viewer with level filter).
-- **File tree** (`file_tree.rs`): directory-based visibility filtering — toggle entire directories on/off to control which nodes appear on the canvas.
+- **File tree** (`file_tree.rs`): directory-based visibility filtering — toggle entire directories on/off to control which nodes appear on the canvas. Directories default to **hidden** on a fresh load (nothing renders until checked), so huge graphs start cheap; checked directories persist in settings. Project-root files and small flat projects are visible by default.
 - **Settings persistence** (`settings.rs`): `AppSettings` saves/loads layout params, render settings (node/edge colors, opacity, circle mode), and view state (edge filters, camera position, console visibility, directory toggles) to `spaghetti_settings.json`.
 - **FPS overlay** (`fps.rs`): rolling average frame rate counter.
 - **Progress overlay** (`progress.rs`): shows background indexing status.
 - **Zoom-based LOD**: at low zoom, nodes degrade from labeled rectangles → plain rectangles → circles for performance.
+- **Split shared types mode**: `query::split_shared_types` duplicates shared field types (e.g. a `vec3` held by many structs) into per-struct clones nested inside each container via `Contains` edges, eliminating hub nodes. The clone's deterministic id derives from `"type@container"`; it inherits the container's location so file-tree filtering and directory affinity keep it local. Toggled in the right panel ("Split shared types"), persisted in settings; `GraphState` keeps the untransformed `base` graph and re-derives the displayed graph on toggle, preserving node positions.
 
 To verify the project is healthy:
 
