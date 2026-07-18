@@ -39,6 +39,9 @@ rfd = "0.15"
 # Hashing
 seahash = "4"
 
+# Shell-quoted command parsing (JSON compilation database `command` field)
+shlex = "1"
+
 # Internal crates
 core-ir = { path = "crates/core-ir" }
 frontend-clang = { path = "crates/frontend-clang" }

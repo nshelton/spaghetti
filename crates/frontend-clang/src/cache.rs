@@ -4,6 +4,10 @@
 //! The mtime of compile_commands.json acts as a coarse invalidation signal for
 //! header changes — when you re-run CMake the mtime bumps and the cache misses.
 //!
+//! A second layer caches the whole-project merged graph (`merged_*.json`),
+//! keyed by the combination of all per-TU keys: when nothing changed, a warm
+//! start loads one file instead of re-loading and re-merging every TU.
+//!
 //! Cache lives in `.spaghetti-cache/` next to `compile_commands.json`.
 
 use std::path::{Path, PathBuf};
@@ -48,31 +52,64 @@ pub(crate) fn cache_key(source_path: &Path, args: &[String], cc_mtime: u64) -> u
 
 /// Try to load a cached graph for the given key.
 pub(crate) fn load(cache_dir: &Path, key: u64) -> Option<Graph> {
-    let path = cache_dir.join(format!("{key:016x}.json"));
-    let bytes = std::fs::read(&path).ok()?;
+    load_at(&cache_dir.join(format!("{key:016x}.json")))
+}
+
+/// Store a graph in the cache.
+pub(crate) fn store(cache_dir: &Path, key: u64, graph: &Graph) {
+    store_at(
+        cache_dir,
+        &cache_dir.join(format!("{key:016x}.json")),
+        graph,
+    )
+}
+
+/// Try to load the whole-project merged graph for the given combined key.
+pub(crate) fn load_merged(cache_dir: &Path, key: u64) -> Option<Graph> {
+    load_at(&cache_dir.join(format!("merged_{key:016x}.json")))
+}
+
+/// Store the whole-project merged graph. Previous merged entries are deleted
+/// rather than accumulated — they are tens of MB each, and only the current
+/// one can ever hit.
+pub(crate) fn store_merged(cache_dir: &Path, key: u64, graph: &Graph) {
+    if let Ok(entries) = std::fs::read_dir(cache_dir) {
+        for entry in entries.flatten() {
+            if entry.file_name().to_string_lossy().starts_with("merged_") {
+                let _ = std::fs::remove_file(entry.path());
+            }
+        }
+    }
+    store_at(
+        cache_dir,
+        &cache_dir.join(format!("merged_{key:016x}.json")),
+        graph,
+    )
+}
+
+fn load_at(path: &Path) -> Option<Graph> {
+    let bytes = std::fs::read(path).ok()?;
     match serde_json::from_slice(&bytes) {
         Ok(graph) => {
-            debug!(key = %format!("{key:016x}"), "cache hit");
+            debug!(path = %path.display(), "cache hit");
             Some(graph)
         }
         Err(e) => {
-            warn!(key = %format!("{key:016x}"), error = %e, "corrupt cache entry, ignoring");
-            let _ = std::fs::remove_file(&path);
+            warn!(path = %path.display(), error = %e, "corrupt cache entry, ignoring");
+            let _ = std::fs::remove_file(path);
             None
         }
     }
 }
 
-/// Store a graph in the cache.
-pub(crate) fn store(cache_dir: &Path, key: u64, graph: &Graph) {
+fn store_at(cache_dir: &Path, path: &Path, graph: &Graph) {
     if let Err(e) = std::fs::create_dir_all(cache_dir) {
         warn!(error = %e, "failed to create cache dir");
         return;
     }
-    let path = cache_dir.join(format!("{key:016x}.json"));
     match serde_json::to_vec(graph) {
         Ok(bytes) => {
-            if let Err(e) = std::fs::write(&path, bytes) {
+            if let Err(e) = std::fs::write(path, bytes) {
                 warn!(error = %e, "failed to write cache entry");
             }
         }

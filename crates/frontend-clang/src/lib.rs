@@ -47,21 +47,41 @@ struct CompileCommand {
     file: String,
 }
 
+/// Fine-grained progress events from [`index_project_with_progress`].
+pub enum IndexProgress<'a> {
+    /// Parsing translation units (the long phase).
+    Parse {
+        /// Zero-based index of the TU about to be parsed.
+        current: usize,
+        /// Total TU count.
+        total: usize,
+        /// Source file about to be parsed.
+        file: &'a str,
+    },
+    /// Merging per-TU graphs into the unified graph.
+    Merge {
+        /// Zero-based index of the graph about to be merged.
+        current: usize,
+        /// Total graphs to merge.
+        total: usize,
+    },
+}
+
 /// Index a C++ project from its `compile_commands.json`, returning a unified [`Graph`].
 ///
 /// Each TU produces a partial graph that is merged at the end.
 pub fn index_project(compile_commands: &Path) -> Result<Graph, ClangError> {
-    index_project_with_progress(compile_commands, |_, _, _| true)
+    index_project_with_progress(compile_commands, |_| true)
 }
 
-/// Index a C++ project with per-TU progress reporting.
+/// Index a C++ project with progress reporting.
 ///
-/// The `on_progress` callback is called before each translation unit with
-/// `(current_index, total_count, file_name)`. Return `true` to continue
-/// indexing or `false` to cancel.
+/// The `on_progress` callback receives an [`IndexProgress`] event before
+/// each translation unit and each merge step. Return `true` to continue
+/// or `false` to cancel.
 pub fn index_project_with_progress(
     compile_commands: &Path,
-    mut on_progress: impl FnMut(usize, usize, &str) -> bool,
+    mut on_progress: impl FnMut(IndexProgress) -> bool,
 ) -> Result<Graph, ClangError> {
     let contents = std::fs::read_to_string(compile_commands)?;
     let commands: Vec<CompileCommand> = serde_json::from_str(&contents)?;
@@ -89,21 +109,19 @@ pub fn index_project_with_progress(
     let cache_dir = cache::cache_dir(compile_commands);
     let cc_mtime = cache::file_mtime_secs(compile_commands);
 
-    // Create a single Clang instance for the entire indexing run.
-    // libclang only allows one `Clang` per process, and init/teardown is
-    // expensive — hoisting it here avoids repeating that cost per TU.
-    let clang = clang::Clang::new().map_err(|e| ClangError::Parse(e.to_string()))?;
-    let index = clang::Index::new(&clang, false, true);
-
-    let mut cache_hits = 0u32;
-    let mut partial_graphs = Vec::with_capacity(total);
-
-    for (i, cmd) in commands.iter().enumerate() {
-        if !on_progress(i, total, &cmd.file) {
-            info!("indexing cancelled at TU {}/{}", i, total);
-            break;
-        }
-
+    // Prepass: resolve paths, drop unparseable entries, compute per-TU cache
+    // keys (reads each source once). The combined key lets a whole-project
+    // cache hit skip parsing, per-TU cache loads, and merging entirely.
+    struct TuEntry<'a> {
+        cmd: &'a CompileCommand,
+        work_dir: PathBuf,
+        args: Vec<String>,
+        key: u64,
+    }
+    let mut missing_files = 0u32;
+    let mut non_c_sources = 0u32;
+    let mut entries: Vec<TuEntry> = Vec::with_capacity(commands.len());
+    for cmd in &commands {
         // Per the spec, `directory` is the working directory for the
         // compile command. CMake always writes absolute paths. For
         // relative paths, resolve against the compile_commands.json
@@ -116,44 +134,136 @@ pub fn index_project_with_progress(
         };
         let file_path = work_dir.join(&cmd.file);
 
-        // Extract args early so we can compute the cache key.
-        let args = extract_args(cmd);
+        // Generated sources (moc output, bison/flex, etc.) may not exist in
+        // this checkout — skip them instead of handing libclang a guaranteed
+        // failure on every run.
+        if !file_path.is_file() {
+            missing_files += 1;
+            debug!(file = %file_path.display(), "source file missing, skipping");
+            continue;
+        }
 
+        // Compilation databases can list sources libclang cannot parse
+        // (e.g. ISPC kernels with ispc-only flags). Only C/C++/ObjC goes in.
+        let ext = file_path
+            .extension()
+            .and_then(|e| e.to_str())
+            .map(|e| e.to_ascii_lowercase())
+            .unwrap_or_default();
+        if !matches!(ext.as_str(), "c" | "cc" | "cpp" | "cxx" | "m" | "mm") {
+            non_c_sources += 1;
+            debug!(file = %file_path.display(), "not a C/C++ source, skipping");
+            continue;
+        }
+
+        let args = extract_args(cmd);
         let key = cache::cache_key(&file_path, &args, cc_mtime);
+        entries.push(TuEntry {
+            cmd,
+            work_dir,
+            args,
+            key,
+        });
+    }
+
+    if missing_files > 0 {
+        warn!(
+            missing_files,
+            "skipped entries whose source file does not exist (generated sources not built?)"
+        );
+    }
+
+    // Whole-project cache: if no source, flag, or compile_commands.json
+    // change invalidated any per-TU key, load the final merged graph directly.
+    let merged_key = {
+        use std::hash::{Hash, Hasher};
+        let mut h = seahash::SeaHasher::new();
+        for e in &entries {
+            e.key.hash(&mut h);
+        }
+        h.finish()
+    };
+    if let Some(graph) = cache::load_merged(&cache_dir, merged_key) {
+        info!(
+            symbols = graph.symbol_count(),
+            edges = graph.edge_count(),
+            "whole-project cache hit"
+        );
+        return Ok(graph);
+    }
+
+    // Create a single Clang instance for the entire indexing run.
+    // libclang only allows one `Clang` per process, and init/teardown is
+    // expensive — hoisting it here avoids repeating that cost per TU.
+    let clang = clang::Clang::new().map_err(|e| ClangError::Parse(e.to_string()))?;
+    let index = clang::Index::new(&clang, false, true);
+
+    let mut cache_hits = 0u32;
+    let mut cancelled = false;
+    let tu_total = entries.len();
+    let mut partial_graphs = Vec::with_capacity(tu_total);
+
+    for (i, e) in entries.iter().enumerate() {
+        if !on_progress(IndexProgress::Parse {
+            current: i,
+            total: tu_total,
+            file: &e.cmd.file,
+        }) {
+            info!("indexing cancelled at TU {}/{}", i, tu_total);
+            cancelled = true;
+            break;
+        }
 
         // Try the cache first.
-        if let Some(cached) = cache::load(&cache_dir, key) {
-            debug!(file = %file_path.display(), symbols = cached.symbol_count(), "cached TU");
+        if let Some(cached) = cache::load(&cache_dir, e.key) {
+            debug!(file = %e.cmd.file, symbols = cached.symbol_count(), "cached TU");
             cache_hits += 1;
             partial_graphs.push(cached);
             continue;
         }
 
-        match index_translation_unit(cmd, &work_dir, &project_root, &index, &args) {
+        match index_translation_unit(e.cmd, &e.work_dir, &project_root, &index, &e.args) {
             Ok(g) => {
-                debug!(file = %file_path.display(), symbols = g.symbol_count(), "indexed TU");
+                debug!(file = %e.cmd.file, symbols = g.symbol_count(), "indexed TU");
                 // Only cache non-empty results — an empty graph likely means
                 // indexing failed silently and we don't want to persist that.
                 if g.symbol_count() > 0 {
-                    cache::store(&cache_dir, key, &g);
+                    cache::store(&cache_dir, e.key, &g);
                 }
                 partial_graphs.push(g);
             }
-            Err(e) => {
-                warn!(file = %file_path.display(), error = %e, "failed to index TU");
+            Err(err) => {
+                warn!(file = %e.cmd.file, error = %err, "failed to index TU");
             }
         }
     }
 
-    info!(cache_hits, total, "TU cache summary");
+    info!(
+        cache_hits,
+        missing_files, non_c_sources, total, "TU cache summary"
+    );
 
+    let merge_total = partial_graphs.len();
     let mut graph = Graph::new();
-    for g in partial_graphs {
+    for (i, g) in partial_graphs.into_iter().enumerate() {
+        if !on_progress(IndexProgress::Merge {
+            current: i,
+            total: merge_total,
+        }) {
+            info!("merge cancelled at {}/{}", i, merge_total);
+            cancelled = true;
+            break;
+        }
         graph.merge(g);
     }
 
     // Deduplicate edges (same headers are processed by multiple TUs)
     dedup_edges(&mut graph);
+
+    // A cancelled run produced a partial graph — never persist that.
+    if !cancelled {
+        cache::store_merged(&cache_dir, merged_key, &graph);
+    }
 
     info!(
         symbols = graph.symbol_count(),
@@ -164,16 +274,19 @@ pub fn index_project_with_progress(
 }
 
 /// Extract raw compiler arguments from a compile command, skipping the compiler path.
+///
+/// The `command` field is a shell-quoted string per the JSON Compilation
+/// Database spec, so it must be tokenized with shell quoting rules — e.g.
+/// `-D__cdecl=""` must reach the parser as `-D__cdecl=`, not with literal
+/// quote characters in the macro body.
 fn extract_args(cmd: &CompileCommand) -> Vec<String> {
     if let Some(arguments) = &cmd.arguments {
         arguments.get(1..).unwrap_or_default().to_vec()
     } else if let Some(command) = &cmd.command {
-        let parts: Vec<&str> = command.split_whitespace().collect();
-        parts
-            .get(1..)
+        shlex::split(command)
             .unwrap_or_default()
-            .iter()
-            .map(|s| s.to_string())
+            .into_iter()
+            .skip(1)
             .collect()
     } else {
         vec![]
@@ -204,7 +317,12 @@ fn index_translation_unit(
             continue;
         }
         // Skip the source file path (clang parser gets it separately)
-        if arg == &cmd.file || arg.ends_with(".cpp") || arg.ends_with(".c") {
+        if arg == &cmd.file
+            || arg.ends_with(".cpp")
+            || arg.ends_with(".cc")
+            || arg.ends_with(".cxx")
+            || arg.ends_with(".c")
+        {
             continue;
         }
         // Resolve relative -I paths to absolute
@@ -1026,6 +1144,45 @@ fn common_ancestor(a: &Path, b: &Path) -> PathBuf {
         }
     }
     result
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn cmd_str(command: &str) -> CompileCommand {
+        CompileCommand {
+            directory: "/build".into(),
+            command: Some(command.into()),
+            arguments: None,
+            file: "/src/a.cc".into(),
+        }
+    }
+
+    #[test]
+    fn extract_args_unquotes_shell_command() {
+        // `-D__cdecl=""` must become `-D__cdecl=` (empty macro body), not
+        // a macro defined as the literal token `""`.
+        let args = extract_args(&cmd_str(r#"/usr/bin/c++ -D__cdecl="" -I/inc -c /src/a.cc"#));
+        assert_eq!(args, vec!["-D__cdecl=", "-I/inc", "-c", "/src/a.cc"]);
+    }
+
+    #[test]
+    fn extract_args_keeps_quoted_spaces_as_one_arg() {
+        let args = extract_args(&cmd_str(r#"cc '-DGREETING="hello world"' a.cc"#));
+        assert_eq!(args, vec![r#"-DGREETING="hello world""#, "a.cc"]);
+    }
+
+    #[test]
+    fn extract_args_prefers_arguments_array() {
+        let cmd = CompileCommand {
+            directory: "/build".into(),
+            command: None,
+            arguments: Some(vec!["cc".into(), "-DFOO=1".into(), "a.cc".into()]),
+            file: "a.cc".into(),
+        };
+        assert_eq!(extract_args(&cmd), vec!["-DFOO=1", "a.cc"]);
+    }
 }
 
 /// Discover system C++ include paths by querying the compiler.
