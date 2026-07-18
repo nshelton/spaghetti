@@ -3,6 +3,7 @@ resolver = "2"
 members = [
     "crates/core-ir",
     "crates/frontend-clang",
+    "crates/frontend-ispc",
     "crates/layout",
     "crates/query",
     "crates/viz",
@@ -42,8 +43,13 @@ seahash = "4"
 # Shell-quoted command parsing (JSON compilation database `command` field)
 shlex = "1"
 
+# ISPC parsing (frontend-ispc vendors the grammar, cc compiles it)
+tree-sitter = "0.25"
+cc = "1"
+
 # Internal crates
 core-ir = { path = "crates/core-ir" }
 frontend-clang = { path = "crates/frontend-clang" }
+frontend-ispc = { path = "crates/frontend-ispc" }
 layout = { path = "crates/layout" }
 query = { path = "crates/query" }

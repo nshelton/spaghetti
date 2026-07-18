@@ -1,0 +1,7 @@
+[
+    {
+        "directory": ".",
+        "command": "ispc simple.ispc --target=host -o simple.o",
+        "file": "simple.ispc"
+    }
+]

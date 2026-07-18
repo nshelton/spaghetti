@@ -1,0 +1,15 @@
+[package]
+name = "frontend-ispc"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+core-ir = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+tracing = { workspace = true }
+tree-sitter = { workspace = true }
+
+[build-dependencies]
+cc = { workspace = true }
